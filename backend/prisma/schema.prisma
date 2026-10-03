@@ -1,4 +1,3 @@
-
 generator client {
   provider = "prisma-client"
   output   = "../generated/prisma"
@@ -8,3 +7,500 @@ datasource db {
   provider = "postgresql"
 }
 
+enum currentStatus {
+  ACTIVE
+  DEACTIVATED
+}
+
+enum Role {
+  ENGINEER
+  TEAM_LEAD
+  ADMIN
+}
+
+enum IncidentSeverity {
+  P0
+  P1
+  P2
+  P3
+}
+
+enum IncidentStates {
+  OPEN
+  ACKNOWLEDGED
+  MITIGATING
+  RESOLVED
+  CLOSED
+}
+
+enum LifecycleStates {
+  PENDING
+  FAILED
+  SUCCESS
+}
+
+enum AuditEventType {
+  ALERT_RECEIVED
+  ALERT_DUPLICATE
+  AI_TRIAGE_COMPLETED
+  ASSIGNED
+  INCIDENT_CREATED
+  ACKNOWLEDGED
+  SEVERITY_CONFIRMED
+  COMMENT_ADDED
+  SLA_WARNING
+  ESCALATED_L1
+  ESCALATED_L2
+  ESCALATED_L3
+  ESCALATED_L4
+  SOURCE_ALERT_RESOLVED
+  RESOLVED
+  NOTIFIED
+  POSTMORTEM_GENERATED
+  POSTMORTEM_REVIEWED
+  AI_INVESTIGATION_COMPLETED
+  CLOSED
+  REASSIGNED
+  OPEN
+}
+
+enum PostmortemReviewStatus {
+  PENDING
+  REJECTED
+  REVIEWED
+}
+
+enum NotificationType {
+  INFO
+  WARNING
+  ALERT
+}
+
+enum InvestigationStatus {
+  REQUESTED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum EvidenceType {
+  FACT
+  INFERENCE
+  UNKNOWN
+}
+
+enum PostmortemGenerationStatus {
+  GENERATING
+  DRAFT
+  FAILED
+}
+
+enum AlertSourceStatus {
+  FIRING
+  RESOLVED
+}
+
+model Team {
+  id     String        @id @default(uuid(7)) @db.Uuid
+  name   String        @unique
+  status currentStatus @default(ACTIVE)
+
+  users       User[]
+  appServices AppService[]
+  incidents   Incident[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+}
+
+model User {
+  id           String @id @default(uuid(7)) @db.Uuid
+  name         String
+  email        String @unique
+  passwordHash String
+
+  role   Role          @default(ENGINEER)
+  status currentStatus @default(ACTIVE)
+
+  comments Comment[]
+  sessions UserSession[]
+
+  teamId String? @db.Uuid
+  team   Team?   @relation(fields: [teamId], references: [id])
+
+  leadId String? @db.Uuid
+  lead   User?   @relation("TeamLead", fields: [leadId], references: [id])
+
+  teamMembers User[] @relation("TeamLead")
+
+  escalationPolicyLevel1        EscalationPolicy[] @relation("EscalationLevel1")
+  escalationPolicyLevel2        EscalationPolicy[] @relation("EscalationLevel2")
+  escalationPolicyLevel3        EscalationPolicy[] @relation("EscalationLevel3")
+  escalationPolicyFallbackAdmin EscalationPolicy[] @relation("FallbackAdmin")
+
+  incidentCurrentAssignee     Incident[] @relation("IncidentCurrentAssignee")
+  incidentAcknowledgedBy      Incident[] @relation("IncidentAcknowledgedBy")
+  incidentSeverityConfirmedBy Incident[] @relation("IncidentSeverityConfirmedBy")
+  incidentResolvedBy          Incident[] @relation("IncidentResolvedBy")
+  incidentClosedBy            Incident[] @relation("IncidentClosedBy")
+
+  postmortemReviewedBy Postmortem[] @relation("PostmortemReviewedBy")
+
+  investigationRequestedBy Investigation[] @relation("InvestigationRequestedBy")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+
+  @@index([email], map: "idx_user_email")
+  @@index([teamId, leadId], map: "idx_user_teamId_leadId")
+}
+
+model UserSession {
+  id               String    @id @default(uuid(7)) @db.Uuid
+  refreshTokenHash String
+  lastRefreshHash  String?
+  ip               String?
+  userAgent        String?
+  lastIp           String?
+  lastSeen         DateTime?
+  revoked          Boolean   @default(false)
+  expiresIn        DateTime
+
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+}
+
+model EscalationPolicy {
+  id              String @id @default(uuid(7)) @db.Uuid
+  level1Id        String @db.Uuid
+  level1          User   @relation("EscalationLevel1", fields: [level1Id], references: [id])
+  level2Id        String @db.Uuid
+  level2          User   @relation("EscalationLevel2", fields: [level2Id], references: [id])
+  level3Id        String @db.Uuid
+  level3          User   @relation("EscalationLevel3", fields: [level3Id], references: [id])
+  fallbackAdminId String @db.Uuid
+  fallbackAdmin   User   @relation("FallbackAdmin", fields: [fallbackAdminId], references: [id])
+
+  appService AppService?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+}
+
+model AppService {
+  id              String           @id @default(uuid(7)) @db.Uuid
+  name            String           @unique
+  defaultSeverity IncidentSeverity @default(P1)
+  status          currentStatus    @default(ACTIVE)
+
+  P0ResponseSlaMinutes   Int
+  P0ResolutionSlaMinutes Int
+
+  P1ResponseSlaMinutes   Int
+  P1ResolutionSlaMinutes Int
+
+  P2ResponseSlaMinutes   Int
+  P2ResolutionSlaMinutes Int
+
+  P3ResponseSlaMinutes   Int
+  P3ResolutionSlaMinutes Int
+
+  teamId String @db.Uuid
+  team   Team   @relation(fields: [teamId], references: [id])
+
+  escalationPolicyId String           @unique @db.Uuid
+  escalationPolicy   EscalationPolicy @relation(fields: [escalationPolicyId], references: [id])
+
+  alert     Alert[]
+  incidents Incident[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+
+  @@unique([id, teamId])
+}
+
+model AlertSource {
+  id            String        @id @default(uuid(7)) @db.Uuid
+  name          String
+  sourceType    String
+  configuration Json
+  status        currentStatus @default(ACTIVE)
+
+  alerts Alert[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+
+  @@index([sourceType, status], map: "idx_alert_sourceType_status")
+}
+
+model Alert {
+  id                String            @id @default(uuid(7)) @db.Uuid
+  sourceEventId     String?
+  sourceFingerprint String?
+  name              String?
+  environment       String
+  sourceSeverity    String?
+  initialSeverity   IncidentSeverity?
+  summary           String?
+  description       String?
+  labels            String[]
+  additionalDetails String?
+  startedTimestamp  DateTime
+  endedTimestamp    DateTime?
+  sourceUrl         String?
+  originalPayload   Json
+  activeIdentityKey String?
+  sourceStatus      AlertSourceStatus @default(FIRING)
+
+  aiTriage AITriage?
+
+  alertSourceId String      @db.Uuid
+  alertSource   AlertSource @relation(fields: [alertSourceId], references: [id])
+
+  affectedServiceId String     @db.Uuid
+  affectedService   AppService @relation(fields: [affectedServiceId], references: [id])
+
+  incidentId String?   @db.Uuid
+  incident   Incident? @relation(fields: [incidentId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+
+  // Inserted separately via migrations
+
+  // @@index([alertSourceId, sourceEventId], map: "idx_alert_sourceId_sourceEventId")
+  // @@index([alertSourceId, sourceFingerprint], map: "idx_alert_sourceId_fingerprint")
+
+  @@unique([alertSourceId, activeIdentityKey])
+  @@index([sourceUrl], map: "idx_alert_sourceUrl")
+}
+
+model AITriage {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  alertId String @unique @db.Uuid
+  alert   Alert  @relation(fields: [alertId], references: [id])
+
+  suggestedSeverity IncidentSeverity?
+  category          String?
+  summary           String?
+  reasoning         String?
+  confidence        Float?
+  rawOutput         Json?
+  failureStatus     LifecycleStates   @default(PENDING)
+  evidence          Json?
+
+  model        String?
+  modelVersion String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+
+  @@index([alertId])
+}
+
+model Incident {
+  id          String           @id @default(uuid(7)) @db.Uuid
+  title       String
+  description String
+  status      IncidentStates   @default(OPEN)
+  severity    IncidentSeverity
+
+  acknowledgedTimestamp    DateTime?
+  severityConfirmTimestamp DateTime?
+  resolvedTimestamp        DateTime?
+  closedTimestamp          DateTime?
+  resolutionSummary        String?
+
+  currentAssigneeId String? @db.Uuid
+  currentAssignee   User?   @relation("IncidentCurrentAssignee", fields: [currentAssigneeId], references: [id])
+
+  acknowledgedById String? @db.Uuid
+  acknowledgedBy   User?   @relation("IncidentAcknowledgedBy", fields: [acknowledgedById], references: [id])
+
+  severityConfirmedById String? @db.Uuid
+  severityConfirmedBy   User?   @relation("IncidentSeverityConfirmedBy", fields: [severityConfirmedById], references: [id])
+
+  resolvedById String? @db.Uuid
+  resolvedBy   User?   @relation("IncidentResolvedBy", fields: [resolvedById], references: [id])
+
+  closedById String? @db.Uuid
+  closedBy   User?   @relation("IncidentClosedBy", fields: [closedById], references: [id])
+
+  affectedServiceId String     @db.Uuid
+  teamId            String     @db.Uuid
+  affectedService   AppService @relation(fields: [affectedServiceId, teamId], references: [id, teamId], onUpdate: Restrict)
+
+  team Team @relation(fields: [teamId], references: [id])
+
+  alert          Alert[]
+  comments       Comment[]
+  auditEvents    AuditEvent[]
+  postmortem     Postmortem?
+  notifications  Notification[]
+  investigations Investigation[]
+  evidences      Evidence[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+}
+
+model Comment {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  title       String?
+  description String
+
+  incidentId String   @db.Uuid
+  incident   Incident @relation(fields: [incidentId], references: [id])
+
+  authorId String @db.Uuid
+  author   User   @relation(fields: [authorId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+
+  @@index([incidentId, authorId], map: "idx_comment_incident_author")
+}
+
+model OutboxEvent {
+  id String @id @default(uuid(7)) @db.Uuid
+
+  eventType     String
+  aggregateType String
+  aggregateId   String          @db.Uuid
+  payload       Json
+  status        LifecycleStates @default(PENDING)
+  attemptCount  Int             @default(0)
+  availableAt   DateTime        @default(now())
+  processedAt   DateTime?
+
+  createdAt DateTime @default(now())
+}
+
+model AuditEvent {
+  id        String         @id @default(uuid(7)) @db.Uuid
+  metadata  Json?
+  eventType AuditEventType
+  actor     String?        @db.Uuid
+
+  incidentId String?   @db.Uuid
+  incident   Incident? @relation(fields: [incidentId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([incidentId, eventType, actor], map: "idx_auditEvent_incident_type_actor")
+}
+
+model Postmortem {
+  id                String                     @id @default(uuid(7)) @db.Uuid
+  summary           String?
+  impact            String?
+  detection         String?
+  timeline          String?
+  rootCause         String?
+  factors           String?
+  resolution        String?
+  correctiveActions String?
+  preventiveActions String?
+  unknowns          String?
+  MTTR              Int?
+  riskLevel         IncidentSeverity?
+  model             String?
+  modelVersion      String?
+  prompt            String?
+  inputData         String?
+  generationStatus  PostmortemGenerationStatus @default(GENERATING)
+  reviewStatus      PostmortemReviewStatus     @default(PENDING)
+  reviewedAt        DateTime?
+  failureReason     String?
+  generatedAt       DateTime?
+
+  reviewedById String? @db.Uuid
+  reviewedBy   User?   @relation("PostmortemReviewedBy", fields: [reviewedById], references: [id])
+
+  incidentId String   @unique @db.Uuid
+  incident   Incident @relation(fields: [incidentId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+
+  @@index([riskLevel, incidentId, reviewedById], map: "idx_postmortem_riskLevel_incident_reviewer")
+  @@index([MTTR, riskLevel, incidentId], map: "idx_postmortem_mttr_riskLevel_incident")
+}
+
+model Notification {
+  id                   String           @id @default(uuid(7)) @db.Uuid
+  deliveryStatus       LifecycleStates  @default(PENDING)
+  notificationType     NotificationType
+  attemptCount         Int?
+  lastAttemptTimestamp DateTime?
+  providerResponse     Json?
+  idempotencyKey       String           @unique
+
+  recipients String[] @db.Uuid
+
+  incidentId String?   @db.Uuid
+  incident   Incident? @relation(fields: [incidentId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([incidentId, deliveryStatus], map: "idx_notification_incident_status")
+}
+
+model Investigation {
+  id             String              @id @default(uuid(7)) @db.Uuid
+  status         InvestigationStatus @default(REQUESTED)
+  result         Json?
+  model          String?
+  modelVersion   String?
+  input          Json
+  idempotencyKey String              @unique
+  completedAt    DateTime?
+  failureReason  String?
+  evidences      Evidence[]
+
+  requestedById String @db.Uuid
+  requestedBy   User   @relation("InvestigationRequestedBy", fields: [requestedById], references: [id])
+
+  incidentId String   @db.Uuid
+  incident   Incident @relation(fields: [incidentId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([incidentId, requestedById], map: "idx_investigation_incident_requestedBy")
+  @@index([incidentId, status], map: "idx_investigation_incident_status")
+}
+
+model Evidence {
+  id              String       @id @default(uuid(7)) @db.Uuid
+  sourceType      String?
+  sourceReference String?
+  relevanceInfo   String?
+  evidenceType    EvidenceType
+
+  investigationId String        @db.Uuid
+  investigation   Investigation @relation(fields: [investigationId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+
+  incidentId String?   @db.Uuid
+  incident   Incident? @relation(fields: [incidentId], references: [id])
+}
+
+model Evaluation {
+  id          String @id @default(uuid(7)) @db.Uuid
+  input       String
+  evidence    String
+  constraints String
+  result      Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+}

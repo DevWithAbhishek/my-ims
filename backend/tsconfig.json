@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "module": "node16",
+    "moduleResolution": "node16",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "strict": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "sourceMap": true,
+    "removeComments": true,
+    "rootDir": ".",
+    "outDir": "./dist",
+    "incremental": true,
+    "types": ["node", "jest"]
+  },
+  "include": ["src/**/*", "test/**/*", "prisma.config.ts"]
+}
