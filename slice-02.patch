@@ -1,0 +1,2361 @@
+diff --git a/backend/src/api-router.ts b/backend/src/api-router.ts
+index c8df779..2b88566 100644
+--- a/backend/src/api-router.ts
++++ b/backend/src/api-router.ts
+@@ -1,9 +1,11 @@
+ import { Router } from 'express';
++import { createAppServiceRouter } from './modules/appService/index.js';
+ import { createIdentityRouter } from './modules/identity/index.js';
+ 
+ /** Composes the module routers mounted at `/api/v1`. */
+ export function createApiRouter(): Router {
+   const router = Router();
+   router.use(createIdentityRouter());
++  router.use(createAppServiceRouter());
+   return router;
+ }
+diff --git a/backend/src/modules/appService/appService.common.ts b/backend/src/modules/appService/appService.common.ts
+new file mode 100644
+index 0000000..e88121c
+--- /dev/null
++++ b/backend/src/modules/appService/appService.common.ts
+@@ -0,0 +1,36 @@
++import { z } from 'zod';
++import { ForbiddenError, NotFoundError, type ErrorDetail } from '../../shared/errors/AppError.js';
++
++export const uuidSchema = z.uuid();
++
++export const sortSchema = z.enum(['asc', 'desc']).default('asc');
++export const limitSchema = z.coerce.number().int().min(1).max(50).default(10);
++export const offsetSchema = z.coerce.number().int().min(0).default(0);
++
++export type Page<T> = { items: T[]; limit: number; offset: number; hasMore: boolean };
++
++/** Splits a `limit + 1` fetch into the page and its `hasMore` flag. */
++export function toPage<T>(rows: T[], limit: number, offset: number): Page<T> {
++  return { items: rows.slice(0, limit), limit, offset, hasMore: rows.length > limit };
++}
++
++export function pageResponse<T>(page: Page<T>) {
++  return {
++    data: page.items,
++    pagination: { limit: page.limit, offset: page.offset, hasMore: page.hasMore },
++  };
++}
++
++export function invalidAction(message: string, details: ErrorDetail[] = []): ForbiddenError {
++  return new ForbiddenError(message, 'INVALID_ACTION', details);
++}
++
++export function serviceNotFound(): NotFoundError {
++  return new NotFoundError('Service not found', 'SERVICE_NOT_FOUND', [{ resource: 'service' }]);
++}
++
++export function policyNotFound(): NotFoundError {
++  return new NotFoundError('Escalation policy not found', 'ESCALATION_POLICY_NOT_FOUND', [
++    { resource: 'escalationPolicy' },
++  ]);
++}
+diff --git a/backend/src/modules/appService/appService.routes.ts b/backend/src/modules/appService/appService.routes.ts
+new file mode 100644
+index 0000000..92e4ee7
+--- /dev/null
++++ b/backend/src/modules/appService/appService.routes.ts
+@@ -0,0 +1,59 @@
++import { Router } from 'express';
++import { requireJsonBody } from '../../shared/middleware/json-body.js';
++import { authenticate, requireRoles } from '../identity/index.js';
++import {
++  createPolicyHandler,
++  getPolicyHandler,
++  updatePolicyHandler,
++} from './escalation-policies/policy.controller.js';
++import {
++  createServiceHandler,
++  getServiceHandler,
++  listServicesHandler,
++  updateServiceHandler,
++} from './services/service.controller.js';
++
++/** Routes of the AppService module, to be mounted at `/api/v1`. */
++export function createAppServiceRouter(): Router {
++  const router = Router();
++
++  router.post(
++    '/services',
++    authenticate,
++    requireRoles('ADMIN'),
++    requireJsonBody,
++    createServiceHandler,
++  );
++  router.get('/services', authenticate, listServicesHandler);
++  router.get('/services/:serviceId', authenticate, getServiceHandler);
++  router.patch(
++    '/services/:serviceId',
++    authenticate,
++    requireRoles('ADMIN'),
++    requireJsonBody,
++    updateServiceHandler,
++  );
++
++  router.post(
++    '/services/:serviceId/escalation-policies',
++    authenticate,
++    requireRoles('ADMIN'),
++    requireJsonBody,
++    createPolicyHandler,
++  );
++  router.get(
++    '/services/:serviceId/escalation-policies/:escalationPolicyId',
++    authenticate,
++    requireRoles('ADMIN', 'TEAM_LEAD'),
++    getPolicyHandler,
++  );
++  router.patch(
++    '/services/:serviceId/escalation-policies/:escalationPolicyId',
++    authenticate,
++    requireRoles('ADMIN'),
++    requireJsonBody,
++    updatePolicyHandler,
++  );
++
++  return router;
++}
+diff --git a/backend/src/modules/appService/config.mapper.ts b/backend/src/modules/appService/config.mapper.ts
+new file mode 100644
+index 0000000..c495a10
+--- /dev/null
++++ b/backend/src/modules/appService/config.mapper.ts
+@@ -0,0 +1,40 @@
++import type { AppService, EscalationPolicy } from '../../generated/prisma/client.js';
++import type { EscalationPolicyConfig, ServiceConfig } from './config.js';
++
++export function toServiceConfig(service: AppService): ServiceConfig {
++  return {
++    id: service.id,
++    name: service.name,
++    status: service.status,
++    teamId: service.teamId,
++    defaultSeverity: service.defaultSeverity,
++    escalationPolicyId: service.escalationPolicyId,
++    sla: {
++      P0: {
++        responseMinutes: service.P0ResponseSlaMinutes,
++        resolutionMinutes: service.P0ResolutionSlaMinutes,
++      },
++      P1: {
++        responseMinutes: service.P1ResponseSlaMinutes,
++        resolutionMinutes: service.P1ResolutionSlaMinutes,
++      },
++      P2: {
++        responseMinutes: service.P2ResponseSlaMinutes,
++        resolutionMinutes: service.P2ResolutionSlaMinutes,
++      },
++      P3: {
++        responseMinutes: service.P3ResponseSlaMinutes,
++        resolutionMinutes: service.P3ResolutionSlaMinutes,
++      },
++    },
++  };
++}
++
++export function toPolicyConfig(policy: EscalationPolicy): EscalationPolicyConfig {
++  return {
++    level1: policy.level1Id,
++    level2: policy.level2Id,
++    level3: policy.level3Id,
++    fallbackAdmin: policy.fallbackAdminId,
++  };
++}
+diff --git a/backend/src/modules/appService/config.ts b/backend/src/modules/appService/config.ts
+new file mode 100644
+index 0000000..b7cc657
+--- /dev/null
++++ b/backend/src/modules/appService/config.ts
+@@ -0,0 +1,40 @@
++import { getPrisma } from '../../infra/db/prisma.js';
++import { toPolicyConfig, toServiceConfig } from './config.mapper.js';
++import { findPolicyByServiceId } from './escalation-policies/policy.repository.js';
++import { findServiceById } from './services/service.repository.js';
++import type { Severity } from './sla.rules.js';
++
++export type ServiceStatus = 'ACTIVE' | 'DEACTIVATED';
++
++/** Configuration of one service as consumed by ingestion (SLICE-04) and SLA/escalation (SLICE-07). */
++export type ServiceConfig = {
++  id: string;
++  name: string;
++  status: ServiceStatus;
++  teamId: string;
++  defaultSeverity: Severity;
++  escalationPolicyId: string;
++  sla: Record<Severity, { responseMinutes: number; resolutionMinutes: number }>;
++};
++
++/** The four responders of a service's escalation policy (user ids). */
++export type EscalationPolicyConfig = {
++  level1: string;
++  level2: string;
++  level3: string;
++  fallbackAdmin: string;
++};
++
++/** The service's configuration, or `null` when the service does not exist. */
++export async function getServiceConfig(serviceId: string): Promise<ServiceConfig | null> {
++  const service = await findServiceById(getPrisma(), serviceId);
++  return service ? toServiceConfig(service) : null;
++}
++
++/** The escalation policy of the service, or `null` when the service does not exist. */
++export async function getEscalationPolicyByService(
++  serviceId: string,
++): Promise<EscalationPolicyConfig | null> {
++  const policy = await findPolicyByServiceId(getPrisma(), serviceId);
++  return policy ? toPolicyConfig(policy) : null;
++}
+diff --git a/backend/src/modules/appService/escalation-policies/policy.controller.ts b/backend/src/modules/appService/escalation-policies/policy.controller.ts
+new file mode 100644
+index 0000000..c69ffa8
+--- /dev/null
++++ b/backend/src/modules/appService/escalation-policies/policy.controller.ts
+@@ -0,0 +1,29 @@
++import type { RequestHandler } from 'express';
++import { parseOrThrow } from '../../../shared/errors/zod.js';
++import { getAuth } from '../../identity/index.js';
++import * as policyService from './policy.service.js';
++import {
++  policyParamsSchema,
++  policyServiceParamsSchema,
++  policyUsersBodySchema,
++  updatePolicyBodySchema,
++} from './policy.schema.js';
++
++export const createPolicyHandler: RequestHandler = async (req) => {
++  const { serviceId } = parseOrThrow(policyServiceParamsSchema, req.params);
++  parseOrThrow(policyUsersBodySchema, req.body);
++  await policyService.rejectAdditionalPolicy(serviceId);
++};
++
++export const getPolicyHandler: RequestHandler = async (req, res) => {
++  const { serviceId, escalationPolicyId } = parseOrThrow(policyParamsSchema, req.params);
++  const policy = await policyService.getPolicy(getAuth(req), serviceId, escalationPolicyId);
++  res.status(200).json({ data: policy });
++};
++
++export const updatePolicyHandler: RequestHandler = async (req, res) => {
++  const { serviceId, escalationPolicyId } = parseOrThrow(policyParamsSchema, req.params);
++  const body = parseOrThrow(updatePolicyBodySchema, req.body);
++  const policy = await policyService.updatePolicyUsers(serviceId, escalationPolicyId, body);
++  res.status(200).json({ data: policy });
++};
+diff --git a/backend/src/modules/appService/escalation-policies/policy.mapper.ts b/backend/src/modules/appService/escalation-policies/policy.mapper.ts
+new file mode 100644
+index 0000000..36ce627
+--- /dev/null
++++ b/backend/src/modules/appService/escalation-policies/policy.mapper.ts
+@@ -0,0 +1,23 @@
++import type { EscalationPolicy } from '../../../generated/prisma/client.js';
++
++export type EscalationPolicyResponse = {
++  id: string;
++  level1: string;
++  level2: string;
++  level3: string;
++  fallbackAdmin: string;
++  createdAt: Date;
++  updatedAt: Date;
++};
++
++export function toPolicyResponse(policy: EscalationPolicy): EscalationPolicyResponse {
++  return {
++    id: policy.id,
++    level1: policy.level1Id,
++    level2: policy.level2Id,
++    level3: policy.level3Id,
++    fallbackAdmin: policy.fallbackAdminId,
++    createdAt: policy.createdAt,
++    updatedAt: policy.updatedAt,
++  };
++}
+diff --git a/backend/src/modules/appService/escalation-policies/policy.repository.ts b/backend/src/modules/appService/escalation-policies/policy.repository.ts
+new file mode 100644
+index 0000000..acfa34e
+--- /dev/null
++++ b/backend/src/modules/appService/escalation-policies/policy.repository.ts
+@@ -0,0 +1,58 @@
++import { Prisma } from '../../../generated/prisma/client.js';
++import type { Db } from '../transaction.js';
++import type { PolicyUserFacts } from '../policy-users.rules.js';
++
++export function insertPolicy(
++  db: Db,
++  data: { level1Id: string; level2Id: string; level3Id: string; fallbackAdminId: string },
++) {
++  return db.escalationPolicy.create({ data });
++}
++
++export function findPolicyById(db: Db, id: string) {
++  return db.escalationPolicy.findUnique({ where: { id } });
++}
++
++/** A policy with the id of the service it is attached to (`null` when orphaned). */
++export function findPolicyWithOwner(db: Db, id: string) {
++  return db.escalationPolicy.findUnique({
++    where: { id },
++    include: { appService: { select: { id: true } } },
++  });
++}
++
++export function findPolicyByServiceId(db: Db, serviceId: string) {
++  return db.escalationPolicy.findFirst({ where: { appService: { id: serviceId } } });
++}
++
++export function updatePolicy(
++  db: Db,
++  id: string,
++  data: { level1Id?: string; level2Id?: string; level3Id?: string; fallbackAdminId?: string },
++) {
++  return db.escalationPolicy.update({ where: { id }, data: { ...data, updatedAt: new Date() } });
++}
++
++/**
++ * Reads the given users under `FOR SHARE` (sorted by id), so a concurrent role, status or team
++ * change of one of them waits for this transaction. Unknown ids are absent from the result.
++ */
++export async function lockUsersForShare(
++  db: Db,
++  userIds: string[],
++): Promise<Map<string, PolicyUserFacts>> {
++  const unique = [...new Set(userIds)];
++  if (unique.length === 0) return new Map();
++  const rows = await db.$queryRaw<
++    {
++      id: string;
++      role: PolicyUserFacts['role'];
++      status: PolicyUserFacts['status'];
++      teamId: string | null;
++    }[]
++  >(
++    Prisma.sql`SELECT "id", "role"::text AS "role", "status"::text AS "status", "teamId"
++      FROM "User" WHERE "id" = ANY(${unique}::uuid[]) ORDER BY "id" FOR SHARE`,
++  );
++  return new Map(rows.map(({ id, ...facts }) => [id, facts]));
++}
+diff --git a/backend/src/modules/appService/escalation-policies/policy.schema.ts b/backend/src/modules/appService/escalation-policies/policy.schema.ts
+new file mode 100644
+index 0000000..c1d34a3
+--- /dev/null
++++ b/backend/src/modules/appService/escalation-policies/policy.schema.ts
+@@ -0,0 +1,31 @@
++import { z } from 'zod';
++import { uuidSchema } from '../appService.common.js';
++
++export const policyUsersBodySchema = z
++  .object({
++    level1: uuidSchema,
++    level2: uuidSchema,
++    level3: uuidSchema,
++    fallbackAdmin: uuidSchema,
++  })
++  .strict();
++
++export const updatePolicyBodySchema = z
++  .object({
++    level1: uuidSchema.optional(),
++    level2: uuidSchema.optional(),
++    level3: uuidSchema.optional(),
++    fallbackAdmin: uuidSchema.optional(),
++  })
++  .strict()
++  .refine((body) => Object.values(body).some((value) => value !== undefined), {
++    message: 'At least one field is required',
++  });
++
++export const policyServiceParamsSchema = z.object({ serviceId: uuidSchema }).strict();
++
++export const policyParamsSchema = z
++  .object({ serviceId: uuidSchema, escalationPolicyId: uuidSchema })
++  .strict();
++
++export type UpdatePolicyBody = z.output<typeof updatePolicyBodySchema>;
+diff --git a/backend/src/modules/appService/escalation-policies/policy.service.ts b/backend/src/modules/appService/escalation-policies/policy.service.ts
+new file mode 100644
+index 0000000..32a5184
+--- /dev/null
++++ b/backend/src/modules/appService/escalation-policies/policy.service.ts
+@@ -0,0 +1,81 @@
++import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
++import { ConflictError } from '../../../shared/errors/AppError.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import { assertSameTeam, requireTeam } from '../../identity/index.js';
++import { invalidAction, policyNotFound, serviceNotFound } from '../appService.common.js';
++import { policyUserViolations } from '../policy-users.rules.js';
++import { findServiceById, hasUnresolvedIncidents } from '../services/service.repository.js';
++import { runServiceTransaction } from '../transaction.js';
++import { toPolicyResponse, type EscalationPolicyResponse } from './policy.mapper.js';
++import { findPolicyById, lockUsersForShare, updatePolicy } from './policy.repository.js';
++import type { UpdatePolicyBody } from './policy.schema.js';
++
++/** S5: a service has exactly one policy, so there is never a success path. */
++export async function rejectAdditionalPolicy(serviceId: string): Promise<never> {
++  if (!(await findServiceById(getPrisma(), serviceId))) throw serviceNotFound();
++  throw new ConflictError(
++    'A service has exactly one escalation policy; update it instead',
++    'POLICIES_MAX_LIMIT_REACHED',
++  );
++}
++
++export async function getPolicy(
++  auth: AuthContext,
++  serviceId: string,
++  policyId: string,
++): Promise<EscalationPolicyResponse> {
++  if (auth.role !== 'ADMIN') requireTeam(auth);
++  const db = getPrisma();
++  const service = await findServiceById(db, serviceId);
++  if (!service) throw serviceNotFound();
++  if (auth.role !== 'ADMIN') assertSameTeam(auth, service.teamId);
++
++  const policy =
++    service.escalationPolicyId === policyId ? await findPolicyById(db, policyId) : null;
++  if (!policy) throw policyNotFound();
++  return toPolicyResponse(policy);
++}
++
++export async function updatePolicyUsers(
++  serviceId: string,
++  policyId: string,
++  body: UpdatePolicyBody,
++): Promise<EscalationPolicyResponse> {
++  return runServiceTransaction(async (tx) => {
++    // Same lock as the service update, so the incident check cannot race incident creation.
++    if (!(await lockRowForUpdate(tx, 'AppService', serviceId))) throw serviceNotFound();
++    const service = await findServiceById(tx, serviceId);
++    if (!service) throw serviceNotFound();
++    if (service.escalationPolicyId !== policyId) throw policyNotFound();
++    const policy = await findPolicyById(tx, policyId);
++    if (!policy) throw policyNotFound();
++
++    const users = await lockUsersForShare(
++      tx,
++      Object.values(body).filter((id) => id !== undefined),
++    );
++    const violations = policyUserViolations(body, users, service.teamId);
++    if (violations.length > 0) {
++      throw invalidAction('Escalation policy users are not valid for this service', violations);
++    }
++
++    const changes = {
++      level1Id: changed(body.level1, policy.level1Id),
++      level2Id: changed(body.level2, policy.level2Id),
++      level3Id: changed(body.level3, policy.level3Id),
++      fallbackAdminId: changed(body.fallbackAdmin, policy.fallbackAdminId),
++    };
++    if (Object.values(changes).every((value) => value === undefined)) {
++      return toPolicyResponse(policy);
++    }
++
++    if (await hasUnresolvedIncidents(tx, serviceId)) {
++      throw new ConflictError('Service has unresolved incidents', 'POLICY_IN_USE');
++    }
++    return toPolicyResponse(await updatePolicy(tx, policyId, changes));
++  });
++}
++
++function changed(sent: string | undefined, stored: string): string | undefined {
++  return sent !== undefined && sent !== stored ? sent : undefined;
++}
+diff --git a/backend/src/modules/appService/index.ts b/backend/src/modules/appService/index.ts
+new file mode 100644
+index 0000000..981ab13
+--- /dev/null
++++ b/backend/src/modules/appService/index.ts
+@@ -0,0 +1,7 @@
++export { createAppServiceRouter } from './appService.routes.js';
++export {
++  getEscalationPolicyByService,
++  getServiceConfig,
++  type EscalationPolicyConfig,
++  type ServiceConfig,
++} from './config.js';
+diff --git a/backend/src/modules/appService/policy-users.rules.spec.ts b/backend/src/modules/appService/policy-users.rules.spec.ts
+new file mode 100644
+index 0000000..1b02a9a
+--- /dev/null
++++ b/backend/src/modules/appService/policy-users.rules.spec.ts
+@@ -0,0 +1,76 @@
++import { policyUserViolations, type PolicyUserFacts } from './policy-users.rules.js';
++
++const TEAM = 'a0000000-0000-4000-8000-00000000000a';
++const OTHER_TEAM = 'b0000000-0000-4000-8000-00000000000b';
++const ids = {
++  engineer: 'e0000000-0000-4000-8000-000000000001',
++  engineer2: 'e0000000-0000-4000-8000-000000000002',
++  lead: 'c0000000-0000-4000-8000-000000000003',
++  admin: 'd0000000-0000-4000-8000-000000000004',
++};
++
++const facts = (overrides: Partial<PolicyUserFacts>): PolicyUserFacts => ({
++  role: 'ENGINEER',
++  status: 'ACTIVE',
++  teamId: TEAM,
++  ...overrides,
++});
++
++const users = (extra: Record<string, PolicyUserFacts> = {}) =>
++  new Map<string, PolicyUserFacts>(
++    Object.entries({
++      [ids.engineer]: facts({}),
++      [ids.engineer2]: facts({}),
++      [ids.lead]: facts({ role: 'TEAM_LEAD' }),
++      [ids.admin]: facts({ role: 'ADMIN', teamId: null }),
++      ...extra,
++    }),
++  );
++
++const valid = {
++  level1: ids.engineer,
++  level2: ids.engineer2,
++  level3: ids.lead,
++  fallbackAdmin: ids.admin,
++};
++
++describe('policyUserViolations', () => {
++  it('accepts a valid policy (the admin may belong to no team)', () => {
++    expect(policyUserViolations(valid, users(), TEAM)).toEqual([]);
++  });
++
++  it('only checks the levels that are present', () => {
++    expect(policyUserViolations({ level3: ids.lead }, users(), TEAM)).toEqual([]);
++    expect(policyUserViolations({}, new Map(), TEAM)).toEqual([]);
++  });
++
++  it.each([
++    ['level1', { level1: ids.lead }],
++    ['level2', { level2: ids.admin }],
++    ['level3', { level3: ids.engineer }],
++    ['fallbackAdmin', { fallbackAdmin: ids.lead }],
++  ])('rejects a wrong role at %s', (field, selection) => {
++    expect(policyUserViolations(selection, users(), TEAM).map((v) => v.field)).toEqual([field]);
++  });
++
++  it('rejects users of another team for team levels but not for the fallback admin', () => {
++    const map = users({
++      [ids.engineer]: facts({ teamId: OTHER_TEAM }),
++      [ids.lead]: facts({ role: 'TEAM_LEAD', teamId: OTHER_TEAM }),
++      [ids.admin]: facts({ role: 'ADMIN', teamId: OTHER_TEAM }),
++    });
++    expect(policyUserViolations(valid, map, TEAM).map((v) => v.field)).toEqual([
++      'level1',
++      'level3',
++    ]);
++  });
++
++  it('rejects deactivated and unknown users', () => {
++    const map = users({ [ids.engineer]: facts({ status: 'DEACTIVATED' }) });
++    const selection = { ...valid, level2: 'f0000000-0000-4000-8000-000000000009' };
++    expect(policyUserViolations(selection, map, TEAM)).toEqual([
++      { field: 'level1', issue: 'User is not active' },
++      { field: 'level2', issue: 'User does not exist' },
++    ]);
++  });
++});
+diff --git a/backend/src/modules/appService/policy-users.rules.ts b/backend/src/modules/appService/policy-users.rules.ts
+new file mode 100644
+index 0000000..918357b
+--- /dev/null
++++ b/backend/src/modules/appService/policy-users.rules.ts
+@@ -0,0 +1,49 @@
++import type { UserRole } from '../../shared/types/auth-context.js';
++
++export const POLICY_LEVELS = ['level1', 'level2', 'level3', 'fallbackAdmin'] as const;
++export type PolicyLevel = (typeof POLICY_LEVELS)[number];
++
++export type PolicyUsers = Partial<Record<PolicyLevel, string>>;
++
++export type PolicyUserFacts = {
++  role: UserRole;
++  status: 'ACTIVE' | 'DEACTIVATED';
++  teamId: string | null;
++};
++
++const REQUIRED_ROLE: Record<PolicyLevel, UserRole> = {
++  level1: 'ENGINEER',
++  level2: 'ENGINEER',
++  level3: 'TEAM_LEAD',
++  fallbackAdmin: 'ADMIN',
++};
++
++/**
++ * Checks the selected policy users against the service's team: `level1`/`level2` must be active
++ * engineers and `level3` an active team lead of that team; `fallbackAdmin` an active admin.
++ * An unknown user id is a violation.
++ */
++export function policyUserViolations(
++  selection: PolicyUsers,
++  users: ReadonlyMap<string, PolicyUserFacts>,
++  teamId: string,
++): { field: PolicyLevel; issue: string }[] {
++  const violations: { field: PolicyLevel; issue: string }[] = [];
++  for (const level of POLICY_LEVELS) {
++    const userId = selection[level];
++    if (userId === undefined) continue;
++
++    const user = users.get(userId);
++    const role = REQUIRED_ROLE[level];
++    if (!user) {
++      violations.push({ field: level, issue: 'User does not exist' });
++    } else if (user.status !== 'ACTIVE') {
++      violations.push({ field: level, issue: 'User is not active' });
++    } else if (user.role !== role) {
++      violations.push({ field: level, issue: `User must have the ${role} role` });
++    } else if (level !== 'fallbackAdmin' && user.teamId !== teamId) {
++      violations.push({ field: level, issue: "User must belong to the service's team" });
++    }
++  }
++  return violations;
++}
+diff --git a/backend/src/modules/appService/services/service.controller.ts b/backend/src/modules/appService/services/service.controller.ts
+new file mode 100644
+index 0000000..6343684
+--- /dev/null
++++ b/backend/src/modules/appService/services/service.controller.ts
+@@ -0,0 +1,32 @@
++import type { RequestHandler } from 'express';
++import { parseOrThrow } from '../../../shared/errors/zod.js';
++import { getAuth } from '../../identity/index.js';
++import { pageResponse } from '../appService.common.js';
++import * as serviceService from './service.service.js';
++import {
++  createServiceBodySchema,
++  listServicesQuerySchema,
++  serviceParamsSchema,
++  updateServiceBodySchema,
++} from './service.schema.js';
++
++export const createServiceHandler: RequestHandler = async (req, res) => {
++  const body = parseOrThrow(createServiceBodySchema, req.body);
++  res.status(201).json({ data: await serviceService.createService(body) });
++};
++
++export const listServicesHandler: RequestHandler = async (req, res) => {
++  const query = parseOrThrow(listServicesQuerySchema, req.query);
++  res.status(200).json(pageResponse(await serviceService.listServices(getAuth(req), query)));
++};
++
++export const getServiceHandler: RequestHandler = async (req, res) => {
++  const { serviceId } = parseOrThrow(serviceParamsSchema, req.params);
++  res.status(200).json({ data: await serviceService.getService(getAuth(req), serviceId) });
++};
++
++export const updateServiceHandler: RequestHandler = async (req, res) => {
++  const { serviceId } = parseOrThrow(serviceParamsSchema, req.params);
++  const body = parseOrThrow(updateServiceBodySchema, req.body);
++  res.status(200).json({ data: await serviceService.updateService(serviceId, body) });
++};
+diff --git a/backend/src/modules/appService/services/service.mapper.ts b/backend/src/modules/appService/services/service.mapper.ts
+new file mode 100644
+index 0000000..3a5b7d5
+--- /dev/null
++++ b/backend/src/modules/appService/services/service.mapper.ts
+@@ -0,0 +1,32 @@
++import type { AppService } from '../../../generated/prisma/client.js';
++import { SLA_FIELDS, type SlaValues } from '../sla.rules.js';
++
++export type ServiceResponse = SlaValues & {
++  id: string;
++  name: string;
++  defaultSeverity: 'P0' | 'P1' | 'P2' | 'P3';
++  status: 'ACTIVE' | 'DEACTIVATED';
++  teamId: string;
++  escalationPolicyId: string;
++  createdAt: Date;
++  updatedAt: Date;
++};
++
++/** The eight stored SLA values of a service. */
++export function slaValuesOf(service: AppService): SlaValues {
++  return Object.fromEntries(SLA_FIELDS.map((field) => [field, service[field]])) as SlaValues;
++}
++
++export function toServiceResponse(service: AppService): ServiceResponse {
++  return {
++    id: service.id,
++    name: service.name,
++    defaultSeverity: service.defaultSeverity,
++    status: service.status,
++    ...slaValuesOf(service),
++    teamId: service.teamId,
++    escalationPolicyId: service.escalationPolicyId,
++    createdAt: service.createdAt,
++    updatedAt: service.updatedAt,
++  };
++}
+diff --git a/backend/src/modules/appService/services/service.repository.ts b/backend/src/modules/appService/services/service.repository.ts
+new file mode 100644
+index 0000000..ebac9b9
+--- /dev/null
++++ b/backend/src/modules/appService/services/service.repository.ts
+@@ -0,0 +1,68 @@
++import { Prisma } from '../../../generated/prisma/client.js';
++import type { SlaValues } from '../sla.rules.js';
++import type { Db } from '../transaction.js';
++import type { ListServicesQuery } from './service.schema.js';
++
++/** Statuses that make an incident "unresolved". */
++export const UNRESOLVED_INCIDENT_STATUSES = ['OPEN', 'ACKNOWLEDGED', 'MITIGATING'] as const;
++
++export type NewService = SlaValues & {
++  name: string;
++  defaultSeverity?: 'P0' | 'P1' | 'P2' | 'P3';
++  teamId: string;
++  escalationPolicyId: string;
++};
++
++export function insertService(db: Db, data: NewService) {
++  return db.appService.create({ data });
++}
++
++export function findServiceById(db: Db, id: string) {
++  return db.appService.findUnique({ where: { id } });
++}
++
++/** Fetches `limit + 1` rows so the caller can compute `hasMore`. */
++export function listServices(db: Db, query: ListServicesQuery & { teamId?: string }) {
++  return db.appService.findMany({
++    where: query.teamId === undefined ? {} : { teamId: query.teamId },
++    orderBy: [{ [query.orderBy]: query.sort }, { id: query.sort }],
++    skip: query.offset,
++    take: query.limit + 1,
++  });
++}
++
++export function updateService(db: Db, id: string, data: Prisma.AppServiceUncheckedUpdateInput) {
++  return db.appService.update({ where: { id }, data: { ...data, updatedAt: new Date() } });
++}
++
++/** Read-only: any incident of the service, whatever its status. */
++export async function hasAnyIncident(db: Db, serviceId: string): Promise<boolean> {
++  const found = await db.incident.findFirst({
++    where: { affectedServiceId: serviceId },
++    select: { id: true },
++  });
++  return found !== null;
++}
++
++/** Read-only: incidents of the service that are `OPEN`, `ACKNOWLEDGED` or `MITIGATING`. */
++export async function hasUnresolvedIncidents(db: Db, serviceId: string): Promise<boolean> {
++  const found = await db.incident.findFirst({
++    where: { affectedServiceId: serviceId, status: { in: [...UNRESOLVED_INCIDENT_STATUSES] } },
++    select: { id: true },
++  });
++  return found !== null;
++}
++
++/**
++ * Takes a `FOR SHARE` lock on the team row, so a concurrent team deactivation (which checks the
++ * attached services under `FOR UPDATE`) waits for this transaction. `null` when the team is absent.
++ */
++export async function lockTeamForShare(
++  db: Db,
++  teamId: string,
++): Promise<{ status: 'ACTIVE' | 'DEACTIVATED' } | null> {
++  const rows = await db.$queryRaw<{ status: 'ACTIVE' | 'DEACTIVATED' }[]>(
++    Prisma.sql`SELECT "status"::text AS "status" FROM "Team" WHERE "id" = ${teamId}::uuid FOR SHARE`,
++  );
++  return rows[0] ?? null;
++}
+diff --git a/backend/src/modules/appService/services/service.schema.spec.ts b/backend/src/modules/appService/services/service.schema.spec.ts
+new file mode 100644
+index 0000000..991bf2f
+--- /dev/null
++++ b/backend/src/modules/appService/services/service.schema.spec.ts
+@@ -0,0 +1,88 @@
++import { zodErrorToAppError } from '../../../shared/errors/zod.js';
++import { createServiceBodySchema, updateServiceBodySchema } from './service.schema.js';
++
++const uuid = 'a0000000-0000-4000-8000-00000000000a';
++
++const validCreate = {
++  name: 'checkout',
++  P0ResponseSlaMinutes: 5,
++  P0ResolutionSlaMinutes: 30,
++  P1ResponseSlaMinutes: 10,
++  P1ResolutionSlaMinutes: 60,
++  P2ResponseSlaMinutes: 30,
++  P2ResolutionSlaMinutes: 120,
++  P3ResponseSlaMinutes: 60,
++  P3ResolutionSlaMinutes: 240,
++  teamId: uuid,
++  escalationPolicy: { level1: uuid, level2: uuid, level3: uuid, fallbackAdmin: uuid },
++};
++
++function failure(
++  schema: typeof createServiceBodySchema | typeof updateServiceBodySchema,
++  body: unknown,
++) {
++  const result = schema.safeParse(body);
++  if (result.success) throw new Error('expected a validation failure');
++  return zodErrorToAppError(result.error);
++}
++
++describe('createServiceBodySchema', () => {
++  it('accepts a valid body and leaves defaultSeverity undefined when absent', () => {
++    const parsed = createServiceBodySchema.parse(validCreate);
++    expect(parsed.defaultSeverity).toBeUndefined();
++  });
++
++  it.each([
++    ['zero', 0],
++    ['negative', -1],
++    ['fractional', 1.5],
++    ['string', '5'],
++    ['above the integer ceiling', 2_147_483_648],
++  ])('rejects a %s SLA value with 422', (_name, value) => {
++    const error = failure(createServiceBodySchema, { ...validCreate, P2ResponseSlaMinutes: value });
++    expect(error.statusCode).toBe(422);
++  });
++
++  it('rejects resolution below response with 422 on the resolution field', () => {
++    const error = failure(createServiceBodySchema, { ...validCreate, P3ResolutionSlaMinutes: 59 });
++    expect(error.statusCode).toBe(422);
++    expect(error.details).toEqual([
++      {
++        field: 'P3ResolutionSlaMinutes',
++        issue: 'Must be greater than or equal to P3ResponseSlaMinutes',
++      },
++    ]);
++  });
++
++  it.each([
++    ['top level', { ...validCreate, escalationDelayMinutes: 5 }],
++    [
++      'inside the policy',
++      { ...validCreate, escalationPolicy: { ...validCreate.escalationPolicy, delayMinutes: 5 } },
++    ],
++  ])('rejects a timing field %s with 400', (_name, body) => {
++    expect(failure(createServiceBodySchema, body).statusCode).toBe(400);
++  });
++});
++
++describe('updateServiceBodySchema', () => {
++  it('requires at least one field', () => {
++    expect(failure(updateServiceBodySchema, {}).statusCode).toBe(422);
++  });
++
++  it('accepts a partial SLA update and checks ordering only when both values are sent', () => {
++    expect(updateServiceBodySchema.parse({ P1ResponseSlaMinutes: 999 })).toEqual({
++      P1ResponseSlaMinutes: 999,
++    });
++    const error = failure(updateServiceBodySchema, {
++      P1ResponseSlaMinutes: 20,
++      P1ResolutionSlaMinutes: 10,
++    });
++    expect(error.statusCode).toBe(422);
++  });
++
++  it('rejects a non-uuid escalationPolicyId with 422 and unknown fields with 400', () => {
++    expect(failure(updateServiceBodySchema, { escalationPolicyId: 'nope' }).statusCode).toBe(422);
++    expect(failure(updateServiceBodySchema, { name: 'x', delayMinutes: 1 }).statusCode).toBe(400);
++  });
++});
+diff --git a/backend/src/modules/appService/services/service.schema.ts b/backend/src/modules/appService/services/service.schema.ts
+new file mode 100644
+index 0000000..b08c232
+--- /dev/null
++++ b/backend/src/modules/appService/services/service.schema.ts
+@@ -0,0 +1,74 @@
++import { z } from 'zod';
++import { limitSchema, offsetSchema, sortSchema, uuidSchema } from '../appService.common.js';
++import { MAX_SLA_MINUTES, slaOrderingIssues, type SlaField, SLA_FIELDS } from '../sla.rules.js';
++
++const serviceName = z.string().min(1).max(50);
++const severity = z.enum(['P0', 'P1', 'P2', 'P3']);
++const status = z.enum(['ACTIVE', 'DEACTIVATED']);
++const slaMinutes = z.number().int().positive().max(MAX_SLA_MINUTES);
++
++const slaShape = Object.fromEntries(SLA_FIELDS.map((field) => [field, slaMinutes])) as Record<
++  SlaField,
++  typeof slaMinutes
++>;
++const optionalSlaShape = Object.fromEntries(
++  SLA_FIELDS.map((field) => [field, slaMinutes.optional()]),
++) as Record<SlaField, z.ZodOptional<typeof slaMinutes>>;
++
++/** Adds a `422` issue per severity whose resolution is below its response (where both are sent). */
++function checkSlaOrdering(values: Partial<Record<SlaField, number>>, ctx: z.RefinementCtx): void {
++  for (const { field, issue } of slaOrderingIssues(values)) {
++    ctx.addIssue({ code: 'custom', path: [field], message: issue });
++  }
++}
++
++export const createServiceBodySchema = z
++  .object({
++    name: serviceName,
++    defaultSeverity: severity.optional(),
++    ...slaShape,
++    teamId: uuidSchema,
++    escalationPolicy: z
++      .object({
++        level1: uuidSchema,
++        level2: uuidSchema,
++        level3: uuidSchema,
++        fallbackAdmin: uuidSchema,
++      })
++      .strict(),
++  })
++  .strict()
++  .superRefine(checkSlaOrdering);
++
++export const updateServiceBodySchema = z
++  .object({
++    name: serviceName.optional(),
++    defaultSeverity: severity.optional(),
++    status: status.optional(),
++    ...optionalSlaShape,
++    teamId: uuidSchema.optional(),
++    escalationPolicyId: uuidSchema.optional(),
++  })
++  .strict()
++  .superRefine((body, ctx) => {
++    if (Object.values(body).every((value) => value === undefined)) {
++      ctx.addIssue({ code: 'custom', message: 'At least one field is required' });
++    }
++    checkSlaOrdering(body, ctx);
++  });
++
++export const serviceParamsSchema = z.object({ serviceId: uuidSchema }).strict();
++
++export const listServicesQuerySchema = z
++  .object({
++    limit: limitSchema,
++    offset: offsetSchema,
++    teamId: uuidSchema.optional(),
++    orderBy: z.enum(['name', 'createdAt']).default('name'),
++    sort: sortSchema,
++  })
++  .strict();
++
++export type CreateServiceBody = z.output<typeof createServiceBodySchema>;
++export type UpdateServiceBody = z.output<typeof updateServiceBodySchema>;
++export type ListServicesQuery = z.output<typeof listServicesQuerySchema>;
+diff --git a/backend/src/modules/appService/services/service.service.ts b/backend/src/modules/appService/services/service.service.ts
+new file mode 100644
+index 0000000..5e6f927
+--- /dev/null
++++ b/backend/src/modules/appService/services/service.service.ts
+@@ -0,0 +1,160 @@
++import { isUniqueViolation } from '../../../infra/db/errors.js';
++import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
++import { ConflictError, ValidationError } from '../../../shared/errors/AppError.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import { assertSameTeam, requireTeam } from '../../identity/index.js';
++import {
++  invalidAction,
++  serviceNotFound,
++  toPage,
++  policyNotFound,
++  type Page,
++} from '../appService.common.js';
++import {
++  findPolicyWithOwner,
++  insertPolicy,
++  lockUsersForShare,
++} from '../escalation-policies/policy.repository.js';
++import { policyUserViolations } from '../policy-users.rules.js';
++import { SLA_FIELDS, slaOrderingIssues } from '../sla.rules.js';
++import { runServiceTransaction, type Db } from '../transaction.js';
++import { slaValuesOf, toServiceResponse, type ServiceResponse } from './service.mapper.js';
++import {
++  findServiceById,
++  hasAnyIncident,
++  hasUnresolvedIncidents,
++  insertService,
++  listServices as selectServices,
++  lockTeamForShare,
++  updateService as writeService,
++} from './service.repository.js';
++import type { CreateServiceBody, ListServicesQuery, UpdateServiceBody } from './service.schema.js';
++
++const duplicateService = () =>
++  new ConflictError('A service with this name already exists', 'SERVICE_ALREADY_EXISTS');
++
++/** Team must exist and be active; the row is locked `FOR SHARE` until the transaction ends. */
++async function assertAssignableTeam(tx: Db, teamId: string): Promise<void> {
++  const team = await lockTeamForShare(tx, teamId);
++  if (team === null || team.status === 'DEACTIVATED') {
++    throw invalidAction('Team does not exist or is deactivated');
++  }
++}
++
++export async function createService(body: CreateServiceBody): Promise<ServiceResponse> {
++  const { escalationPolicy, ...serviceFields } = body;
++  try {
++    return await runServiceTransaction(async (tx) => {
++      await assertAssignableTeam(tx, body.teamId);
++
++      const users = await lockUsersForShare(tx, Object.values(escalationPolicy));
++      const violations = policyUserViolations(escalationPolicy, users, body.teamId);
++      if (violations.length > 0) {
++        throw invalidAction('Escalation policy users are not valid for this service', violations);
++      }
++
++      const policy = await insertPolicy(tx, {
++        level1Id: escalationPolicy.level1,
++        level2Id: escalationPolicy.level2,
++        level3Id: escalationPolicy.level3,
++        fallbackAdminId: escalationPolicy.fallbackAdmin,
++      });
++      const service = await insertService(tx, { ...serviceFields, escalationPolicyId: policy.id });
++      return toServiceResponse(service);
++    });
++  } catch (error) {
++    if (isUniqueViolation(error)) throw duplicateService();
++    throw error;
++  }
++}
++
++/** Admins see any team (optionally filtered); other roles see their own team only. */
++export async function listServices(
++  auth: AuthContext,
++  query: ListServicesQuery,
++): Promise<Page<ServiceResponse>> {
++  let teamId = query.teamId;
++  if (auth.role !== 'ADMIN') {
++    const ownTeamId = requireTeam(auth);
++    if (teamId !== undefined) assertSameTeam(auth, teamId);
++    teamId = ownTeamId;
++  }
++  const rows = await selectServices(getPrisma(), { ...query, teamId });
++  return toPage(rows.map(toServiceResponse), query.limit, query.offset);
++}
++
++export async function getService(auth: AuthContext, serviceId: string): Promise<ServiceResponse> {
++  if (auth.role !== 'ADMIN') requireTeam(auth);
++  const service = await findServiceById(getPrisma(), serviceId);
++  if (!service) throw serviceNotFound();
++  if (auth.role !== 'ADMIN') assertSameTeam(auth, service.teamId);
++  return toServiceResponse(service);
++}
++
++/** The fields of `patch` that are present and differ from the stored `current` values. */
++function changedFields<T extends object>(current: object, patch: T): Partial<T> {
++  const stored = current as Record<string, unknown>;
++  const changed = Object.entries(patch).filter(
++    ([key, value]) => value !== undefined && stored[key] !== value,
++  );
++  return Object.fromEntries(changed) as Partial<T>;
++}
++
++export async function updateService(
++  serviceId: string,
++  body: UpdateServiceBody,
++): Promise<ServiceResponse> {
++  try {
++    return await runServiceTransaction(async (tx) => {
++      // The lock conflicts with the key-share lock an incident insert takes on this row, so the
++      // incident checks below see every incident that committed before this update.
++      if (!(await lockRowForUpdate(tx, 'AppService', serviceId))) throw serviceNotFound();
++      const stored = await findServiceById(tx, serviceId);
++      if (!stored) throw serviceNotFound();
++
++      const changes = changedFields(stored, body);
++
++      const slaIssues = slaOrderingIssues({ ...slaValuesOf(stored), ...changes });
++      if (slaIssues.length > 0) {
++        throw new ValidationError('Request validation failed', 'VALIDATION_FAILED', slaIssues);
++      }
++
++      const policyChanging = changes.escalationPolicyId !== undefined;
++
++      if (changes.teamId !== undefined) {
++        await assertAssignableTeam(tx, changes.teamId);
++        // Any incident pins the service to its team; this wins over SERVICE_HAS_OPEN_INCIDENTS.
++        if (await hasAnyIncident(tx, serviceId)) {
++          throw invalidAction('The team of a service with incidents cannot change');
++        }
++      }
++
++      if (changes.escalationPolicyId !== undefined) {
++        // Locking the policy serializes two services racing for the same orphaned policy.
++        if (!(await lockRowForUpdate(tx, 'EscalationPolicy', changes.escalationPolicyId))) {
++          throw policyNotFound();
++        }
++        const policy = await findPolicyWithOwner(tx, changes.escalationPolicyId);
++        if (!policy) throw policyNotFound();
++        if (policy.appService !== null) {
++          throw invalidAction('The escalation policy is attached to another service');
++        }
++      }
++
++      const slaChanging = SLA_FIELDS.some((field) => changes[field] !== undefined);
++      const deactivating = changes.status === 'DEACTIVATED';
++      if (
++        (deactivating || slaChanging || policyChanging) &&
++        (await hasUnresolvedIncidents(tx, serviceId))
++      ) {
++        throw new ConflictError('Service has unresolved incidents', 'SERVICE_HAS_OPEN_INCIDENTS');
++      }
++
++      if (Object.keys(changes).length === 0) return toServiceResponse(stored);
++      return toServiceResponse(await writeService(tx, serviceId, changes));
++    });
++  } catch (error) {
++    if (isUniqueViolation(error)) throw duplicateService();
++    throw error;
++  }
++}
+diff --git a/backend/src/modules/appService/sla.rules.spec.ts b/backend/src/modules/appService/sla.rules.spec.ts
+new file mode 100644
+index 0000000..b7678f0
+--- /dev/null
++++ b/backend/src/modules/appService/sla.rules.spec.ts
+@@ -0,0 +1,42 @@
++import { SLA_FIELDS, slaOrderingIssues } from './sla.rules.js';
++
++describe('slaOrderingIssues', () => {
++  it('accepts resolution equal to or above response for every severity', () => {
++    expect(
++      slaOrderingIssues({
++        P0ResponseSlaMinutes: 5,
++        P0ResolutionSlaMinutes: 5,
++        P1ResponseSlaMinutes: 10,
++        P1ResolutionSlaMinutes: 60,
++      }),
++    ).toEqual([]);
++  });
++
++  it('reports each severity whose resolution is below its response', () => {
++    const issues = slaOrderingIssues({
++      P0ResponseSlaMinutes: 30,
++      P0ResolutionSlaMinutes: 29,
++      P2ResponseSlaMinutes: 60,
++      P2ResolutionSlaMinutes: 10,
++      P3ResponseSlaMinutes: 1,
++      P3ResolutionSlaMinutes: 2,
++    });
++    expect(issues.map((issue) => issue.field)).toEqual([
++      'P0ResolutionSlaMinutes',
++      'P2ResolutionSlaMinutes',
++    ]);
++  });
++
++  it('ignores a severity that is only half present (a partial patch)', () => {
++    expect(slaOrderingIssues({ P1ResponseSlaMinutes: 999 })).toEqual([]);
++    expect(slaOrderingIssues({ P1ResolutionSlaMinutes: 1 })).toEqual([]);
++  });
++
++  it('validates stored values merged with a patch', () => {
++    const stored = Object.fromEntries(SLA_FIELDS.map((field) => [field, 60]));
++    const merged = { ...stored, P1ResponseSlaMinutes: 61 };
++    expect(slaOrderingIssues(merged).map((issue) => issue.field)).toEqual([
++      'P1ResolutionSlaMinutes',
++    ]);
++  });
++});
+diff --git a/backend/src/modules/appService/sla.rules.ts b/backend/src/modules/appService/sla.rules.ts
+new file mode 100644
+index 0000000..0aca74d
+--- /dev/null
++++ b/backend/src/modules/appService/sla.rules.ts
+@@ -0,0 +1,31 @@
++export const SEVERITIES = ['P0', 'P1', 'P2', 'P3'] as const;
++export type Severity = (typeof SEVERITIES)[number];
++
++export type SlaField = `${Severity}ResponseSlaMinutes` | `${Severity}ResolutionSlaMinutes`;
++export type SlaValues = Record<SlaField, number>;
++
++export const SLA_FIELDS: readonly SlaField[] = SEVERITIES.flatMap(
++  (severity) => [`${severity}ResponseSlaMinutes`, `${severity}ResolutionSlaMinutes`] as const,
++);
++
++/** PostgreSQL `integer` ceiling; larger values would fail at the database. */
++export const MAX_SLA_MINUTES = 2_147_483_647;
++
++/**
++ * For each severity whose response and resolution values are both present, the resolution
++ * must be at least the response. Returns one issue per violating severity (on the resolution field).
++ */
++export function slaOrderingIssues(values: Partial<SlaValues>): { field: string; issue: string }[] {
++  const issues: { field: string; issue: string }[] = [];
++  for (const severity of SEVERITIES) {
++    const response = values[`${severity}ResponseSlaMinutes`];
++    const resolution = values[`${severity}ResolutionSlaMinutes`];
++    if (response !== undefined && resolution !== undefined && resolution < response) {
++      issues.push({
++        field: `${severity}ResolutionSlaMinutes`,
++        issue: `Must be greater than or equal to ${severity}ResponseSlaMinutes`,
++      });
++    }
++  }
++  return issues;
++}
+diff --git a/backend/src/modules/appService/transaction.ts b/backend/src/modules/appService/transaction.ts
+new file mode 100644
+index 0000000..2323025
+--- /dev/null
++++ b/backend/src/modules/appService/transaction.ts
+@@ -0,0 +1,20 @@
++import { isConcurrencyFailure } from '../../infra/db/errors.js';
++import { runInTransaction, type TransactionClient } from '../../infra/db/prisma.js';
++import { ConflictError } from '../../shared/errors/AppError.js';
++
++export type Db = TransactionClient;
++
++/** Runs `work` in one transaction; lock timeouts and deadlocks become `409 CONCURRENCY_CONFLICT`. */
++export async function runServiceTransaction<T>(work: (tx: Db) => Promise<T>): Promise<T> {
++  try {
++    return await runInTransaction(work);
++  } catch (error) {
++    if (isConcurrencyFailure(error)) {
++      throw new ConflictError(
++        'The request conflicted with a concurrent change; retry',
++        'CONCURRENCY_CONFLICT',
++      );
++    }
++    throw error;
++  }
++}
+diff --git a/backend/test/integration/services.int-spec.ts b/backend/test/integration/services.int-spec.ts
+new file mode 100644
+index 0000000..901a50f
+--- /dev/null
++++ b/backend/test/integration/services.int-spec.ts
+@@ -0,0 +1,1137 @@
++import { randomUUID } from 'node:crypto';
++import { Client } from 'pg';
++import request from 'supertest';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { getRedis } from '../../src/infra/redis/redis';
++import { getEscalationPolicyByService, getServiceConfig } from '../../src/modules/appService';
++import { buildTestApp } from '../helpers/app';
++import {
++  adminSession,
++  bearer,
++  createIncident,
++  createService,
++  createTeam,
++  createUser,
++  resetState,
++  sessionFor,
++} from '../helpers/identity';
++import { testDatabaseUrl } from '../helpers/test-env';
++
++const app = buildTestApp();
++const api = '/api/v1/services';
++const NIL = '00000000-0000-4000-8000-000000000000';
++
++beforeEach(resetState);
++afterAll(async () => {
++  await getPrisma().$disconnect();
++  getRedis().disconnect();
++});
++
++const SLA = {
++  P0ResponseSlaMinutes: 5,
++  P0ResolutionSlaMinutes: 30,
++  P1ResponseSlaMinutes: 10,
++  P1ResolutionSlaMinutes: 60,
++  P2ResponseSlaMinutes: 30,
++  P2ResolutionSlaMinutes: 120,
++  P3ResponseSlaMinutes: 60,
++  P3ResolutionSlaMinutes: 240,
++};
++
++const SERVICE_KEYS = [
++  'createdAt',
++  'defaultSeverity',
++  'escalationPolicyId',
++  'id',
++  'name',
++  'status',
++  'teamId',
++  'updatedAt',
++  ...Object.keys(SLA),
++].sort();
++const POLICY_KEYS = ['createdAt', 'fallbackAdmin', 'id', 'level1', 'level2', 'level3', 'updatedAt'];
++
++/** A team with the users an escalation policy needs. */
++async function kit() {
++  const team = await createTeam();
++  const engineer1 = await createUser({ role: 'ENGINEER', teamId: team.id });
++  const engineer2 = await createUser({ role: 'ENGINEER', teamId: team.id });
++  const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++  return { team, engineer1, engineer2, lead };
++}
++type Kit = Awaited<ReturnType<typeof kit>>;
++
++function createBody(k: Kit, adminId: string, overrides: Record<string, unknown> = {}) {
++  return {
++    name: `svc-${randomUUID().slice(0, 8)}`,
++    ...SLA,
++    teamId: k.team.id,
++    escalationPolicy: {
++      level1: k.engineer1.id,
++      level2: k.engineer2.id,
++      level3: k.lead.id,
++      fallbackAdmin: adminId,
++    },
++    ...overrides,
++  };
++}
++
++type CreatedService = { id: string; name: string; teamId: string; escalationPolicyId: string };
++
++/** An admin session plus a service created through S1. */
++async function setup() {
++  const k = await kit();
++  const admin = await adminSession(app);
++  const res = await request(app)
++    .post(api)
++    .set(bearer(admin.token))
++    .send(createBody(k, admin.admin.id));
++  expect(res.status).toBe(201);
++  return { k, admin, service: res.body.data as CreatedService };
++}
++
++const patchService = (token: string, id: string, body: unknown) =>
++  request(app)
++    .patch(`${api}/${id}`)
++    .set(bearer(token))
++    .send(body as object);
++const policyUrl = (serviceId: string, policyId: string) =>
++  `${api}/${serviceId}/escalation-policies/${policyId}`;
++
++describe('S1 POST /services', () => {
++  it('creates an ACTIVE service with its policy in one request (201)', async () => {
++    const k = await kit();
++    const { token, admin } = await adminSession(app);
++    const res = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .send(createBody(k, admin.id, { name: 'checkout' }));
++
++    expect(res.status).toBe(201);
++    expect(Object.keys(res.body.data).sort()).toEqual(SERVICE_KEYS);
++    expect(res.body.data).toMatchObject({
++      name: 'checkout',
++      status: 'ACTIVE',
++      defaultSeverity: 'P1',
++      teamId: k.team.id,
++      ...SLA,
++    });
++    const policy = await getPrisma().escalationPolicy.findUniqueOrThrow({
++      where: { id: res.body.data.escalationPolicyId },
++    });
++    expect(policy).toMatchObject({
++      level1Id: k.engineer1.id,
++      level2Id: k.engineer2.id,
++      level3Id: k.lead.id,
++      fallbackAdminId: admin.id,
++    });
++  });
++
++  it('stores an explicit defaultSeverity', async () => {
++    const k = await kit();
++    const { token, admin } = await adminSession(app);
++    const res = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .send(createBody(k, admin.id, { defaultSeverity: 'P0' }));
++    expect(res.body.data.defaultSeverity).toBe('P0');
++  });
++
++  it('accepts an admin of another team (or of none) as fallbackAdmin', async () => {
++    const k = await kit();
++    const { token } = await adminSession(app);
++    const otherAdmin = await createUser({ role: 'ADMIN', teamId: (await createTeam()).id });
++    const res = await request(app).post(api).set(bearer(token)).send(createBody(k, otherAdmin.id));
++    expect(res.status).toBe(201);
++  });
++
++  it('requires authentication and the ADMIN role', async () => {
++    const k = await kit();
++    const { admin } = await adminSession(app);
++    expect((await request(app).post(api).send(createBody(k, admin.id))).status).toBe(401);
++    for (const role of ['ENGINEER', 'TEAM_LEAD'] as const) {
++      const { token } = await sessionFor(app, role, k.team.id);
++      const res = await request(app).post(api).set(bearer(token)).send(createBody(k, admin.id));
++      expect(res.status).toBe(403);
++      expect(res.body.error.code).toBe('FORBIDDEN_ROLE');
++    }
++  });
++
++  it.each([
++    ['empty name', { name: '' }],
++    ['name over 50 chars', { name: 'x'.repeat(51) }],
++    ['missing name', { name: undefined }],
++    ['missing SLA field', { P2ResolutionSlaMinutes: undefined }],
++    ['zero SLA value', { P0ResponseSlaMinutes: 0 }],
++    ['negative SLA value', { P1ResponseSlaMinutes: -5 }],
++    ['non-integer SLA value', { P3ResponseSlaMinutes: 1.5 }],
++    ['resolution below response', { P0ResolutionSlaMinutes: 4 }],
++    ['invalid defaultSeverity', { defaultSeverity: 'P9' }],
++    ['non-uuid teamId', { teamId: 'nope' }],
++    ['missing escalationPolicy', { escalationPolicy: undefined }],
++    [
++      'non-uuid policy user',
++      { escalationPolicy: { level1: 'x', level2: NIL, level3: NIL, fallbackAdmin: NIL } },
++    ],
++    ['incomplete policy', { escalationPolicy: { level1: NIL } }],
++  ])('rejects %s with 422', async (_name, override) => {
++    const k = await kit();
++    const { token, admin } = await adminSession(app);
++    const res = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .send(createBody(k, admin.id, override));
++    expect(res.status).toBe(422);
++    expect(res.body.error.code).toBe('VALIDATION_FAILED');
++    expect(await getPrisma().appService.count()).toBe(0);
++  });
++
++  it.each([
++    ['unknown field', { status: 'ACTIVE' }],
++    ['timing field on the service', { escalationDelayMinutes: 5 }],
++    ['timing field inside the policy', { escalationPolicy: { delayMinutes: 5 } }],
++  ])('rejects %s with 400', async (_name, extra) => {
++    const k = await kit();
++    const { token, admin } = await adminSession(app);
++    const base = createBody(k, admin.id);
++    const body =
++      'escalationPolicy' in extra
++        ? { ...base, escalationPolicy: { ...base.escalationPolicy, ...extra.escalationPolicy } }
++        : { ...base, ...extra };
++    const res = await request(app).post(api).set(bearer(token)).send(body);
++    expect(res.status).toBe(400);
++    expect(res.body.error.code).toBe('BAD_REQUEST');
++  });
++
++  it('rejects malformed JSON and a non-JSON content type with 400', async () => {
++    const { token } = await adminSession(app);
++    const malformed = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .set('Content-Type', 'application/json')
++      .send('{"name":');
++    expect(malformed.status).toBe(400);
++    const wrongType = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .set('Content-Type', 'text/plain')
++      .send('name=x');
++    expect(wrongType.status).toBe(400);
++  });
++
++  it('rejects a missing or deactivated team with 403 INVALID_ACTION', async () => {
++    const k = await kit();
++    const { token, admin } = await adminSession(app);
++    const missing = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .send(createBody(k, admin.id, { teamId: NIL }));
++    expect(missing.status).toBe(403);
++    expect(missing.body.error.code).toBe('INVALID_ACTION');
++
++    await getPrisma().team.update({ where: { id: k.team.id }, data: { status: 'DEACTIVATED' } });
++    const deactivated = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .send(createBody(k, admin.id));
++    expect(deactivated.status).toBe(403);
++    expect(deactivated.body.error.code).toBe('INVALID_ACTION');
++  });
++
++  it('validates the policy user of each level (role, team, status) with 403 INVALID_ACTION', async () => {
++    const k = await kit();
++    const { token, admin } = await adminSession(app);
++    const otherTeam = await createTeam();
++    const foreignEngineer = await createUser({ role: 'ENGINEER', teamId: otherTeam.id });
++    const foreignLead = await createUser({ role: 'TEAM_LEAD', teamId: otherTeam.id });
++    const inactive = await createUser({
++      role: 'ENGINEER',
++      teamId: k.team.id,
++      status: 'DEACTIVATED',
++    });
++    const policy = (patch: object) => ({
++      level1: k.engineer1.id,
++      level2: k.engineer2.id,
++      level3: k.lead.id,
++      fallbackAdmin: admin.id,
++      ...patch,
++    });
++    const cases: [string, object][] = [
++      ['level1 is a team lead', policy({ level1: k.lead.id })],
++      ['level1 is of another team', policy({ level1: foreignEngineer.id })],
++      ['level1 is deactivated', policy({ level1: inactive.id })],
++      ['level2 is an admin', policy({ level2: admin.id })],
++      ['level2 is of another team', policy({ level2: foreignEngineer.id })],
++      ['level2 does not exist', policy({ level2: NIL })],
++      ['level3 is an engineer', policy({ level3: k.engineer1.id })],
++      ['level3 is of another team', policy({ level3: foreignLead.id })],
++      ['fallbackAdmin is a team lead', policy({ fallbackAdmin: k.lead.id })],
++    ];
++    for (const [label, escalationPolicy] of cases) {
++      const res = await request(app)
++        .post(api)
++        .set(bearer(token))
++        .send(createBody(k, admin.id, { escalationPolicy }));
++      expect([label, res.status, res.body.error?.code]).toEqual([label, 403, 'INVALID_ACTION']);
++    }
++    const deactivatedAdmin = await createUser({ role: 'ADMIN', status: 'DEACTIVATED' });
++    const res = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .send(
++        createBody(k, admin.id, {
++          escalationPolicy: policy({ fallbackAdmin: deactivatedAdmin.id }),
++        }),
++      );
++    expect(res.status).toBe(403);
++  });
++
++  it('is atomic: an invalid policy user or a duplicate name leaves no service or policy rows', async () => {
++    const k = await kit();
++    const { token, admin } = await adminSession(app);
++    const bad = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .send(
++        createBody(k, admin.id, {
++          escalationPolicy: {
++            level1: k.lead.id,
++            level2: k.engineer2.id,
++            level3: k.lead.id,
++            fallbackAdmin: admin.id,
++          },
++        }),
++      );
++    expect(bad.status).toBe(403);
++    expect([
++      await getPrisma().appService.count(),
++      await getPrisma().escalationPolicy.count(),
++    ]).toEqual([0, 0]);
++
++    await request(app)
++      .post(api)
++      .set(bearer(token))
++      .send(createBody(k, admin.id, { name: 'dup' }));
++    const dup = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .send(createBody(k, admin.id, { name: 'dup' }));
++    expect(dup.status).toBe(409);
++    expect(dup.body.error.code).toBe('SERVICE_ALREADY_EXISTS');
++    expect([
++      await getPrisma().appService.count(),
++      await getPrisma().escalationPolicy.count(),
++    ]).toEqual([1, 1]);
++  });
++
++  it('waits for a concurrent team deactivation that holds the team row lock', async () => {
++    const k = await kit();
++    const { token, admin } = await adminSession(app);
++    const client = new Client({ connectionString: testDatabaseUrl() });
++    await client.connect();
++    try {
++      await client.query('BEGIN');
++      await client.query('SELECT "id" FROM "Team" WHERE "id" = $1 FOR UPDATE', [k.team.id]);
++      await client.query(`UPDATE "Team" SET "status" = 'DEACTIVATED' WHERE "id" = $1`, [k.team.id]);
++
++      let settled = false;
++      const pending = request(app)
++        .post(api)
++        .set(bearer(token))
++        .send(createBody(k, admin.id))
++        .then((res) => {
++          settled = true;
++          return res;
++        });
++      await new Promise((resolve) => setTimeout(resolve, 500));
++      expect(settled).toBe(false);
++
++      await client.query('COMMIT');
++      const res = await pending;
++      expect([res.status, res.body.error.code]).toEqual([403, 'INVALID_ACTION']);
++      expect(await getPrisma().appService.count()).toBe(0);
++    } finally {
++      await client.end();
++    }
++  });
++
++  it('has a single winner for concurrent creates with the same name', async () => {
++    const k = await kit();
++    const { token, admin } = await adminSession(app);
++    const responses = await Promise.all(
++      [1, 2, 3, 4].map(() =>
++        request(app)
++          .post(api)
++          .set(bearer(token))
++          .send(createBody(k, admin.id, { name: 'race' })),
++      ),
++    );
++    expect(responses.filter((r) => r.status === 201)).toHaveLength(1);
++    for (const r of responses.filter((r) => r.status !== 201)) {
++      expect([r.status, r.body.error.code]).toEqual([409, 'SERVICE_ALREADY_EXISTS']);
++    }
++    expect(await getPrisma().escalationPolicy.count()).toBe(1);
++  });
++});
++
++describe('S2 GET /services', () => {
++  it('lets an admin list every team and filter by teamId', async () => {
++    const admin = await adminSession(app);
++    const a = await createTeam();
++    const b = await createTeam();
++    await createService(a.id, admin.admin.id);
++    await createService(a.id, admin.admin.id);
++    await createService(b.id, admin.admin.id);
++
++    const all = await request(app).get(api).set(bearer(admin.token));
++    expect(all.status).toBe(200);
++    expect(all.body.data).toHaveLength(3);
++    expect(Object.keys(all.body.data[0]).sort()).toEqual(SERVICE_KEYS);
++    expect(all.body.pagination).toEqual({ limit: 10, offset: 0, hasMore: false });
++
++    const filtered = await request(app).get(`${api}?teamId=${b.id}`).set(bearer(admin.token));
++    expect(filtered.body.data).toHaveLength(1);
++    expect(filtered.body.data[0].teamId).toBe(b.id);
++  });
++
++  it('shows team leads and engineers only their own team', async () => {
++    const { admin } = await adminSession(app);
++    const a = await createTeam();
++    const b = await createTeam();
++    await createService(a.id, admin.id);
++    await createService(b.id, admin.id);
++    for (const role of ['TEAM_LEAD', 'ENGINEER'] as const) {
++      const { token } = await sessionFor(app, role, a.id);
++      const res = await request(app).get(api).set(bearer(token));
++      expect(res.status).toBe(200);
++      expect(res.body.data.map((s: { teamId: string }) => s.teamId)).toEqual([a.id]);
++      const own = await request(app).get(`${api}?teamId=${a.id}`).set(bearer(token));
++      expect(own.body.data).toHaveLength(1);
++      const other = await request(app).get(`${api}?teamId=${b.id}`).set(bearer(token));
++      expect(other.status).toBe(403);
++      expect(other.body.error.code).toBe('TEAM_ACCESS_DENIED');
++    }
++  });
++
++  it('rejects a non-admin without a team with 403 INVALID_ACTION', async () => {
++    const { token } = await sessionFor(app, 'ENGINEER', null);
++    const res = await request(app).get(api).set(bearer(token));
++    expect(res.status).toBe(403);
++    expect(res.body.error.code).toBe('INVALID_ACTION');
++    const admin = await adminSession(app, null);
++    expect((await request(app).get(api).set(bearer(admin.token))).status).toBe(200);
++  });
++
++  it('paginates, sorts with an id tie-breaker and validates the query', async () => {
++    const admin = await adminSession(app);
++    const team = await createTeam();
++    for (let i = 0; i < 3; i++) await createService(team.id, admin.admin.id);
++
++    const first = await request(app).get(`${api}?limit=2`).set(bearer(admin.token));
++    expect(first.body.data).toHaveLength(2);
++    expect(first.body.pagination).toEqual({ limit: 2, offset: 0, hasMore: true });
++    const second = await request(app).get(`${api}?limit=2&offset=2`).set(bearer(admin.token));
++    expect(second.body.data).toHaveLength(1);
++    expect(second.body.pagination.hasMore).toBe(false);
++
++    const asc = await request(app).get(`${api}?orderBy=name&sort=asc`).set(bearer(admin.token));
++    const desc = await request(app).get(`${api}?orderBy=name&sort=desc`).set(bearer(admin.token));
++    const names = asc.body.data.map((s: { name: string }) => s.name);
++    expect(names).toEqual([...names].sort());
++    expect(desc.body.data.map((s: { name: string }) => s.name)).toEqual([...names].reverse());
++
++    for (const query of [
++      'limit=51',
++      'limit=0',
++      'offset=-1',
++      'orderBy=status',
++      'sort=up',
++      'teamId=x',
++    ]) {
++      const res = await request(app).get(`${api}?${query}`).set(bearer(admin.token));
++      expect([query, res.status]).toEqual([query, 422]);
++    }
++    expect((await request(app).get(`${api}?bogus=1`).set(bearer(admin.token))).status).toBe(400);
++    expect((await request(app).get(api)).status).toBe(401);
++  });
++});
++
++describe('S3 GET /services/:serviceId', () => {
++  it('returns the service to an admin and to the owning team', async () => {
++    const { k, admin, service } = await setup();
++    const asAdmin = await request(app).get(`${api}/${service.id}`).set(bearer(admin.token));
++    expect(asAdmin.status).toBe(200);
++    expect(Object.keys(asAdmin.body.data).sort()).toEqual(SERVICE_KEYS);
++    for (const role of ['TEAM_LEAD', 'ENGINEER'] as const) {
++      const { token } = await sessionFor(app, role, k.team.id);
++      expect((await request(app).get(`${api}/${service.id}`).set(bearer(token))).status).toBe(200);
++    }
++  });
++
++  it('enforces team isolation, the null-team rule, 404 and path validation', async () => {
++    const { admin, service } = await setup();
++    const other = await createTeam();
++    const foreign = await sessionFor(app, 'TEAM_LEAD', other.id);
++    const denied = await request(app).get(`${api}/${service.id}`).set(bearer(foreign.token));
++    expect([denied.status, denied.body.error.code]).toEqual([403, 'TEAM_ACCESS_DENIED']);
++
++    const noTeam = await sessionFor(app, 'ENGINEER', null);
++    const invalid = await request(app).get(`${api}/${service.id}`).set(bearer(noTeam.token));
++    expect([invalid.status, invalid.body.error.code]).toEqual([403, 'INVALID_ACTION']);
++
++    const missing = await request(app).get(`${api}/${NIL}`).set(bearer(admin.token));
++    expect([missing.status, missing.body.error.code]).toEqual([404, 'SERVICE_NOT_FOUND']);
++    expect(missing.body.error.details).toEqual([{ resource: 'service' }]);
++
++    expect((await request(app).get(`${api}/not-a-uuid`).set(bearer(admin.token))).status).toBe(422);
++    expect((await request(app).get(`${api}/${service.id}`)).status).toBe(401);
++  });
++});
++
++describe('S4 PATCH /services/:serviceId', () => {
++  it('updates name, defaultSeverity and status (including reactivation)', async () => {
++    const { admin, service } = await setup();
++    const res = await patchService(admin.token, service.id, {
++      name: 'renamed',
++      defaultSeverity: 'P2',
++    });
++    expect(res.status).toBe(200);
++    expect(res.body.data).toMatchObject({ name: 'renamed', defaultSeverity: 'P2' });
++    expect(Object.keys(res.body.data).sort()).toEqual(SERVICE_KEYS);
++
++    const off = await patchService(admin.token, service.id, { status: 'DEACTIVATED' });
++    expect(off.body.data.status).toBe('DEACTIVATED');
++    const on = await patchService(admin.token, service.id, { status: 'ACTIVE' });
++    expect(on.body.data.status).toBe('ACTIVE');
++  });
++
++  it('applies partial SLA updates and validates ordering on the merged values', async () => {
++    const { admin, service } = await setup();
++    const ok = await patchService(admin.token, service.id, { P1ResponseSlaMinutes: 20 });
++    expect(ok.status).toBe(200);
++    expect(ok.body.data).toMatchObject({ P1ResponseSlaMinutes: 20, P1ResolutionSlaMinutes: 60 });
++
++    const raiseResponse = await patchService(admin.token, service.id, { P1ResponseSlaMinutes: 61 });
++    expect([raiseResponse.status, raiseResponse.body.error.code]).toEqual([
++      422,
++      'VALIDATION_FAILED',
++    ]);
++    expect(raiseResponse.body.error.details).toEqual([
++      { field: 'P1ResolutionSlaMinutes', issue: expect.any(String) },
++    ]);
++    const lowerResolution = await patchService(admin.token, service.id, {
++      P0ResolutionSlaMinutes: 4,
++    });
++    expect(lowerResolution.status).toBe(422);
++    const bothInvalid = await patchService(admin.token, service.id, {
++      P2ResponseSlaMinutes: 50,
++      P2ResolutionSlaMinutes: 40,
++    });
++    expect(bothInvalid.status).toBe(422);
++    const bothValid = await patchService(admin.token, service.id, {
++      P2ResponseSlaMinutes: 500,
++      P2ResolutionSlaMinutes: 600,
++    });
++    expect(bothValid.status).toBe(200);
++    const stored = await getPrisma().appService.findUniqueOrThrow({ where: { id: service.id } });
++    expect(stored.P1ResolutionSlaMinutes).toBe(60);
++  });
++
++  it('validates the body and the gates', async () => {
++    const { k, admin, service } = await setup();
++    for (const body of [
++      {},
++      { name: '' },
++      { teamId: 'x' },
++      { escalationPolicyId: 'x' },
++      { status: 'GONE' },
++    ]) {
++      const res = await patchService(admin.token, service.id, body);
++      expect([JSON.stringify(body), res.status]).toEqual([JSON.stringify(body), 422]);
++    }
++    for (const body of [{ bogus: 1 }, { name: 'x', escalationDelayMinutes: 5 }]) {
++      expect((await patchService(admin.token, service.id, body)).status).toBe(400);
++    }
++    expect((await patchService(admin.token, 'nope', { name: 'x' })).status).toBe(422);
++    expect((await request(app).patch(`${api}/${service.id}`).send({ name: 'x' })).status).toBe(401);
++    for (const role of ['ENGINEER', 'TEAM_LEAD'] as const) {
++      const { token } = await sessionFor(app, role, k.team.id);
++      const res = await patchService(token, service.id, { name: 'x' });
++      expect([res.status, res.body.error.code]).toEqual([403, 'FORBIDDEN_ROLE']);
++    }
++    const missing = await patchService(admin.token, NIL, { name: 'x' });
++    expect([missing.status, missing.body.error.code]).toEqual([404, 'SERVICE_NOT_FOUND']);
++  });
++
++  it('rejects a duplicate name with 409 SERVICE_ALREADY_EXISTS', async () => {
++    const { k, admin, service } = await setup();
++    const other = await request(app)
++      .post(api)
++      .set(bearer(admin.token))
++      .send(createBody(k, admin.admin.id, { name: 'taken' }));
++    expect(other.status).toBe(201);
++    const res = await patchService(admin.token, service.id, { name: 'taken' });
++    expect([res.status, res.body.error.code]).toEqual([409, 'SERVICE_ALREADY_EXISTS']);
++    expect((await patchService(admin.token, service.id, { name: service.name })).status).toBe(200);
++  });
++
++  it.each(['OPEN', 'ACKNOWLEDGED', 'MITIGATING'] as const)(
++    'blocks deactivation, SLA change and policy reassignment while an incident is %s',
++    async (status) => {
++      const { k, admin, service } = await setup();
++      await createIncident(k.team.id, service.id, status);
++      const orphan = await getPrisma().escalationPolicy.create({
++        data: {
++          level1Id: k.engineer1.id,
++          level2Id: k.engineer2.id,
++          level3Id: k.lead.id,
++          fallbackAdminId: admin.admin.id,
++        },
++      });
++      for (const body of [
++        { status: 'DEACTIVATED' },
++        { P0ResponseSlaMinutes: 6 },
++        { escalationPolicyId: orphan.id },
++      ]) {
++        const res = await patchService(admin.token, service.id, body);
++        expect([JSON.stringify(body), res.status, res.body.error.code]).toEqual([
++          JSON.stringify(body),
++          409,
++          'SERVICE_HAS_OPEN_INCIDENTS',
++        ]);
++      }
++      const rename = await patchService(admin.token, service.id, {
++        name: 'still-fine',
++        defaultSeverity: 'P3',
++      });
++      expect(rename.status).toBe(200);
++      const same = await patchService(admin.token, service.id, {
++        P0ResponseSlaMinutes: 5,
++        status: 'ACTIVE',
++      });
++      expect(same.status).toBe(200);
++    },
++  );
++
++  it('does not treat RESOLVED or CLOSED incidents as unresolved', async () => {
++    const { k, admin, service } = await setup();
++    await createIncident(k.team.id, service.id, 'RESOLVED');
++    await createIncident(k.team.id, service.id, 'CLOSED');
++    const res = await patchService(admin.token, service.id, {
++      status: 'DEACTIVATED',
++      P0ResponseSlaMinutes: 6,
++    });
++    expect(res.status).toBe(200);
++  });
++
++  it('changes the team when no incident exists and the team is active', async () => {
++    const { admin, service } = await setup();
++    const target = await createTeam();
++    const res = await patchService(admin.token, service.id, { teamId: target.id });
++    expect(res.status).toBe(200);
++    expect(res.body.data.teamId).toBe(target.id);
++  });
++
++  it('rejects an unknown or deactivated target team with 403 INVALID_ACTION', async () => {
++    const { admin, service } = await setup();
++    const inactive = await createTeam(undefined, 'DEACTIVATED');
++    for (const teamId of [NIL, inactive.id]) {
++      const res = await patchService(admin.token, service.id, { teamId });
++      expect([res.status, res.body.error.code]).toEqual([403, 'INVALID_ACTION']);
++    }
++  });
++
++  it.each(['RESOLVED', 'CLOSED', 'OPEN'] as const)(
++    'rejects a team change while a %s incident exists with 403 INVALID_ACTION (wins over 409)',
++    async (status) => {
++      const { k, admin, service } = await setup();
++      await createIncident(k.team.id, service.id, status);
++      const target = await createTeam();
++      const res = await patchService(admin.token, service.id, { teamId: target.id });
++      expect([res.status, res.body.error.code]).toEqual([403, 'INVALID_ACTION']);
++    },
++  );
++
++  it('keeps the composite foreign key that pins an incident to its service team', async () => {
++    const { k, service } = await setup();
++    await createIncident(k.team.id, service.id, 'CLOSED');
++    const target = await createTeam();
++    await expect(
++      getPrisma().appService.update({ where: { id: service.id }, data: { teamId: target.id } }),
++    ).rejects.toThrow();
++  });
++
++  it('reassigns an orphaned policy and keeps the previous one, unattached', async () => {
++    const { k, admin, service } = await setup();
++    const orphan = await getPrisma().escalationPolicy.create({
++      data: {
++        level1Id: k.engineer1.id,
++        level2Id: k.engineer2.id,
++        level3Id: k.lead.id,
++        fallbackAdminId: admin.admin.id,
++      },
++    });
++    const previous = service.escalationPolicyId as string;
++
++    const res = await patchService(admin.token, service.id, { escalationPolicyId: orphan.id });
++    expect(res.status).toBe(200);
++    expect(res.body.data.escalationPolicyId).toBe(orphan.id);
++
++    const kept = await getPrisma().escalationPolicy.findUniqueOrThrow({
++      where: { id: previous },
++      include: { appService: true },
++    });
++    expect(kept.appService).toBeNull();
++
++    const old = await request(app).get(policyUrl(service.id, previous)).set(bearer(admin.token));
++    expect(old.status).toBe(404);
++    const current = await request(app)
++      .get(policyUrl(service.id, orphan.id))
++      .set(bearer(admin.token));
++    expect(current.status).toBe(200);
++  });
++
++  it('rejects an unknown policy with 404 and a policy of another service with 403', async () => {
++    const { k, admin, service } = await setup();
++    const unknown = await patchService(admin.token, service.id, { escalationPolicyId: NIL });
++    expect([unknown.status, unknown.body.error.code]).toEqual([404, 'ESCALATION_POLICY_NOT_FOUND']);
++
++    const second = await request(app)
++      .post(api)
++      .set(bearer(admin.token))
++      .send(createBody(k, admin.admin.id));
++    const attached = await patchService(admin.token, service.id, {
++      escalationPolicyId: second.body.data.escalationPolicyId,
++    });
++    expect([attached.status, attached.body.error.code]).toEqual([403, 'INVALID_ACTION']);
++  });
++
++  it('lets only one of two services claim the same orphaned policy', async () => {
++    const { k, admin, service } = await setup();
++    const second = await request(app)
++      .post(api)
++      .set(bearer(admin.token))
++      .send(createBody(k, admin.admin.id));
++    const orphan = await getPrisma().escalationPolicy.create({
++      data: {
++        level1Id: k.engineer1.id,
++        level2Id: k.engineer2.id,
++        level3Id: k.lead.id,
++        fallbackAdminId: admin.admin.id,
++      },
++    });
++    const results = await Promise.all(
++      [service.id, second.body.data.id].map((id) =>
++        patchService(admin.token, id, { escalationPolicyId: orphan.id }),
++      ),
++    );
++    expect(results.map((r) => r.status).sort()).toEqual([200, 403]);
++  });
++
++  it('serializes with incident creation: a deactivation waits for an in-flight incident insert', async () => {
++    const { k, admin, service } = await setup();
++    const client = new Client({ connectionString: testDatabaseUrl() });
++    await client.connect();
++    try {
++      await client.query('BEGIN');
++      await client.query(
++        `INSERT INTO "Incident" ("id","title","description","severity","affectedServiceId","teamId")
++         VALUES (gen_random_uuid(),'t','d','P1',$1,$2)`,
++        [service.id, k.team.id],
++      );
++
++      let settled = false;
++      const pending = patchService(admin.token, service.id, { status: 'DEACTIVATED' }).then(
++        (res) => {
++          settled = true;
++          return res;
++        },
++      );
++      await new Promise((resolve) => setTimeout(resolve, 500));
++      expect(settled).toBe(false);
++
++      await client.query('COMMIT');
++      const res = await pending;
++      expect([res.status, res.body.error.code]).toEqual([409, 'SERVICE_HAS_OPEN_INCIDENTS']);
++    } finally {
++      await client.end();
++    }
++  });
++
++  it('yields a consistent outcome for deactivation racing direct incident inserts', async () => {
++    const { k, admin } = await setup();
++    for (let round = 0; round < 6; round++) {
++      const created = await request(app)
++        .post(api)
++        .set(bearer(admin.token))
++        .send(createBody(k, admin.admin.id));
++      const id = created.body.data.id as string;
++      const [res] = await Promise.all([
++        patchService(admin.token, id, { status: 'DEACTIVATED' }),
++        createIncident(k.team.id, id, 'OPEN'),
++      ]);
++      const stored = await getPrisma().appService.findUniqueOrThrow({ where: { id } });
++      if (res.status === 200) {
++        expect(stored.status).toBe('DEACTIVATED');
++      } else {
++        expect([res.status, res.body.error.code]).toEqual([409, 'SERVICE_HAS_OPEN_INCIDENTS']);
++        expect(stored.status).toBe('ACTIVE');
++      }
++    }
++  });
++});
++
++describe('S5 POST /services/:serviceId/escalation-policies', () => {
++  const policyBody = (k: Kit, adminId: string) => ({
++    level1: k.engineer1.id,
++    level2: k.engineer2.id,
++    level3: k.lead.id,
++    fallbackAdmin: adminId,
++  });
++
++  it('always answers 409 POLICIES_MAX_LIMIT_REACHED for a valid request and creates nothing', async () => {
++    const { k, admin, service } = await setup();
++    const res = await request(app)
++      .post(`${api}/${service.id}/escalation-policies`)
++      .set(bearer(admin.token))
++      .send(policyBody(k, admin.admin.id));
++    expect([res.status, res.body.error.code]).toEqual([409, 'POLICIES_MAX_LIMIT_REACHED']);
++    expect(await getPrisma().escalationPolicy.count()).toBe(1);
++  });
++
++  it('validates the body, the path and the gates', async () => {
++    const { k, admin, service } = await setup();
++    const url = `${api}/${service.id}/escalation-policies`;
++    const valid = policyBody(k, admin.admin.id);
++    expect(
++      (await request(app).post(url).set(bearer(admin.token)).send({ level1: valid.level1 })).status,
++    ).toBe(422);
++    expect(
++      (
++        await request(app)
++          .post(url)
++          .set(bearer(admin.token))
++          .send({ ...valid, level1: 'x' })
++      ).status,
++    ).toBe(422);
++    const timing = await request(app)
++      .post(url)
++      .set(bearer(admin.token))
++      .send({ ...valid, delayMinutes: 5 });
++    expect(timing.status).toBe(400);
++    expect(
++      (
++        await request(app)
++          .post(`${api}/bad/escalation-policies`)
++          .set(bearer(admin.token))
++          .send(valid)
++      ).status,
++    ).toBe(422);
++    const missing = await request(app)
++      .post(`${api}/${NIL}/escalation-policies`)
++      .set(bearer(admin.token))
++      .send(valid);
++    expect([missing.status, missing.body.error.code]).toEqual([404, 'SERVICE_NOT_FOUND']);
++    expect((await request(app).post(url).send(valid)).status).toBe(401);
++    for (const role of ['ENGINEER', 'TEAM_LEAD'] as const) {
++      const { token } = await sessionFor(app, role, k.team.id);
++      const res = await request(app).post(url).set(bearer(token)).send(valid);
++      expect([res.status, res.body.error.code]).toEqual([403, 'FORBIDDEN_ROLE']);
++    }
++  });
++});
++
++describe('S6 GET /services/:serviceId/escalation-policies/:escalationPolicyId', () => {
++  it('returns the policy to an admin and to a lead of the owning team', async () => {
++    const { k, admin, service } = await setup();
++    const url = policyUrl(service.id, service.escalationPolicyId);
++    const asAdmin = await request(app).get(url).set(bearer(admin.token));
++    expect(asAdmin.status).toBe(200);
++    expect(Object.keys(asAdmin.body.data).sort()).toEqual(POLICY_KEYS);
++    expect(asAdmin.body.data).toMatchObject({
++      id: service.escalationPolicyId,
++      level1: k.engineer1.id,
++      level2: k.engineer2.id,
++      level3: k.lead.id,
++      fallbackAdmin: admin.admin.id,
++    });
++    const { token } = await sessionFor(app, 'TEAM_LEAD', k.team.id);
++    expect((await request(app).get(url).set(bearer(token))).status).toBe(200);
++  });
++
++  it('enforces the role, team and null-team gates', async () => {
++    const { k, service } = await setup();
++    const url = policyUrl(service.id, service.escalationPolicyId);
++    const engineer = await sessionFor(app, 'ENGINEER', k.team.id);
++    const eng = await request(app).get(url).set(bearer(engineer.token));
++    expect([eng.status, eng.body.error.code]).toEqual([403, 'FORBIDDEN_ROLE']);
++    const engineerNoTeam = await sessionFor(app, 'ENGINEER', null);
++    expect((await request(app).get(url).set(bearer(engineerNoTeam.token))).body.error.code).toBe(
++      'FORBIDDEN_ROLE',
++    );
++
++    const foreign = await sessionFor(app, 'TEAM_LEAD', (await createTeam()).id);
++    const denied = await request(app).get(url).set(bearer(foreign.token));
++    expect([denied.status, denied.body.error.code]).toEqual([403, 'TEAM_ACCESS_DENIED']);
++    const noTeam = await sessionFor(app, 'TEAM_LEAD', null);
++    const invalid = await request(app).get(url).set(bearer(noTeam.token));
++    expect([invalid.status, invalid.body.error.code]).toEqual([403, 'INVALID_ACTION']);
++    expect((await request(app).get(url)).status).toBe(401);
++  });
++
++  it('answers 404 for an unknown service, an unknown policy and a policy of another service', async () => {
++    const { k, admin, service } = await setup();
++    const other = await request(app)
++      .post(api)
++      .set(bearer(admin.token))
++      .send(createBody(k, admin.admin.id));
++    const missingService = await request(app)
++      .get(policyUrl(NIL, service.escalationPolicyId))
++      .set(bearer(admin.token));
++    expect([missingService.status, missingService.body.error.code]).toEqual([
++      404,
++      'SERVICE_NOT_FOUND',
++    ]);
++    const unknownPolicy = await request(app)
++      .get(policyUrl(service.id, NIL))
++      .set(bearer(admin.token));
++    expect([unknownPolicy.status, unknownPolicy.body.error.code]).toEqual([
++      404,
++      'ESCALATION_POLICY_NOT_FOUND',
++    ]);
++    const foreignPolicy = await request(app)
++      .get(policyUrl(service.id, other.body.data.escalationPolicyId))
++      .set(bearer(admin.token));
++    expect([foreignPolicy.status, foreignPolicy.body.error.code]).toEqual([
++      404,
++      'ESCALATION_POLICY_NOT_FOUND',
++    ]);
++    expect(
++      (await request(app).get(`${api}/x/escalation-policies/y`).set(bearer(admin.token))).status,
++    ).toBe(422);
++  });
++});
++
++describe('S7 PATCH /services/:serviceId/escalation-policies/:escalationPolicyId', () => {
++  it('updates any subset of the four levels and is idempotent', async () => {
++    const { k, admin, service } = await setup();
++    const url = policyUrl(service.id, service.escalationPolicyId);
++    const replacement = await createUser({ role: 'ENGINEER', teamId: k.team.id });
++    const newAdmin = await createUser({ role: 'ADMIN' });
++
++    const first = await request(app)
++      .patch(url)
++      .set(bearer(admin.token))
++      .send({ level1: replacement.id, fallbackAdmin: newAdmin.id });
++    expect(first.status).toBe(200);
++    expect(Object.keys(first.body.data).sort()).toEqual(POLICY_KEYS);
++    expect(first.body.data).toMatchObject({
++      level1: replacement.id,
++      level2: k.engineer2.id,
++      level3: k.lead.id,
++      fallbackAdmin: newAdmin.id,
++    });
++    const again = await request(app)
++      .patch(url)
++      .set(bearer(admin.token))
++      .send({ level1: replacement.id, fallbackAdmin: newAdmin.id });
++    expect(again.status).toBe(200);
++    expect(again.body.data).toEqual(first.body.data);
++  });
++
++  it('validates the users of each level with 403 INVALID_ACTION', async () => {
++    const { k, admin, service } = await setup();
++    const url = policyUrl(service.id, service.escalationPolicyId);
++    const foreign = await createTeam();
++    const cases: [string, object][] = [
++      ['level1 team lead', { level1: k.lead.id }],
++      [
++        'level1 other team',
++        { level1: (await createUser({ role: 'ENGINEER', teamId: foreign.id })).id },
++      ],
++      [
++        'level2 deactivated',
++        {
++          level2: (await createUser({ role: 'ENGINEER', teamId: k.team.id, status: 'DEACTIVATED' }))
++            .id,
++        },
++      ],
++      ['level2 unknown', { level2: NIL }],
++      ['level3 engineer', { level3: k.engineer1.id }],
++      [
++        'level3 other team',
++        { level3: (await createUser({ role: 'TEAM_LEAD', teamId: foreign.id })).id },
++      ],
++      ['fallback not admin', { fallbackAdmin: k.lead.id }],
++    ];
++    for (const [label, body] of cases) {
++      const res = await request(app).patch(url).set(bearer(admin.token)).send(body);
++      expect([label, res.status, res.body.error?.code]).toEqual([label, 403, 'INVALID_ACTION']);
++    }
++    const stored = await getPrisma().escalationPolicy.findUniqueOrThrow({
++      where: { id: service.escalationPolicyId },
++    });
++    expect(stored.level1Id).toBe(k.engineer1.id);
++  });
++
++  it('answers 409 POLICY_IN_USE for a change while an incident is unresolved', async () => {
++    const { k, admin, service } = await setup();
++    const url = policyUrl(service.id, service.escalationPolicyId);
++    const replacement = await createUser({ role: 'ENGINEER', teamId: k.team.id });
++    await createIncident(k.team.id, service.id, 'MITIGATING');
++
++    const res = await request(app)
++      .patch(url)
++      .set(bearer(admin.token))
++      .send({ level1: replacement.id });
++    expect([res.status, res.body.error.code]).toEqual([409, 'POLICY_IN_USE']);
++    const same = await request(app)
++      .patch(url)
++      .set(bearer(admin.token))
++      .send({ level1: k.engineer1.id });
++    expect(same.status).toBe(200);
++  });
++
++  it('allows changes when incidents are only RESOLVED or CLOSED', async () => {
++    const { k, admin, service } = await setup();
++    await createIncident(k.team.id, service.id, 'RESOLVED');
++    await createIncident(k.team.id, service.id, 'CLOSED');
++    const replacement = await createUser({ role: 'ENGINEER', teamId: k.team.id });
++    const res = await request(app)
++      .patch(policyUrl(service.id, service.escalationPolicyId))
++      .set(bearer(admin.token))
++      .send({ level2: replacement.id });
++    expect(res.status).toBe(200);
++  });
++
++  it('serializes with incident creation: a change waits for an in-flight incident insert', async () => {
++    const { k, admin, service } = await setup();
++    const replacement = await createUser({ role: 'ENGINEER', teamId: k.team.id });
++    const client = new Client({ connectionString: testDatabaseUrl() });
++    await client.connect();
++    try {
++      await client.query('BEGIN');
++      await client.query(
++        `INSERT INTO "Incident" ("id","title","description","severity","affectedServiceId","teamId")
++         VALUES (gen_random_uuid(),'t','d','P1',$1,$2)`,
++        [service.id, k.team.id],
++      );
++      let settled = false;
++      const pending = request(app)
++        .patch(policyUrl(service.id, service.escalationPolicyId))
++        .set(bearer(admin.token))
++        .send({ level1: replacement.id })
++        .then((res) => {
++          settled = true;
++          return res;
++        });
++      await new Promise((resolve) => setTimeout(resolve, 500));
++      expect(settled).toBe(false);
++      await client.query('COMMIT');
++      const res = await pending;
++      expect([res.status, res.body.error.code]).toEqual([409, 'POLICY_IN_USE']);
++    } finally {
++      await client.end();
++    }
++  });
++
++  it('validates the body, the path and the gates', async () => {
++    const { k, admin, service } = await setup();
++    const url = policyUrl(service.id, service.escalationPolicyId);
++    const send = (token: string, body: object, target = url) =>
++      request(app).patch(target).set(bearer(token)).send(body);
++    expect((await send(admin.token, {})).status).toBe(422);
++    expect((await send(admin.token, { level1: 'x' })).status).toBe(422);
++    expect((await send(admin.token, { level1: k.engineer1.id, delayMinutes: 5 })).status).toBe(400);
++    expect(
++      (
++        await send(
++          admin.token,
++          { level1: k.engineer1.id },
++          `${api}/${service.id}/escalation-policies/x`,
++        )
++      ).status,
++    ).toBe(422);
++    const noService = await send(
++      admin.token,
++      { level1: k.engineer1.id },
++      policyUrl(NIL, service.escalationPolicyId),
++    );
++    expect([noService.status, noService.body.error.code]).toEqual([404, 'SERVICE_NOT_FOUND']);
++    const noPolicy = await send(
++      admin.token,
++      { level1: k.engineer1.id },
++      policyUrl(service.id, NIL),
++    );
++    expect([noPolicy.status, noPolicy.body.error.code]).toEqual([
++      404,
++      'ESCALATION_POLICY_NOT_FOUND',
++    ]);
++    expect((await request(app).patch(url).send({ level1: k.engineer1.id })).status).toBe(401);
++    for (const role of ['ENGINEER', 'TEAM_LEAD'] as const) {
++      const { token } = await sessionFor(app, role, k.team.id);
++      const res = await send(token, { level1: k.engineer1.id });
++      expect([res.status, res.body.error.code]).toEqual([403, 'FORBIDDEN_ROLE']);
++    }
++  });
++});
++
++describe('database constraints and configuration read contract', () => {
++  it('enforces unique service names and one service per policy in the database', async () => {
++    const { k, admin, service } = await setup();
++    const db = getPrisma();
++    const data = {
++      ...SLA,
++      teamId: k.team.id,
++    };
++    await expect(
++      db.appService.create({
++        data: {
++          ...data,
++          name: service.name,
++          escalationPolicyId: (
++            await db.escalationPolicy.create({
++              data: {
++                level1Id: admin.admin.id,
++                level2Id: admin.admin.id,
++                level3Id: admin.admin.id,
++                fallbackAdminId: admin.admin.id,
++              },
++            })
++          ).id,
++        },
++      }),
++    ).rejects.toThrow();
++    await expect(
++      db.appService.create({
++        data: { ...data, name: 'another', escalationPolicyId: service.escalationPolicyId },
++      }),
++    ).rejects.toThrow();
++  });
++
++  it('exports the service configuration and the policy users for other modules', async () => {
++    const { k, admin, service } = await setup();
++    expect(await getServiceConfig(service.id)).toEqual({
++      id: service.id,
++      name: service.name,
++      status: 'ACTIVE',
++      teamId: k.team.id,
++      defaultSeverity: 'P1',
++      escalationPolicyId: service.escalationPolicyId,
++      sla: {
++        P0: { responseMinutes: 5, resolutionMinutes: 30 },
++        P1: { responseMinutes: 10, resolutionMinutes: 60 },
++        P2: { responseMinutes: 30, resolutionMinutes: 120 },
++        P3: { responseMinutes: 60, resolutionMinutes: 240 },
++      },
++    });
++    expect(await getEscalationPolicyByService(service.id)).toEqual({
++      level1: k.engineer1.id,
++      level2: k.engineer2.id,
++      level3: k.lead.id,
++      fallbackAdmin: admin.admin.id,
++    });
++    expect(await getServiceConfig(NIL)).toBeNull();
++    expect(await getEscalationPolicyByService(NIL)).toBeNull();
++  });
++});
