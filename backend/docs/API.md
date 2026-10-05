@@ -1,7 +1,7 @@
 # IMS API Reference
 
 **Base path:** `/api/v1` — every path below is relative to it.
-**Source hierarchy:** your decisions (rounds 1–7) > `DB_Schema.md` (incl. the extensions listed in §13) > `API_Contract.md` (inference only: endpoint content, DTO shapes, traceability tags and limits "as per API_CONTRACT"). Traceability tags are not re-verified against `PRD.md`.
+**Source hierarchy:** your decisions (all rounds) > the final Prisma schema (`schema.prisma`) > `API_Contract.md` (inference only: endpoint content, DTO shapes, traceability tags and limits "as per API_CONTRACT"). Traceability tags are not re-verified against `PRD.md`.
 **Layout rule:** every field is always present; `N/A` is the only spelling for "not applicable". Every open item has been closed; the final decisions are recorded in §14.
 
 ---
@@ -47,7 +47,7 @@ No `DELETE` exists anywhere. Users, teams and services are deactivated through `
 
 **Consequence:** `ACCOUNT_DEACTIVATED` is returned only by login and refresh, never by protected endpoints.
 
-**Session store:** a `UserSession` record per login (`refreshTokenHash`, `lastRefreshHash`, `ip`, `userAgent`, `lastIp`, `lastSeen`, `revoked`) — schema extension, §13.
+**Session store:** a `UserSession` record per login (`refreshTokenHash`, `lastRefreshHash`, `ip`, `userAgent`, `lastIp`, `lastSeen`, `revoked`, `expiresIn` = refresh-token expiry), model `UserSession`.
 
 ### 1.3 Authorization — gates in this order
 
@@ -62,7 +62,7 @@ Gate 3  State / business    409  INVALID_STATE_TRANSITION | POSTMORTEM_STATE_INV
 - **Roles:** `ENGINEER`, `TEAM_LEAD`, `ADMIN`.
 - **Team scope is never a client parameter** for incidents. The team is the caller's `teamId` claim.
 - **Admin:** may administer any team (identity, services, policies). Incident data is limited to the Admin's own team (OD-03).
-- **User with `teamId = null`** (including an Admin): every incident-scoped endpoint returns `403 INVALID_ACTION` ("update `teamId` first").
+- **User with `teamId = null`:** every incident-scoped endpoint returns `403 INVALID_ACTION` ("update `teamId` first"), Admins included. A non-Admin with `teamId = null` also receives `403 INVALID_ACTION` on every own-team endpoint (T3, U2, U3, S2, S3, S6). Admins are exempt from the own-team rule.
 - **Escalation chain** = the four users of the incident's service policy: `level1`, `level2`, `level3`, `fallbackAdmin`.
 - **"Unresolved incident"** = status `OPEN`, `ACKNOWLEDGED` or `MITIGATING`.
 - **Check order:** gates run in the order above; path, query and body validation (`422`/`400`) runs **before** state checks (Gate 3).
@@ -136,7 +136,7 @@ Request DTOs are the Zod schemas named in each endpoint; response types are the 
 | 403 | `NOT_CURRENT_ASSIGNEE` | resolve by a non-assignee Engineer | No |
 | 403 | `ACCOUNT_DEACTIVATED` | login or refresh by a `DEACTIVATED` user | No |
 | 403 | `ASSIGNEE_NOT_ELIGIBLE` | assignee not active / not in team / wrong role | No |
-| 403 | `INVALID_ACTION` | invalid team/user reference on admin writes; user with `teamId = null` on incident endpoints; leadId for an Admin; wrong incident/postmortem state for P2–P5 where stated; service `teamId` change when any incident exists; team deactivation with services attached; policy attached to another service | No |
+| 403 | `INVALID_ACTION` | invalid team/user reference on admin writes; user with `teamId = null` on incident endpoints and (non-Admin) on own-team endpoints; `teamId` of a `DEACTIVATED` team (S1, S4, U1, U4); leadId for an Admin; wrong incident/postmortem state for P2–P5 where stated; service `teamId` change when any incident exists; team deactivation with services attached; policy attached to another service | No |
 | 404 | `TEAM_NOT_FOUND`, `USER_NOT_FOUND`, `SERVICE_NOT_FOUND`, `INCIDENT_NOT_FOUND`, `ALERT_NOT_FOUND`, `POSTMORTEM_NOT_FOUND`, `INVESTIGATION_NOT_FOUND`, `ESCALATION_POLICY_NOT_FOUND` | the id does not exist, or a sub-resource does not belong to its parent | No |
 | 409 | `EMAIL_ALREADY_EXISTS`, `DUPLICATE_TEAM`, `SERVICE_ALREADY_EXISTS` | uniqueness violated (email, team name, service name) | No |
 | 409 | `INVALID_STATE_TRANSITION` | incident not in the required state (includes the race loser) | No — re-read |
@@ -279,7 +279,7 @@ Request DTOs are Zod-strict (named at each endpoint). The types below are the re
 
 **`AlertDetailResponse`** = `AlertSummary` + `sourceEventId`, `sourceFingerprint`, `summary`, `description`, `labels: string[]`, `additionalDetails`, `originalPayload` (verbatim stored JSON). Nullable fields are `null` when absent.
 
-**`AiTriage`** (read-only, advisory, never changes state) — `status` (`PENDING|COMPLETED|UNAVAILABLE`), `category: string|null`, `suggestedSeverity: P0..P3|null`, `confidence: number 0–1|null`, `evidence: { type, reference, excerpt }[]`, `reasoningSummary: string|null`, `model`, `modelVersion`, `generatedAt` (string/datetime or `null`). Always present; while pending: all values `null`, `evidence: []`.
+**`AiTriage`** (read-only, advisory, never changes state) — shown for the **latest accepted alert** of the incident. `status` (`PENDING|COMPLETED|UNAVAILABLE`) is derived from that alert's triage record: no record, or a record still pending → `PENDING`; a successful record → `COMPLETED`; a record with a persisted failure state → `UNAVAILABLE`. Fields: `category: string|null`, `suggestedSeverity: P0..P3|null`, `confidence: number 0–1|null`, `evidence: { type, reference, excerpt }[]` (the stored structured evidence, never derived from raw model output), `reasoningSummary: string|null` (the stored `reasoning`), `model`, `modelVersion`, `generatedAt` (string/datetime or `null`). The internal triage `summary` and raw model output are never exposed. Always present; while `PENDING` or `UNAVAILABLE`: all values `null`, `evidence: []`.
 
 **`CommentResponse`** — `id`, `title: string|null`, `body: string`, `author: UserSummary`, `createdAt`.
 
@@ -316,15 +316,15 @@ Request DTOs are Zod-strict (named at each endpoint). The types below are the re
 | Field | Type | Notes |
 |---|---|---|
 | `id`, `incidentId` | uuid | |
-| `generationStatus` | `GENERATING \| DRAFT \| FAILED` | schema extension |
+| `generationStatus` | `GENERATING \| DRAFT \| FAILED` | row is inserted as `GENERATING` in the I8 transaction |
 | `reviewStatus` | `PENDING \| REJECTED \| REVIEWED` | `REJECTED` can never be set (no reject endpoint) |
-| `aiGenerated` | boolean | `false` for a manually created postmortem (its `model`, `modelVersion`, `prompt` and `inputData` are stored `NULL`) |
+| `aiGenerated` | boolean | derived, not stored: `true` while `GENERATING` or `FAILED`; `true` for an AI draft (`generatedAt` is set); `false` for a P5 manual postmortem (`generationStatus = DRAFT`, `generatedAt = null`, `model`, `modelVersion`, `prompt`, `inputData` stored `NULL`) |
 | `summary`, `impact`, `detection`, `timeline`, `rootCause`, `contributingFactors`, `resolution`, `correctiveActions`, `preventiveActions`, `unknowns` | string \| null | `null` while `GENERATING` / `FAILED` |
-| `mttrMinutes` | int \| null | `ceil((incident.resolvedAt − incident.createdAt) in minutes)` |
+| `mttrMinutes` | int \| null | `ceil((incident.resolvedAt − incident.createdAt) in minutes)`; set when generation succeeds or on P5 |
 | `riskLevel` | `P0..P3 \| null` | |
-| `provenance` | `{ model, modelVersion, generatedAt, promptVersion }` | strings/datetime or `null`; `prompt` and `inputData` are never exposed |
+| `provenance` | `{ model, modelVersion, generatedAt }` | strings/datetime or `null`. `generatedAt` is a stored column: the time generation **successfully completed**; `null` until then and for manual postmortems. `prompt` and `inputData` are never exposed |
 | `review` | `{ reviewedBy: UserSummary, reviewedAt: datetime } \| null` | set only on approve and manual create |
-| `failureReason` | `AI_UNAVAILABLE \| OUTPUT_INVALID \| INSUFFICIENT_CONTEXT \| null` | schema extension; no provider text |
+| `failureReason` | `AI_UNAVAILABLE \| OUTPUT_INVALID \| INSUFFICIENT_CONTEXT \| null` | non-null only while `FAILED`; no provider text; cleared when a retry starts (P4) and by P5 |
 
 ### 3.5 Investigation
 
@@ -408,7 +408,7 @@ Same as A3 except: revokes **every** session of the caller where `revoked = fals
 
 ## 5. Identity (`/identity`)
 
-Common to T1–T4 and U1–U4: write operations require role `ADMIN` (`403 FORBIDDEN_ROLE` otherwise). Idempotency N/A, side effects N/A unless stated. Requests are Zod-strict; `At least one field` means an empty body is `422 VALIDATION_FAILED`. Traceability: PRD §2, §5 Admin stories, §11 matrix, BR-002, BR-003, RD-019, RD-020, AC-007 (per API_Contract).
+Common to T1–T4 and U1–U4: write operations require role `ADMIN` (`403 FORBIDDEN_ROLE` otherwise). Idempotency N/A, side effects N/A unless stated. A non-Admin caller with `teamId = null` receives `403 INVALID_ACTION` on T3, U2, U3 (§1.3). Requests are Zod-strict; `At least one field` means an empty body is `422 VALIDATION_FAILED`. Traceability: PRD §2, §5 Admin stories, §11 matrix, BR-002, BR-003, RD-019, RD-020, AC-007 (per API_Contract).
 
 ### T1 · `POST /identity/teams`
 
@@ -452,7 +452,7 @@ Common to T1–T4 and U1–U4: write operations require role `ADMIN` (`403 FORBI
 | Response | `200 OK`, `data: TeamResponse` |
 | Errors | `422`; `400`; `401`; `403 FORBIDDEN_ROLE`; `404 TEAM_NOT_FOUND`; `409 DUPLICATE_TEAM`; `409 TEAM_WITH_OPEN_INCIDENT` (deactivating while the team has unresolved incidents); `403 INVALID_ACTION` (deactivating while services are still attached; services must be reassigned first). If both blockers apply: `409 TEAM_WITH_OPEN_INCIDENT` |
 | Consistency | One transaction |
-| Side effects | On deactivation: every user of the team gets `teamId = null` and **all their sessions are revoked** (their previous team association is kept so that reactivation restores it). On reactivation (`status: ACTIVE`): former users get their `teamId` back. |
+| Side effects | On deactivation: every user of the team gets `teamId = null` their `leadId` is set to `null`, and **all their sessions are revoked**. Nothing is stored about the former team: on reactivation (`status: ACTIVE`) users are **not** restored; an Admin sets their `teamId` again (U4). |
 
 ### U1 · `POST /identity/users`
 
@@ -461,7 +461,7 @@ Common to T1–T4 and U1–U4: write operations require role `ADMIN` (`403 FORBI
 | Purpose | Create a user. `ADMIN` users are never created here (seed script only). |
 | Auth / Authorization | Bearer / `ADMIN` |
 | Request — `CreateUserDto` | `name: string` (1–50); `email: string` (valid, ≤72, stored lower-case); `password: string` (8–24, hashed, never returned); `role?: "ENGINEER"\|"TEAM_LEAD"` (default `ENGINEER`); `teamId?: uuid` (optional; may be set later); `leadId?: uuid` (optional) |
-| Validation | `teamId` must exist, else `403 INVALID_ACTION`. `leadId` must reference an `ACTIVE` `TEAM_LEAD` of the same team, else `403 INVALID_ACTION`. A `leadId` supplied while the user's `teamId` is `null` → `403 INVALID_ACTION` |
+| Validation | `teamId` must exist and the team must not be `DEACTIVATED`, else `403 INVALID_ACTION`. `leadId` must reference an `ACTIVE` `TEAM_LEAD` of the same team, else `403 INVALID_ACTION`. A `leadId` supplied while the user's `teamId` is `null` → `403 INVALID_ACTION` |
 | Response | `201 Created`, `data: UserResponse` (`status = ACTIVE`) |
 | Errors | `422`; `400`; `401`; `403 FORBIDDEN_ROLE`; `403 INVALID_ACTION`; `409 EMAIL_ALREADY_EXISTS` |
 | Consistency | Single transaction |
@@ -494,7 +494,7 @@ Common to T1–T4 and U1–U4: write operations require role `ADMIN` (`403 FORBI
 | Purpose | Update a user or deactivate the account. `email` is immutable. |
 | Auth / Authorization | Bearer / `ADMIN` |
 | Request — `UpdateUserDto` | `name?` (1–50); `password?` (8–24); `role?: "ENGINEER"\|"TEAM_LEAD"`; `status?: "ACTIVE"\|"DEACTIVATED"`; `teamId?: uuid`; `leadId?: uuid`; at least one field |
-| Rules | **teamId:** may be set when currently `null`; may be changed afterwards only if the user is not `acknowledgedBy` on any unresolved incident (else `409 USER_ASSIGNED_CURRENTLY`); a team change sets `leadId = null`. **leadId:** must reference an `ACTIVE` `TEAM_LEAD` of the same team, else `403 INVALID_ACTION`; never allowed for an `ADMIN` user (`403 INVALID_ACTION`). **role:** `ENGINEER → TEAM_LEAD` sets `leadId = null`; `TEAM_LEAD → ENGINEER` with engineers still reporting to them → `409 CONFLICT_STILL_HAS_ENGINEERS`; any role change on a user who is `acknowledgedBy` on an unresolved incident → `409 USER_ASSIGNED_CURRENTLY`. **status:** deactivating such a user → `409 USER_ASSIGNED_CURRENTLY`; deactivating (or moving to another team) a Team Lead who still has engineers → `409 CONFLICT_STILL_HAS_ENGINEERS`. If both `409`s apply, `USER_ASSIGNED_CURRENTLY` is returned; a `leadId` supplied while the resulting `teamId` is `null` → `403 INVALID_ACTION` |
+| Rules | **teamId:** must reference an existing team that is not `DEACTIVATED` (else `403 INVALID_ACTION`); may be set when currently `null`; may be changed afterwards only if the user is not `acknowledgedBy` on any unresolved incident (else `409 USER_ASSIGNED_CURRENTLY`); a team change sets `leadId = null`. **leadId:** must reference an `ACTIVE` `TEAM_LEAD` of the same team, else `403 INVALID_ACTION`; never allowed for an `ADMIN` user (`403 INVALID_ACTION`). **role:** `ENGINEER → TEAM_LEAD` sets `leadId = null`; `TEAM_LEAD → ENGINEER` with engineers still reporting to them → `409 CONFLICT_STILL_HAS_ENGINEERS`; any role change on a user who is `acknowledgedBy` on an unresolved incident → `409 USER_ASSIGNED_CURRENTLY`. **status:** deactivating such a user → `409 USER_ASSIGNED_CURRENTLY`; deactivating (or moving to another team) a Team Lead who still has engineers → `409 CONFLICT_STILL_HAS_ENGINEERS`. If both `409`s apply, `USER_ASSIGNED_CURRENTLY` is returned; a `leadId` supplied while the resulting `teamId` is `null` → `403 INVALID_ACTION` |
 | Response | `200 OK`, `data: UserResponse` |
 | Errors | `422`; `400`; `401`; `403 FORBIDDEN_ROLE`; `403 INVALID_ACTION`; `404 USER_NOT_FOUND`; `409 USER_ASSIGNED_CURRENTLY`; `409 CONFLICT_STILL_HAS_ENGINEERS` |
 | Consistency | One transaction, including session revocation |
@@ -504,7 +504,7 @@ Common to T1–T4 and U1–U4: write operations require role `ADMIN` (`403 FORBI
 
 ## 6. Services (`/services`)
 
-Common to S1–S7: write operations require `ADMIN`; Requests are Zod-strict; idempotency N/A; traceability PRD §2, §5, §11, BR-031, AC-007 (per API_Contract).
+Common to S1–S7: write operations require `ADMIN`; a non-Admin caller with `teamId = null` receives `403 INVALID_ACTION` on S2, S3, S6 (§1.3); Requests are Zod-strict; idempotency N/A; traceability PRD §2, §5, §11, BR-031, AC-007 (per API_Contract).
 **Escalation policy rule:** exactly one policy per service, never shared. It is created inline by S1 and can only be updated (S7) — never deleted or replaced.
 **Policy user validation** (S1, S7): `level1`, `level2` = `ACTIVE` `ENGINEER` of the service's team; `level3` = `ACTIVE` `TEAM_LEAD` of the service's team; `fallbackAdmin` = `ACTIVE` `ADMIN`. Violation → `403 INVALID_ACTION`.
 
@@ -514,7 +514,7 @@ Common to S1–S7: write operations require `ADMIN`; Requests are Zod-strict; id
 |---|---|
 | Purpose | Create a service and its escalation policy together. |
 | Auth / Authorization | Bearer / `ADMIN` |
-| Request — `CreateServiceDto` | `name` (1–50); `defaultSeverity?: P0..P3` (default `P1`); `P0ResponseSlaMinutes`, `P0ResolutionSlaMinutes`, `P1ResponseSlaMinutes`, `P1ResolutionSlaMinutes`, `P2ResponseSlaMinutes`, `P2ResolutionSlaMinutes`, `P3ResponseSlaMinutes`, `P3ResolutionSlaMinutes` (positive ints; per severity `Resolution ≥ Response`); `teamId: uuid` (must exist, else `403 INVALID_ACTION`); `escalationPolicy: { level1: uuid, level2: uuid, level3: uuid, fallbackAdmin: uuid }` |
+| Request — `CreateServiceDto` | `name` (1–50); `defaultSeverity?: P0..P3` (default `P1`); `P0ResponseSlaMinutes`, `P0ResolutionSlaMinutes`, `P1ResponseSlaMinutes`, `P1ResolutionSlaMinutes`, `P2ResponseSlaMinutes`, `P2ResolutionSlaMinutes`, `P3ResponseSlaMinutes`, `P3ResolutionSlaMinutes` (positive ints; per severity `Resolution ≥ Response`); `teamId: uuid` (must exist and not be `DEACTIVATED`, else `403 INVALID_ACTION`); `escalationPolicy: { level1: uuid, level2: uuid, level3: uuid, fallbackAdmin: uuid }` |
 | Response | `201 Created`, `data: ServiceResponse` (`status = ACTIVE`) |
 | Errors | `422`; `400`; `401`; `403 FORBIDDEN_ROLE`; `403 INVALID_ACTION`; `409 SERVICE_ALREADY_EXISTS` |
 | Consistency | Policy and service inserted in one transaction |
@@ -546,7 +546,7 @@ Common to S1–S7: write operations require `ADMIN`; Requests are Zod-strict; id
 | Purpose | Update a service, its SLA, team, policy link, or status. |
 | Auth / Authorization | Bearer / `ADMIN` |
 | Request — `UpdateServiceDto` | `name?`, `defaultSeverity?`, `status?: ACTIVE\|DEACTIVATED`, the eight SLA fields (each optional), `teamId?: uuid`, `escalationPolicyId?: uuid`; at least one field |
-| Rules | SLA ordering (`Resolution ≥ Response` per severity) is checked on the **merged** (stored + sent) values. Any of: deactivation, SLA change, `escalationPolicyId` change while the service has unresolved incidents → `409 SERVICE_HAS_OPEN_INCIDENTS`. `teamId` change while **any** incident exists → `403 INVALID_ACTION` (wins over `SERVICE_HAS_OPEN_INCIDENTS`). `escalationPolicyId`: not a uuid → `422`; unknown → `404 ESCALATION_POLICY_NOT_FOUND`; attached to another service → `403 INVALID_ACTION`. The previous policy stays, unattached; policies are never deleted. Reactivation (`status: ACTIVE`) is allowed. |
+| Rules | SLA ordering (`Resolution ≥ Response` per severity) is checked on the **merged** (stored + sent) values. Any of: deactivation, SLA change, `escalationPolicyId` change while the service has unresolved incidents → `409 SERVICE_HAS_OPEN_INCIDENTS`. `teamId`: must reference an existing team that is not `DEACTIVATED` (else `403 INVALID_ACTION`); a change while **any** incident exists → `403 INVALID_ACTION` (wins over `SERVICE_HAS_OPEN_INCIDENTS`; the incident–service composite foreign key uses `onUpdate: Restrict`). `escalationPolicyId`: not a uuid → `422`; unknown → `404 ESCALATION_POLICY_NOT_FOUND`; attached to another service → `403 INVALID_ACTION`. The previous policy stays, unattached; policies are never deleted. Reactivation (`status: ACTIVE`) is allowed. |
 | Response | `200 OK`, `data: ServiceResponse` |
 | Errors | `422`; `400`; `401`; `403 FORBIDDEN_ROLE`; `403 INVALID_ACTION`; `404 SERVICE_NOT_FOUND`; `404 ESCALATION_POLICY_NOT_FOUND`; `409 SERVICE_ALREADY_EXISTS`; `409 SERVICE_HAS_OPEN_INCIDENTS` |
 | Side effects | A `DEACTIVATED` service rejects webhook alerts with item code `SERVICE_DEACTIVATED` (W1). |
@@ -595,7 +595,7 @@ Common to S1–S7: write operations require `ADMIN`; Requests are Zod-strict; id
 | Purpose | The only entry point for external alerts. Authenticate → validate → normalize → identify → deduplicate → persist Alert + Incident + audit + outbox per alert → respond. |
 | Authentication | **Source authentication**, no JWT. `alertSourceId` selects the source; the signature proves the caller holds its secret. |
 | Authorization | Role: N/A. Team: the incident's team comes from the alert's service (alert → service → team); the caller cannot choose it. |
-| Headers | `Content-Type: application/json` (required); `X-Signature: sha256=<hex>` = HMAC-SHA256 of `"<X-Timestamp>.<raw body>"` with the source secret (computed over the **raw** bytes); `X-Timestamp: <unix seconds>` (±300 s); `X-Request-Id` optional |
+| Headers | `Content-Type: application/json` (required); `X-Signature: sha256=<hex>` = HMAC-SHA256 of `"<X-Timestamp>.<raw body>"` with the source secret, read from `AlertSource.configuration` and never returned, logged, audited or placed in an error message (computed over the **raw** bytes); `X-Timestamp: <unix seconds>` (±300 s); `X-Request-Id` optional |
 | Path | `alertSourceId: uuid` of an `ACTIVE` seeded `AlertSource`. A malformed value → `401 SOURCE_AUTH_FAILED` |
 | Query | N/A |
 | Request — `AlertIngestDto` | `alerts: CommonAlertInputDto[]` (1–100). Body ≤ 1 MB |
@@ -633,7 +633,8 @@ Each alert needs a usable identity: `sourceEventId`, or `sourceFingerprint`, or 
 | 6 | envelope: `Content-Type` present and ≤100 items | `400 BAD_REQUEST`; malformed JSON, missing or empty `alerts` → `422 VALIDATION_FAILED` |
 | 7 | per alert, independently, in its own transaction | per-item result |
 
-**Identity and deduplication.** identity = `alertSourceId` + `sourceEventId`, or + `sourceFingerprint`, or + a deterministic fingerprint of `serviceId + name + environment + sorted labels`. Never a hash of the whole payload. Uniqueness applies only while the matching incident is unresolved (`OPEN`, `ACKNOWLEDGED`, `MITIGATING`): a delivery whose identity matches an unresolved incident is a `DUPLICATE`; after `RESOLVED` or `CLOSED` the same identity (event id or fingerprint) creates a **new** incident. The DB unique key, not read-then-insert, resolves concurrent deliveries (the loser is handled as `DUPLICATE`).
+**Identity and deduplication.** The identity of an alert, in order of precedence, is: `sourceEventId`; else `sourceFingerprint`; else a deterministic fingerprint of `serviceId + name + environment + sorted labels` (stored in `sourceFingerprint`). Never a hash of the whole payload. While an alert's incident is unresolved (`OPEN`, `ACKNOWLEDGED`, `MITIGATING`) the alert carries an **active identity key** derived from that identity, and `(alertSourceId, activeIdentityKey)` is unique in the database. A `FIRING` delivery whose identity matches an alert with an active key is a `DUPLICATE`: no second alert row and no second incident are stored. When the incident becomes `RESOLVED` (I8), the key is cleared on every alert of the incident in the same transaction, so a later `FIRING` delivery with the same identity creates a **new** incident. The database unique key, not read-then-insert, resolves concurrent deliveries (the loser is handled as `DUPLICATE`).
+**Source-resolved deliveries.** A delivery with `status = RESOLVED` never creates an incident. W1 looks up the most recent existing alert with the same identity by `sourceEventId` / `sourceFingerprint` (including the derived fingerprint), **not** by the active key, which may already be cleared. If one exists, `sourceStatus = RESOLVED` and the end time are recorded on it, audit event `SOURCE_ALERT_RESOLVED` is written to that alert's incident, and the outcome is `SOURCE_RESOLVED_RECORDED`; the incident status and the active key are unchanged. If no earlier alert with that identity exists, the item is `REJECTED` with item code `ALERT_INVALID`.
 **Replay vs duplicate:** the exact same signed request re-sent → `409 REPLAY_DETECTED`; a new, freshly signed request carrying a known alert → `200` with `DUPLICATE`.
 **Initial severity:** the `GENERIC` source has no configured `sourceSeverity` mapping yet (the mapping must be configurable); until configured, every alert's `initialSeverity` is the service's `defaultSeverity`.
 
@@ -648,10 +649,10 @@ Each alert needs a usable identity: `sourceEventId`, or `sourceFingerprint`, or 
 
 | Outcome | Meaning / persistence |
 |---|---|
-| `INCIDENT_CREATED` | new Alert + new `OPEN` incident + audit `INCIDENT_CREATED`, `ALERT_RECEIVED` + outbox, in one transaction |
-| `DUPLICATE` | audit `ALERT_DUPLICATE` on the existing incident; no second incident |
-| `SOURCE_RESOLVED_RECORDED` | delivery says the source alert is `RESOLVED`: source status and end time recorded, audit `SOURCE_ALERT_RESOLVED`; **incident status unchanged** |
-| `REJECTED` | nothing stored for that alert; siblings unaffected. Codes `ALERT_INVALID`, `UNKNOWN_SERVICE`, `IDENTITY_UNRESOLVABLE`, `SERVICE_DEACTIVATED` |
+| `INCIDENT_CREATED` | new Alert (with its active identity key) + new `OPEN` incident + audit `INCIDENT_CREATED`, `ALERT_RECEIVED` + outbox, in one transaction |
+| `DUPLICATE` | audit `ALERT_DUPLICATE` on the existing incident; no second alert row, no second incident |
+| `SOURCE_RESOLVED_RECORDED` | delivery says the source alert is `RESOLVED`: source status and end time recorded on the most recent alert with that identity, audit `SOURCE_ALERT_RESOLVED` on its incident; **incident status and active key unchanged**; no new incident |
+| `REJECTED` | nothing stored for that alert; siblings unaffected. Codes `ALERT_INVALID` (also a `RESOLVED` delivery with no earlier alert for its identity), `UNKNOWN_SERVICE`, `IDENTITY_UNRESOLVABLE`, `SERVICE_DEACTIVATED` |
 
 **Status:** `200 OK` when the request is authentic and well-formed and **at least one** alert was not rejected. `400` with the **same `{ data: { results } }` body** when **every** alert was rejected (the sender should not retry as-is).
 
@@ -695,6 +696,7 @@ Each alert needs a usable identity: `sourceEventId`, or `sourceFingerprint`, or 
 | Purpose | Everything a responder needs on one screen. |
 | Auth / Authorization | Bearer / all roles + team gate |
 | Response | `200 OK`, `data: IncidentDetailResponse` |
+| AI triage | `aiTriage` comes from the latest accepted alert's triage record; status derivation in §3.2. `AI_TRIAGE_COMPLETED` is written to the timeline only on success; a failed triage persists its failure state and writes no timeline event. |
 | Errors | `422`; `401`; `403 TEAM_ACCESS_DENIED`; `403 INVALID_ACTION`; `404 INCIDENT_NOT_FOUND` |
 | Pagination / Idempotency / Consistency / Side effects | N/A |
 | Traceability | FR-008, FR-010, FR-018, BR-004, UC-002, AC-008, AC-041 |
@@ -761,8 +763,9 @@ Each alert needs a usable identity: `sourceEventId`, or `sourceFingerprint`, or 
 
 **I8 resolve**
 - Sets `resolvedBy`, `resolvedAt`, `resolutionSummary`, `status = RESOLVED`. Event `RESOLVED { resolutionSummary, serviceConfirmedWorking }`.
+- In the same transaction: inserts the `Postmortem` row (`generationStatus = GENERATING`, `reviewStatus = PENDING`; content fields, `mttrMinutes` and `riskLevel` `null`) and clears the active identity key on every alert of the incident.
 - Errors: `403 NOT_CURRENT_ASSIGNEE` (Engineer who is not the assignee); `400 BAD_REQUEST` (`serviceConfirmedWorking ≠ true`); `422` (summary missing).
-- Idempotency: state-guarded; a retry cannot create a second postmortem job.
+- Idempotency: state-guarded; a retry cannot create a second postmortem row or job (`incidentId` is unique).
 - Side effects (async): postmortem generation job, notification; resolution SLA stops. If generation permanently fails, the Team Lead and the resolver are notified so they can create the postmortem manually (P5). The incident stays `RESOLVED`.
 - Traceability: FR-017, FR-026, FR-027, BR-005, BR-009, BR-013, BR-015, BR-059, BR-065, BR-070, UC-008, AC-012, AC-029, AC-030.
 
@@ -800,7 +803,7 @@ Each alert needs a usable identity: `sourceEventId`, or `sourceFingerprint`, or 
 
 ## 9. Postmortem
 
-The postmortem is a 0..1 sub-resource of an incident. A worker generates it after `RESOLVED`; humans edit it, approve it, or (when generation fails) create it manually. Approving or manually creating it **atomically closes the incident**.
+The postmortem is a 0..1 sub-resource of an incident. The row is inserted (`GENERATING`) in the I8 resolve transaction and a worker then fills it in; humans edit it, approve it, or (when generation fails) create it manually. Approving or manually creating it **atomically closes the incident**.
 
 ### P1 · `GET /incidents/:incidentId/postmortem`
 
@@ -808,7 +811,7 @@ The postmortem is a 0..1 sub-resource of an incident. A worker generates it afte
 |---|---|
 | Purpose | Read the postmortem, its generation status and review state. |
 | Auth / Authorization | Bearer / all roles + team gate |
-| Response | `200 OK`, `data: PostmortemResponse` for an incident that is `RESOLVED` or `CLOSED`. While no content exists yet: `generationStatus: GENERATING` and content fields `null`. |
+| Response | `200 OK`, `data: PostmortemResponse` for an incident that is `RESOLVED` or `CLOSED`. While generating: `generationStatus: GENERATING` and content fields `null` (the row already exists once the incident is `RESOLVED`). |
 | Errors | `422`; `401`; `403 TEAM_ACCESS_DENIED`; `403 INVALID_ACTION`; `404 INCIDENT_NOT_FOUND`; `404 POSTMORTEM_NOT_FOUND` (incident not yet `RESOLVED`) |
 | Idempotency / Consistency / Side effects | N/A |
 | Traceability | FR-026–029, BR-065–072, UC-009, UC-010, AC-029–033 |
@@ -830,7 +833,7 @@ The postmortem is a 0..1 sub-resource of an incident. A worker generates it afte
 
 **P3 approve** — in one transaction (postmortem and incident both locked): postmortem `reviewStatus = REVIEWED`, `reviewedBy` = caller, `reviewedAt` = now; incident `status = CLOSED`, `closedBy` = caller, `closedAt` = now. Events in order: `POSTMORTEM_REVIEWED { postmortemId, reviewedBy }`, then `CLOSED { closedAt }`. Idempotency: state-guarded (a second call → `409 POSTMORTEM_STATE_INVALID`, no second event). Side effects (async): notification. Traceability: FR-028, FR-029, BR-014, BR-015, BR-067, BR-072, UC-010, AC-015, AC-033.
 
-**P4 retry** — flips `generationStatus` to `GENERATING` and writes an outbox event in one transaction; the worker runs later; the incident stays `RESOLVED`. Idempotency: state-guarded. Client polls P1. Traceability: FR-027, BR-013, BR-070, BR-071, NFR-009, AC-030.
+**P4 retry** — flips `generationStatus` to `GENERATING`, sets `failureReason = null`, and writes an outbox event in one transaction; the worker runs later; the incident stays `RESOLVED`. Idempotency: state-guarded. Client polls P1. Traceability: FR-027, BR-013, BR-070, BR-071, NFR-009, AC-030.
 
 ### P5 · `POST /incidents/:incidentId/postmortem`
 
@@ -841,10 +844,10 @@ The postmortem is a 0..1 sub-resource of an incident. A worker generates it afte
 | Path | `incidentId: uuid` |
 | Request — `CreatePostmortemDto` | required: `summary`, `impact`, `detection`, `timeline`, `rootCause`, `contributingFactors`, `resolution`, `correctiveActions`, `preventiveActions` (strings 1–20,000), `riskLevel` (`P0..P3`); optional: `unknowns` (string or `null`) |
 | Required state | incident `RESOLVED` **and** `generationStatus = FAILED`; otherwise `403 INVALID_ACTION` |
-| Response | `201 Created`, `data: PostmortemResponse` with `generationStatus: DRAFT`, `reviewStatus: REVIEWED`, `review { reviewedBy: caller, reviewedAt: now }`, `aiGenerated: false`, `provenance { model: null, modelVersion: null, generatedAt: null, promptVersion: null }`, `mttrMinutes` as defined in §3.4 |
+| Response | `201 Created`, `data: PostmortemResponse` with `generationStatus: DRAFT`, `reviewStatus: REVIEWED`, `review { reviewedBy: caller, reviewedAt: now }`, `aiGenerated: false`, `failureReason: null`, `provenance { model: null, modelVersion: null, generatedAt: null }`, `mttrMinutes` as defined in §3.4 |
 | Errors | `422`; `400`; `401`; `403 FORBIDDEN`; `403 TEAM_ACCESS_DENIED`; `403 INVALID_ACTION`; `404 INCIDENT_NOT_FOUND`; `409 CONCURRENCY_CONFLICT` |
 | Pagination / Idempotency | N/A / state-guarded (after success the incident is `CLOSED`, so a retry gets `403 INVALID_ACTION`) |
-| Consistency | One transaction: postmortem content stored, incident → `CLOSED` (`closedBy` = caller, `closedAt` = now) |
+| Consistency | One transaction: the existing `FAILED` postmortem row is **reused** (`incidentId` is unique, so no second row exists) and populated with the supplied content; `failureReason`, `model`, `modelVersion`, `prompt`, `inputData` and `generatedAt` are set to `null`; `generationStatus = DRAFT`, `reviewStatus = REVIEWED`, `reviewedBy`/`reviewedAt` set; `mttrMinutes` computed; incident → `CLOSED` (`closedBy` = caller, `closedAt` = now). The response stays `201`. |
 | Side effects | Events in order: `POSTMORTEM_REVIEWED { postmortemId, reviewedBy }`, then `CLOSED { closedAt }`. Async: notification. No approve step follows; P2/P3 are no longer possible because the incident is `CLOSED`. |
 | Traceability | FR-027, BR-013, BR-015, BR-070, OQ-008 (as decided) |
 
@@ -909,22 +912,20 @@ An investigation is an advisory, asynchronous brief. It never changes incident s
 
 ## 12. Decisions that differ from `API_Contract.md`
 
-Base path `/api/v1`; JWT 15 min + 7-day refresh cookie, no body tokens; logout endpoints; `422` for validation; per-resource error codes; password 8–24, email ≤72, names 1–50; flat SLA fields and one inline escalation policy per service; team/service `status`; unique team and service names; offset `limit` default 10; `orderBy`/`sort` on lists; timeline and investigations use offset pagination; one `PATCH` per resource for incident and postmortem actions; atomic close on approve; manual postmortem path; `ASSIGNED`/`REASSIGNED`/`OPEN` events; rate-limit ladders; user `teamId`/`leadId` updatable; webhook per-alert rate limiting.
+Base path `/api/v1`; JWT 15 min + 7-day refresh cookie, no body tokens; logout endpoints; `422` for validation; per-resource error codes; password 8–24, email ≤72, names 1–50; flat SLA fields and one inline escalation policy per service; team/service `status`; unique team and service names; offset `limit` default 10; `orderBy`/`sort` on lists; timeline and investigations use offset pagination; one `PATCH` per resource for incident and postmortem actions; atomic close on approve; manual postmortem path; `ASSIGNED`/`REASSIGNED`/`OPEN` events; rate-limit ladders; user `teamId`/`leadId` updatable; webhook per-alert rate limiting; postmortem row created in the resolve transaction; `activeIdentityKey` deduplication; source-resolved deliveries never create incidents; team deactivation nulls users' `teamId` and `leadId` with no restore; a `DEACTIVATED` team cannot receive services or users; users without a team get `INVALID_ACTION` on own-team endpoints.
 
 ---
 
-## 13. Schema extensions required (documented at requirement level)
+## 13. Schema alignment (final)
 
-`DB_Schema.md` does not yet hold these; the API is written to the requirement, not to today's schema.
+The API is aligned with the final Prisma schema. Remaining points, none of which changes the API:
 
-1. `UserSession` table: `userId`, `refreshTokenHash`, `lastRefreshHash`, `ip`, `userAgent`, `lastIp`, `lastSeen`, `revoked`, timestamps.
-2. Alert identity uniqueness limited to alerts whose incident is unresolved (so recurrence after `RESOLVED`/`CLOSED` creates a new incident); `Alert.sourceStatus` (`FIRING|RESOLVED`).
-3. `Postmortem`: `generationStatus`, `failureReason`, `promptVersion`, `aiGenerated`; `reviewStatus` usable as in §9.
-4. `Investigation`: status vocabulary `REQUESTED|RUNNING|COMPLETED|FAILED`, `completedAt`, `failureReason`, evidence linked to the investigation; idempotency key globally unique.
-5. AI triage storage (`aiTriage` block).
-6. `EscalationPolicy`/`AppService`: one policy per service, never shared; `AppService.escalationPolicyId` stays `NOT NULL` (policy created in the same transaction).
-7. A way to remember a deactivated team's former users so reactivation restores `teamId`.
-8. `Incident` foreign key `(affectedServiceId, teamId)`: service `teamId` is therefore changeable only while the service has no incidents.
+1. **Names:** API field names stay as written; the repository layer maps them to the schema (`acknowledgedAt` ↔ `acknowledgedTimestamp`, `body` ↔ `description`, `contributingFactors` ↔ `factors`, `mttrMinutes` ↔ `MTTR`, `level1` ↔ `level1Id`, `currentAssignee` ↔ `currentAssigneeId`, `relevance` ↔ `relevanceInfo`, `startedAt` ↔ `startedTimestamp`, `AiTriage.reasoningSummary` ↔ `AITriage.reasoning`).
+2. **Derived values (not stored):** `aiTriage.status` (from the triage record's `failureStatus`) and `PostmortemResponse.aiGenerated` (§3.4).
+3. **SQL migrations:** the non-unique lookup indexes on `(alertSourceId, sourceEventId)` and `(alertSourceId, sourceFingerprint)` are added by migration; W1 uses them to find the most recent alert for a source-resolved delivery.
+4. **Database guarantees the API relies on:** `Alert (alertSourceId, activeIdentityKey)` unique; `Incident (affectedServiceId, teamId) → AppService (id, teamId)` with `onUpdate: Restrict`; `Postmortem.incidentId` unique; `Investigation.idempotencyKey` unique; `AppService.name` and `Team.name` unique.
+5. **Unverified:** `id String @id` has no `@db.Uuid` while foreign keys do (and `Evidence.incidentId` has neither); `prisma validate` was not run.
+6. **Other documents to update:** `PRD.md` and `Domain_Model.md` still describe a single postmortem lifecycle and 1..4 escalation policies per service.
 
 ---
 
@@ -940,5 +941,14 @@ Base path `/api/v1`; JWT 15 min + 7-day refresh cookie, no body tokens; logout e
 | all | body/path/query validation runs before state checks |
 | U1, U4 | `leadId` supplied while the user's `teamId` is `null` → `403 INVALID_ACTION` |
 | A2 | refresh for a deactivated user → `403 ACCOUNT_DEACTIVATED` |
+
+| W1 | a `RESOLVED` delivery never creates an incident; it is recorded on the most recent alert with that identity (`SOURCE_RESOLVED_RECORDED`), or rejected `ALERT_INVALID` when none exists |
+| P1–P5 | postmortem row inserted in the I8 transaction; `generatedAt` is a column (completion time); `aiGenerated` is derived; `promptVersion` dropped |
+| P4 | retry clears `failureReason` |
+| P5 | reuses the `FAILED` row, `201`, clears `failureReason`, `model`, `modelVersion`, `prompt`, `inputData`, `generatedAt` |
+| I2 | `aiTriage` from the latest accepted alert; `AI_TRIAGE_COMPLETED` only on success |
+| S1, S4, U1, U4 | `teamId` of a `DEACTIVATED` team → `403 INVALID_ACTION` |
+| T3, U2, U3, S2, S3, S6 | non-Admin with `teamId = null` → `403 INVALID_ACTION` |
+| T4 | team deactivation nulls users' `teamId` and `leadId`; no restore on reactivation |
 
 No open items remain.

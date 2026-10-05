@@ -1,15 +1,21 @@
 import js from '@eslint/js';
-import tseslint, { plugin } from 'typescript-eslint';
+import tseslint from 'typescript-eslint';
 import boundaries from 'eslint-plugin-boundaries';
 import prettierConfig from 'eslint-config-prettier';
 
 export default tseslint.config(
   // files ESLint should never look at all (global exclusion)
-  { ignores: ['dist/**', 'node_modules/**', 'coverage/**'] },
+  { ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'src/generated/**'] },
 
   // Eslint's and typescript-eslint's baseline correctness rules
   js.configs.recommended,
   ...tseslint.configs.recommended,
+
+  // CommonJS tool configs (jest.config.js, ...)
+  {
+    files: ['**/*.js'],
+    languageOptions: { sourceType: 'commonjs' },
+  },
 
   {
     files: ['src/**/*.ts'],
@@ -29,7 +35,8 @@ export default tseslint.config(
         // IMS's architecture declaration
         { type: 'shared', pattern: 'src/shared/**' },
         { type: 'infra', pattern: 'src/infra/**' },
-        { type: 'module', pattern: 'src/module/*/**', capture: ['moduleName'] },
+        { type: 'workers', pattern: 'src/workers/**' },
+        { type: 'module', pattern: 'src/modules/*', capture: ['moduleName'] },
       ],
     },
     rules: {
@@ -50,16 +57,32 @@ export default tseslint.config(
             // A module can use itself
             {
               from: 'module',
-              allow: [['module', { moduleName: `${from.moduleName}` }]],
+              allow: [['module', { moduleName: '{{from.moduleName}}' }]],
             },
 
-            // alert -> incident, app-service
+            // alerts -> incidents, appService
             {
-              from: [['module', { moduleName: 'alert' }]],
+              from: [['module', { moduleName: 'alerts' }]],
               allow: [
-                ['module', { moduleName: 'incident' }],
-                ['module', { moduleName: 'app-service' }],
+                ['module', { moduleName: 'incidents' }],
+                ['module', { moduleName: 'appService' }],
               ],
+            },
+
+            // Workers are composition code: they may use modules, shared and infra
+            {
+              from: 'workers',
+              allow: ['module', 'shared', 'infra', 'workers'],
+            },
+
+            // infra and shared stay free of business modules
+            {
+              from: 'infra',
+              allow: ['shared', 'infra'],
+            },
+            {
+              from: 'shared',
+              allow: ['shared'],
             },
           ],
         },
@@ -72,9 +95,16 @@ export default tseslint.config(
           default: 'disallow',
 
           rules: [
+            // Only a module's index.ts is public
             {
               target: 'module',
               allow: 'index.ts',
+            },
+
+            // Everything else is importable file by file
+            {
+              target: ['shared', 'infra', 'workers'],
+              allow: '**',
             },
           ],
         },

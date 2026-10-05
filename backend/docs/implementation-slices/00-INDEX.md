@@ -1,295 +1,949 @@
 # IMS Capability Slices — Index, Cross-Slice Review & Human Design Gate
 
-**Version:** 0.1 DRAFT · **Date:** 2026-10-01 · **Status:** DESIGN / PRE-IMPLEMENTATION   
-**Derived from:** `PRD.md` (Revised Draft, 19 Sep 2026), `Architecture.md`, `Domain_Model.md`, `DB_Schema.md` ("proposed MVP Schema"). `API_Contracts.md`, `DESIGN_CHECKS.md`, `AGENTS.md`, `PROJECT_STATE.md` were **not provided**.    
-**Authority:** canonical documents stay authoritative. Slices are derived views. Nothing here was invented silently: every statement is tagged `[C]` canonical, `[D]` derived, `[P]` proposed, `[UDR-nn]` user decision required, `[UNK]` unknown, `[N/A]`.    
+**Version:** 0.2 · **Status:** DESIGN / PRE-IMPLEMENTATION  
+**Purpose:** single design gate for capability-slice boundaries and unresolved cross-slice decisions.
 
-Only PRD carries a date/revision label; Architecture, Domain_Model and DB_Schema are unversioned (cited as `unv.`).    
+## Authority
 
----
+Canonical project documents remain authoritative:
 
-# A. Capability Inventory
+- `PRD.md`
+- `Architecture.md`
+- `Domain_Model.md`
+- `DB_Schema.md`
 
-| ID | Capability | Purpose | Main Entities | Main Modules | MVP? | File |
-|---|---|---|---|---|---|---|
-| SLICE-01 | Identity, Authentication & Team Isolation | who is calling, which team fence | User, Team | Identity | Yes | `SLICE-01-identity-access.md` |
-| SLICE-02 | Service Catalog, SLA Config & Escalation Policy | per-service severity default, SLA minutes, responders | AppService, EscalationPolicy | AppService | Yes | `SLICE-02-service-catalog-sla-escalation-policy.md` |
-| SLICE-03 | Alert Source Trust Gate | authenticate source, replay protection, size + rate limit | AlertSource | Alerts | Yes | `SLICE-03-alert-source-trust-gate.md` |
-| SLICE-04 | Alert Ingestion, Dedup & Incident Creation | normalize, identify, dedup, atomic Alert+Incident+Outbox | Alert, Incident(create), OutboxEvent | Alerts (+Incident repo) | Yes | `SLICE-04-alert-ingestion-incident-creation.md` |
-| SLICE-05 | Incident Lifecycle & Assignment | ack / severity / resolve / assign, lock-based transitions | Incident | Incident | Yes | `SLICE-05-incident-lifecycle-assignment.md` |
-| SLICE-06 | Incident Visibility, Comments & Timeline | team-scoped reads, comments, append-only audit contract | Comment, AuditEvent | Incident | Yes | `SLICE-06-incident-visibility-comments-timeline.md` |
-| SLICE-07 | SLA Monitoring & Escalation | evaluate SLAs, 80% warning, breach escalation chain | Incident (read), AppService, EscalationPolicy | SLA/escalation worker | Yes | `SLICE-07-sla-monitoring-escalation.md` |
-| SLICE-08 | Outbox, Queue & Worker Reliability | outbox relay, BullMQ, retry/backoff/DLQ | OutboxEvent | cross-cutting | Yes | `SLICE-08-outbox-queue-worker-reliability.md` |
-| SLICE-09 | Notification Delivery | async idempotent email, attempts, DLQ | Notification | Notifications | Yes | `SLICE-09-notifications.md` |
-| SLICE-10 | AI Alert Triage (advisory) | category / severity suggestion / confidence / evidence | (triage result — no table) | AI | Yes | `SLICE-10-ai-alert-triage.md` |
-| SLICE-11 | Postmortem, Review & Closure | AI draft, human review, `RESOLVED→CLOSED` | Postmortem, Incident | AI + Incident kernel | Yes | `SLICE-11-postmortem-review-closure.md` |
-| SLICE-12 | AI Investigation & Evaluation Harness | evidence-grounded brief, evaluation set | Investigation, Evidence, Evaluation | AI | Yes | `SLICE-12-ai-investigation-evaluation.md` |
+`API.md` is now the **finalized API reference** and its resolved decisions are ingested here where they answer an Index decision.
 
-**Why 12.** The evidence supports 12 coherent capabilities. Each has a distinct trigger, owner, and failure semantics. I did not force 10.
+### Decision-source rule
+
+- **Canonical docs** define product/domain/architecture intent.
+- **Final `API.md`** defines the finalized API-facing decisions already made through the eight API-question rounds.
+- This Index records what is **resolved**, what remains **open**, and where the human must make the next decision.
+- Do **not** ask the user again for a decision already explicitly answered in the eight API-question documents.
+- Do **not** infer an answer merely because an API detail looks compatible with a question.
+- If only part of an old question was answered, split it: ingest the answered part and leave only the unanswered part below.
+- New questions discovered later must be added under **Remaining Open Questions** with a new `IDX-nn` ID. Do not reopen a resolved API decision unless a canonical conflict requires it.
 
 ---
 
-# B. Boundary Analysis
+# 1. Capability Inventory
 
-## B.1 Hard couplings and decisions
-
-| Coupling | Evidence | Decision |
-|---|---|---|
-| Alert + Incident(create) + Outbox in one tx | ADR-011, RD-043 | **KEEP TOGETHER** in SLICE-04. The `∅→OPEN` transition is owned by 04, not 05. |
-| Lifecycle ↔ Assignment | resolve requires the assigned responder; both write the same locked Incident row | **KEEP TOGETHER** in SLICE-05 |
-| Transition + audit + outbox atomic | ADR-010, BR-009, NFR-007 | Enforced by 05's *transition kernel*; audit (06) and outbox (08) supply **narrow in-transaction functions**. SEPARATE slices, single transaction. |
-| Postmortem review ↔ `RESOLVED→CLOSED` | BR-014, UC-010, ADR-010 | Generation + review + closure **KEEP TOGETHER** in SLICE-11 (shared postmortem state machine and gate). Who *owns* the CLOSED transition vs SLICE-05 → **NEEDS USER DECISION (UDR-15)**; proposed: 11 owns it by calling 05's kernel. |
-| Escalation ↔ assignment | UC-006 lists "assignment event"; BR-056 "No invalid responder is assigned"; but BR-041 "notifies", RD-013 "notifies" | **NEEDS USER DECISION (UDR-02)**. Default in 07: notify-only; if escalation assigns, it must use 05's kernel. |
-| Source auth ↔ ingestion | gate runs before the tx, different failure semantics (reject vs persist) | **SEPARATE** (03 / 04). Re-evaluate only if replay tracking needs DB atomicity with dedup (UDR-10). |
-| AI triage ↔ ingestion | RD-001, BR-012 | **SEPARATE**; linked only by an outbox row |
-| Triage ↔ Investigation | different trigger/authorization/data | **SEPARATE** (10 / 12), shared AI provider + redaction code |
-| Evaluation harness ↔ Investigation | shares retrieval/validation, non-production | **KEEP TOGETHER** in 12; split only if it grows (UDR-23) |
-
-## B.2 Coupling checks per capability (summary)
-
-| Slice | Transactional | Synchronous | Shared invariants | Side-effect ownership |
-|---|---|---|---|---|
-| 01 | No | Yes (guard on every request) | No (rule owned here, enforced everywhere) | none |
-| 02 | No | Yes (read by 04) | No | none |
-| 03 | No (pre-tx) | Yes (in-request with 04) | No | rate-limit counters (Redis) |
-| 04 | **Yes** (Alert+Incident+Outbox) | Yes (02, 03) | **Yes** (≤1 unresolved incident per identity) | owns initial outbox + `ALERT_*`/`INCIDENT_CREATED` audit [D] |
-| 05 | **Yes** (state+audit+outbox) | Yes (01) | **Yes** (single winner; resolve-by-assignee) | owns transition audit + notification/postmortem outbox rows |
-| 06 | Contract only | In-tx function | Split: producers own atomicity; 06 owns shape/append-only | owns audit store, `COMMENT_ADDED` |
-| 07 | Per evaluation | Reads 02/05 | Possibly with 05 (UDR-02) | owns `SLA_WARNING`/`ESCALATED_*` + notify outbox |
-| 08 | Contract only | No | Split with producers | owns relay/queue/DLQ |
-| 09 | No | No | Split (outbox atomicity vs consumption) | owns Notification + email send |
-| 10 | No | No | "AI advisory" (05 owns severity, 10 owns suggestion) | owns LLM call + triage result |
-| 11 | **Yes** (review+CLOSED+audit+outbox) | closure sync | **Yes** with 05 (UDR-15) | owns postmortem LLM call, closure audit |
-| 12 | No (own tx) | request authz sync | team isolation (rule from 01) | owns LLM/retrieval + investigation audit |
+| ID  | Capability                                      | Purpose                                       | Main Entities                       | MVP? |
+| --- | ----------------------------------------------- | --------------------------------------------- | ----------------------------------- | ---- |
+| 01  | Identity, Authentication & Team Isolation       | authentication, authorization, team fence     | User, Team, UserSession             | Yes  |
+| 02  | Service Catalog, SLA Config & Escalation Policy | service, SLA and responder configuration      | AppService, EscalationPolicy        | Yes  |
+| 03  | Alert Source Trust Gate                         | source authentication, replay, rate/size gate | AlertSource                         | Yes  |
+| 04  | Alert Ingestion, Dedup & Incident Creation      | normalize, identify, dedup, create incident   | Alert, Incident                     | Yes  |
+| 05  | Incident Lifecycle & Assignment                 | acknowledge, severity, assignment, resolve    | Incident                            | Yes  |
+| 06  | Incident Visibility, Comments & Timeline        | reads, comments, audit/timeline               | Comment, AuditEvent                 | Yes  |
+| 07  | SLA Monitoring & Escalation                     | SLA evaluation and escalation                 | SLA/Incident/Policy                 | Yes  |
+| 08  | Outbox, Queue & Worker Reliability              | outbox, BullMQ, retry, DLQ                    | OutboxEvent                         | Yes  |
+| 09  | Notification Delivery                           | async notification delivery                   | Notification                        | Yes  |
+| 10  | AI Alert Triage                                 | advisory AI triage                            | AI triage result                    | Yes  |
+| 11  | Postmortem, Review & Closure                    | postmortem and atomic closure                 | Postmortem, Incident                | Yes  |
+| 12  | AI Investigation & Evaluation Harness           | evidence-grounded investigation/evaluation    | Investigation, Evidence, Evaluation | Yes  |
 
 ---
 
-# D. Cross-Slice Architecture Matrices
+# 2. Decisions Ingested from Final API
 
-## D.1 Cross-Slice Invariant Matrix
+The following are **closed** because the answer is explicitly represented in the finalized `API.md` and/or its eight resolved API-question rounds.
 
-| Invariant | Owning Slice | Other Slices Involved | Transaction Boundary | Evidence |
-|---|---|---|---|---|
-| ≤1 unresolved incident per alert identity | 04 | 05 (state), 03 (replay differs) | Alert+Incident+Outbox tx; unique partial indexes | DM, ADR-011, BR-035/037, AC-003 |
-| Every accepted alert belongs to exactly one incident | 04 | — | same tx (DB column nullable → app-enforced) | DM; DBS `incidentId` nullable |
-| Original payload preserved separately | 04 | — | same insert | BR-018/038, AC-038 |
-| Source alert state separate from incident state | 04 | 05 | alert-side write only | BR-024/039, AC-047 |
-| Valid transition graph, single winner on concurrent ack | 05 | 07, 11 (race partners) | locked tx | ADR-010, BR-045, AC-011 |
-| Every successful transition has an atomic audit event | 05 (producer) / 06 (store) | 04, 07, 11 | producer's tx | BR-009, NFR-007, AC-012 |
-| Ack actor ≠ assignee (stored separately) | 05 | 07 (if escalation assigns) | same row, separate columns | BR-007/046, RD-014 |
-| Single current assignee | 05 | 07 | row lock | BR-008, DM |
-| CLOSED requires reviewed postmortem or manual path | 11 (proposed) | 05 | review + CLOSED + audit tx | BR-014/072, AC-015 |
-| CLOSED is terminal | 05 | 11 | kernel rejects all | BR-015, AC-034 |
-| Team isolation on every incident operation | 01 (rule) | all | n/a | BR-004, NFR-002, AC-008 |
-| Required events have an atomic outbox record | producers (04/05/07/11/12) | 08 | producer's tx | ADR-009, DM |
-| Duplicate job ⇒ no duplicate business effect | each consumer (07/09/10/11/12) | 08 | per consumer unique key | ADR-014, BR-010, FR-031 |
-| Notification idempotent | 09 | 08 | UNIQUE(idempotencyKey) (nullable!) | BR-064, AC-028 |
-| One postmortem per incident | 11 | — | UNIQUE(incidentId) **missing in DBS** | DM, FR-033, AC-032 |
-| AI never changes incident state/severity | 10, 12 | 05 | no write path | BR-023/073 |
-| Investigation retrieval limited to requester's team | 12 | 01 | filter in query | BR-074, AC-051 |
-| AI/Redis/provider outage never blocks persistence | 04, 05 | 08, 10 | commit precedes external calls | BR-012, FR-007 |
+## 2.1 Identity / authentication
 
-## D.2 Cross-Slice Dependency Matrix
+### API-01 — Authentication mechanism
 
-| From | To | Dependency | Sync/Async | Hard/Soft | Reason |
-|---|---|---|---|---|---|
-| 03 | 04 | verified source context | Sync | Hard (flow) | gate precedes ingestion |
-| 04 | 02 | service, team, default severity | Sync | Soft | initial severity (BR-021) |
-| 04 | 06 | `appendAuditEvent(tx)` | Sync in-tx | Medium | creation audit |
-| 04 | 08 | `enqueueOutbox(tx)` | Sync in-tx | Medium | ADR-011 |
-| 04 | 10 | triage job | Async | Loose | RD-001 |
-| 05 | 01 | guards | Sync | Soft | BR-005 |
-| 05 | 06, 08 | audit + outbox in-tx | Sync in-tx | Medium | ADR-010 |
-| 05 | 09 | notification events | Async | Loose | §8 side effects |
-| 05 | 11 | postmortem job on RESOLVED | Async | Loose | §8 |
-| 07 | 02, 05 | config + state read | Sync | Soft/Hard on state race | ADR-015, UC-006 |
-| 07 | 09 | notify | Async | Loose | UC-006/007 |
-| 09 | 08 | queue/retry/DLQ | Runtime | Medium | ADR-008 |
-| 10, 11, 12 | 08 | queue/retry | Runtime | Medium | ADR-012/014 |
-| 11 | 05 | CLOSED via kernel | Sync | Hard | UDR-15 |
-| 11 | 06 | comments/timeline input | Sync read | Soft | UC-009 |
-| 12 | 11 | REVIEWED postmortems | Read | Soft | FR-041 |
-| 12 | 01 | team authorization | Sync | Soft | BR-074 |
-| all | 01 | request context | Sync | Soft | ARCH |
+**Resolved.**
 
-## D.3 Entity Ownership Matrix
+- User APIs use JWT access tokens.
+- Access-token lifetime: **15 minutes**.
+- Refresh token lifetime: **7 days**.
+- Refresh token is delivered only through the `ims_refresh_cookie`.
+- Access token is delivered in the `Authorization` response header.
+- `sessionId` participates in the session model.
+- Login, refresh, logout and logout-all are explicit API operations.
+- Changes to user role, team, password or status revoke all sessions in the same transaction.
+- Protected-request authorization trusts the JWT until expiry; database state is reflected after refresh/re-login/session revocation.
 
-| Entity | Owning Slice | Read By | Modified By |
-|---|---|---|---|
-| User, Team | 01 | 02, 05, 07, 09, 12 | 01 |
-| AppService, EscalationPolicy | 02 | 04, 07 | 02 |
-| AlertSource | 03 | 04 | 03 |
-| Alert | 04 | 06, 10, 11, 12 | 04 |
-| Incident (create) | 04 | all | 04 |
-| Incident (status, severity, assignee, ack/resolve fields) | 05 | all | **05 kernel only** (11 for CLOSED via kernel — UDR-15) |
-| Comment | 06 | 11, 12 | 06 |
-| AuditEvent | 06 (store/contract) | all | every producer via `appendAuditEvent` |
-| OutboxEvent | 08 | 08 | producers insert via contract; 08 updates status |
-| Notification | 09 | 06 | 09 |
-| Triage result | 10 (storage UNK) | 05/read APIs | 10 |
-| Postmortem | 11 | 12 | 11 |
-| Investigation, Evidence | 12 | read APIs | 12 |
-| Evaluation | 12 (test-only? UDR-23) | — | evaluation runner |
+**Remaining from old question:** password-hashing algorithm itself is not specified by the finalized API.
 
-## D.4 State Transition Ownership Matrix
+### API-02 — Cross-team access
 
-| Transition | Owning Slice | Trigger | Transaction | Evidence |
-|---|---|---|---|---|
-| `∅ → OPEN` (incident) | 04 | accepted alert | Alert+Incident+Outbox | ADR-011, RD-043 |
-| `OPEN → ACKNOWLEDGED` | 05 | user | locked tx + audit + outbox | UC-003, BR-044/045 |
-| `ACKNOWLEDGED → MITIGATING` | 05 | user (severity confirm/update) | locked tx | UC-004 |
-| `MITIGATING → RESOLVED` | 05 | assigned engineer | locked tx + postmortem outbox | UC-008, FR-017 |
-| `RESOLVED → CLOSED` | **11 (proposed)** / 05 (UDR-15) | reviewer approval | review+CLOSED+audit+outbox | UC-010, BR-014 |
-| assign / reassign / unassign (no lifecycle change) | 05 | Team Lead/Admin | locked tx | UC-005 |
-| escalation level progression | 07 | SLA breach | event + notify tx | UC-006 |
-| Alert source `FIRING → RESOLVED` | 04 | source delivery | alert-side write | FR-039, BR-024 |
-| Notification `PENDING → SUCCESS/FAILED` | 09 | worker | worker tx | BR-062/063 |
-| Postmortem `GENERATING → DRAFT → REVIEWED` | 11 | worker / human | per step | DM |
-| Investigation `REQUESTED → RUNNING → COMPLETED/FAILED` | 12 | request / worker | per step | DM (DBS differs) |
-| Outbox row `PENDING → processed` | 08 | relay | relay tx | ADR-009 |
-| AlertSource / User `ACTIVE ↔ DEACTIVATED` | 03 / 01 | Admin | single row | DBS |
+**Resolved.**
+
+Cross-team resource access uses:
+
+`403 TEAM_ACCESS_DENIED`
+
+The API does not use a read-404/write-403 split.
+
+### API-03 — Admin team scope
+
+**Resolved.**
+
+- Admin may administer any team for identity/service/policy administration.
+- Incident data is limited to the Admin's own team.
+- Incident-scoped endpoints use the caller's `teamId`.
+- A user with `teamId = null` receives `403 INVALID_ACTION` on incident-scoped endpoints.
+
+### API-04 — Team-lead / leadId integrity
+
+**Resolved by API.**
+
+- `leadId` must reference an `ACTIVE TEAM_LEAD` of the same team.
+- `leadId` is not allowed for an Admin.
+- Engineer → Team Lead clears `leadId`.
+- Team changes clear `leadId`.
+- The API explicitly defines the relevant role/team/status validation.
+
+### API-05 — User deactivation effects
+
+**Resolved by API.**
+
+- Deactivation revokes all sessions.
+- Existing incident assignments are not automatically changed.
+- Escalation policies are not automatically edited.
+- A policy referencing a deactivated responder can fail at runtime.
+- Login/refresh of a deactivated user returns `403 ACCOUNT_DEACTIVATED`.
 
 ---
 
-# Source Discrepancy Register (SD)
+## 2.2 Service / escalation policy
 
-Conflicts or defects **inside** the canonical documents. I did not resolve them silently.
+### API-06 — Escalation policy shape
 
-| ID | Discrepancy | Affected slices |
-|---|---|---|
-| SD-01 | PRD §7 "Verification" columns cite AC IDs that do not match PRD §20 text (e.g., BR-024→AC-048, BR-025→AC-047, BR-047/048→AC-019/020, BR-031→AC-021). Slices use §20 text as authoritative. | 01, 02, 04, 07 |
-| SD-02 | DBS DDL creates `Alert` (FK→`Incident`) before `Incident`; `User` is a reserved word in PostgreSQL; table/column casing is unquoted camelCase. | 01, 04 |
-| SD-03 | ARCH "Synchronous Request Flow" shows "Alert module --AI Module--> Incident module", contradicting FR-007 / ADR-012 (AI async). Slices follow async. | 04, 10 |
-| SD-04 | ARCH Flows says services "publish a job" after commit; ADR-009 mandates the transactional outbox. | 08, 09 |
-| SD-05 | PRD RD-005 says "multiple external alert sources"; PRD §15 says "One representative external alert source". | 03, 04 |
-| SD-06 | PRD OQ-002 asks whether SLA is identical or per-service; BR-031/RD-018/DBS already say per-service. | 02 |
-| SD-07 | Postmortem state: DM `GENERATING→DRAFT→REVIEWED`; DBS `reviewStatus PENDING/REJECTED/REVIEWED`; PRD §9 "Generation status" + "Approval status". | 11 |
-| SD-08 | Investigation/Evidence: PRD §9 `Evidence.Investigation ID`; DBS `Evidence.incidentId`. DM states REQUESTED/RUNNING/COMPLETED/FAILED; DBS PENDING/DONE (no FAILED). `result NOT NULL` blocks pending rows. DM "≥1 evidence" conflicts with UC-011 no-result flow. | 10, 12 |
-| SD-09 | Alert→Incident cardinality: DM diagram `0..1`, DM invariant "exactly one", DBS `incidentId` nullable. | 04 |
-| SD-10 | Notification `recipients uuid[]` (DBS) vs single "Recipient" (PRD §9); `idempotencyKey` nullable UNIQUE; `attemptCount` nullable. | 09 |
-| SD-11 | DBS `Evaluation` table has `incidentId NOT NULL` FK (production-coupled) vs DM/BR-080/FR-046 "outside the production domain model and API". | 12 |
-| SD-12 | PRD §11 matrix grants Admin acknowledge/resolve; §8 transition table lists only Engineer/Team Lead (ack) and Assigned Engineer (resolve). | 05 |
-| SD-13 | DM Escalation: "1..4 policies per service" + `UNIQUE(service_id, severity)`; DBS one `escalationPolicyId` per service with fixed `level1..fallbackAdmin` and no severity/timing; PRD §9 policy has "Service ID", "Ordered responder list", "timing". | 02, 07 |
-| SD-14 | FR-011 text is garbled ("A Engineer acknowledges a incident post notification…"); meaning of "post notification" unclear. | 05 |
-| SD-15 | Audit event vocabulary differs between PRD §9 and DBS CHECK (`SEVERITY_CHANGED`/`SEVERITY_CONFIRMED`, `ESCALATED`/`ESCALATED_L1–L4`, `NOTIFICATION_SENT`/`NOTIFIED`); both lack unassign/reassign, SLA breach, escalation failure, AI/notification/postmortem/investigation failure. `AuditEvent.actor` has no FK. | 06 + all producers |
-| SD-16 | PRD §9 Alert has "Source status" (firing/resolved); DBS `Alert` has no such column. PRD §9 Incident lacks `severityConfirmedBy/Timestamp`, `closedBy` that DBS adds. | 04, 05 |
-| SD-17 | PRD "Created on: 17th Sept 2026 / Last updated: 19th Sept 2026"; Architecture/DM/DBS carry no version. Slice "canonical version" fields cite `PRD-RD` / `unv.`. | all |
+**Partially resolved.**
 
----
+Resolved:
 
-# E. API Contract Readiness Review
+- Exactly **one escalation policy per service**.
+- Policy is created inline with service creation.
+- Four responder positions exist:
+  - `level1`
+  - `level2`
+  - `level3`
+  - `fallbackAdmin`
+- Policy is never deleted/replaced through the API.
+- A second creation attempt returns `409 POLICIES_MAX_LIMIT_REACHED`.
+- Policy changes are blocked while the service has unresolved incidents.
 
-> **Not a design.** No endpoint, field, or status code below is proposed as final. This is input to the API-contract phase.
+**Still open:** any separate inter-responder timing/delay semantics not specified by `API.md`.
 
-## E.1 Capabilities that need external API operations
+### API-07 — Policy responder validity
 
-| Slice | External operations needed | Actors |
-|---|---|---|
-| 01 | login; current user; user CRUD; team CRUD | anonymous, any user, Admin |
-| 02 | service CRUD; policy CRUD | Admin (read: team members UNK) |
-| 03 | alert ingestion (shared w/ 04); alert-source management (**actor UNKNOWN**) | alert source; ? |
-| 04 | alert ingestion (single/multi-alert) | alert source |
-| 05 | acknowledge; confirm/update severity; resolve; assign; reassign; unassign | Engineer/Team Lead(/Admin) |
-| 06 | list/get incidents; add/list comments; get timeline | all roles, own team |
-| 07 | SLA & escalation status (read) | all roles, own team |
-| 08 | DLQ inspect/re-drive (ops, optional) | Admin? |
-| 09 | notification history (optional); retry (optional) | UNK |
-| 10 | read suggestion; retry triage (optional) | all roles / Team Lead? |
-| 11 | get/update postmortem; approve & close; retry generation (optional) | Engineer/Team Lead/Admin |
-| 12 | request investigation; get investigation(s); retry (optional) | Engineer/Team Lead/Admin |
+**Resolved.**
 
-## E.2 Per-dimension summary
+- `level1`, `level2`: ACTIVE ENGINEER of the service's team.
+- `level3`: ACTIVE TEAM_LEAD of the service's team.
+- `fallbackAdmin`: ACTIVE ADMIN.
+- Invalid references return `403 INVALID_ACTION`.
 
-| Dimension | Status |
-|---|---|
-| Authorization rules | PRD §11 matrix is the only source: Engineer/Team Lead/Admin; "Authorization must additionally enforce team isolation." Gaps: Admin cross-team scope, Admin on ack/resolve (SD-12), read access to config, alert-source management actor. |
-| Input concepts | Mostly clear for lifecycle ops (incidentId, severity, resolutionSummary + confirmation, responderId). Unclear: alert payload shape per source, identity-defining fields (BR-033), service mapping (UDR-18), postmortem edit payload, investigation request reference. |
-| Output concepts | Incident detail per UC-002; timeline entries; suggestions; postmortem; investigation brief + evidence refs. Shapes UNKNOWN. |
-| State transitions | See D.4. Open: re-update of severity in `MITIGATING`, unassign-then-resolve, closure ownership. |
-| Failure conditions | PRD gives 403 (authorization), 409 (lost ack race, close-without-review, invalid transition), "403/404" (BR-004), "Invalid ... is rejected" (400-class). No error-code taxonomy or envelope. |
-| Idempotency | Alert: natural identity. Lifecycle ops: state-guarded (repeat ⇒ conflict). Investigation: request reference / key (global UNIQUE, nullable). Notification: key. Postmortem: per incident (missing UNIQUE). Request-level keys for lifecycle ops: UNKNOWN. |
-| Concurrency semantics | Server-side row lock (ADR-010); first ack wins ⇒ conflict. Client concurrency tokens (ETag/version): UNKNOWN. Postmortem edit vs approve: UNKNOWN. |
-| Pagination / filtering | **Not specified anywhere** (incident list, comments, timeline, investigations, notifications). NFR-006: p95 < 300 ms for current-status reads. |
-| Asynchronous operations | Ingestion sync (≤5 s, NFR-004). Triage, notifications, SLA/escalation, postmortem generation, investigation: async. Request/response timing for investigation (202 + poll? — SSE/WebSocket are non-goals) UNKNOWN. |
-| Ambiguous API shapes | Ingestion with multiple alerts and partial success; endpoint per source vs shared; one "transition" endpoint vs one per action; postmortem approve+close as one vs two operations; investigation sync vs async; suggestion embedded vs separate. |
-| Decisions needed before freeze | UDR-09 (auth scheme), 19 (multi-alert response), 20 (403 vs 404), 02, 05, 10, 15, 17, 18, plus pagination/filter convention, error envelope, correlation-ID header, idempotency-key convention. |
+### API-08 — SLA configuration validity/change semantics
 
-## E.3 Candidate operation table
+**Resolved where API-defined.**
 
-| Slice | Candidate operation | Transition | Confidence |
-|---|---|---|---|
-| 01 | Login; User/Team CRUD | — | Med / High (capability) |
-| 02 | Service/Policy CRUD | — | High / Low (shape, UDR-03) |
-| 03/04 | Ingest alerts | `∅→OPEN`, dup, source-resolved | High / Low (envelope) |
-| 05 | Acknowledge | OPEN→ACK | High |
-| 05 | Confirm/update severity | ACK→MITIGATING | High |
-| 05 | Resolve | MITIGATING→RESOLVED | High |
-| 05 | Assign / reassign / unassign | none | High |
-| 06 | List/get incident; comments; timeline | none | High / Low (filters) |
-| 07 | SLA/escalation status | none | Medium |
-| 10 | Read triage suggestion | none | Medium |
-| 11 | Get/update postmortem; approve & close | postmortem + RESOLVED→CLOSED | High / Medium |
-| 12 | Request/get investigation | none (async job) | High / Low (timing) |
+- SLA values are positive integers.
+- For every severity: `resolution >= response`.
+- Validation is performed on the merged stored + submitted values.
+- Changing SLA configuration while unresolved incidents exist returns `409 SERVICE_HAS_OPEN_INCIDENTS`.
+- Severity changes use the latest severity's configured thresholds.
+- The SLA clock is not reset by a severity change.
+- SLA status is computed from `incident.createdAt + current severity threshold`.
+
+**Still open:** worker scheduling/catch-up/once-only persistence details belong to the remaining SLA/worker design gate below.
 
 ---
 
-# F. HUMAN DESIGN REVIEW
+## 2.3 Alert source / ingestion
 
-I did **not** choose any of these for you. They are numbered `UDR-nn` and referenced from the slices.
+### API-09 — Representative source
 
-## MUST DECIDE (boundaries, transactions, invariants, ownership, state, authorization, concurrency, idempotency, API semantics)
+**Resolved for the API boundary.**
 
-| ID | Decision | Why it matters | Affected | Options (not chosen) | Evidence |
-|---|---|---|---|---|---|
-| **UDR-01** | Alert recurrence & duplicate storage: after the incident is RESOLVED/CLOSED, is a repeated alert with the same identity a duplicate, a new incident, or a reopen? Is a duplicate stored as a row or only an audit event? | DBS unique indexes forbid *any* second row with same identity, but FR-004 only talks about *unresolved* incidents; UC-001 says "record/associate the duplicate alert". | 04, 05, 06 | (a) one Alert row per identity forever, dup = audit only; (b) relax unique to unresolved scope; (c) occurrence table | FR-004, BR-035/037, DBS indexes, UC-001 |
-| **UDR-02** | Assignment model: who sets `currentAssignee` initially/automatically ("enqueues a worker for assignment")? Does ack set the assignee? Does escalation assign or only notify? What makes a user an eligible assignee (role/team/ACTIVE)? | Ownership of `currentAssignee`, ack race with escalation, Team Lead semantics | 05, 07, 02 | (a) escalation notify-only, assignment only by Team Lead/Admin; (b) escalation assigns via 05's kernel; (c) ack auto-assigns when null | BR-040/041/056, UC-006, ARCH Incident flow, FR-011 |
-| **UDR-03** | Escalation policy shape and timing: DM "1..4 per service, UNIQUE(service, severity)" vs DBS fixed `level1..fallbackAdmin` vs PRD "ordered list + timing". Responder validity rules. | Determines schema and what 07 reads | 02, 07 | fixed columns; normalized ordered rows; per-severity policies | SD-13, OQ-003 |
-| **UDR-07** | Postmortem schema/state: generation status + failure state storage; `REJECTED` meaning; `UNIQUE(incidentId)`; NOT NULL narrative fields vs in-progress rows | FR-033/BR-071 can't be satisfied by current DDL | 11 | add status columns; separate job table; relax NOT NULL | SD-07, DBS |
-| **UDR-06** | Manual review path when generation repeatedly fails (OQ-008) | Without it incidents can stick in RESOLVED | 11, 05 | manual authoring; waiver by Team Lead/Admin | BR-014/072, OQ-008 |
-| **UDR-15** | Who owns `RESOLVED → CLOSED`: 05 or 11? | Ownership of transition and the closure tx | 05, 11 | 11 owns, calls 05 kernel (proposed); 05 owns, calls 11 gate | UC-010, ADR-010 |
-| **UDR-17** | Role details: Admin on ack/resolve; severity re-update while MITIGATING; resolve by non-assignee (Team Lead/Admin) | Authorization + state machine completeness | 05 | follow §11 matrix; follow §8 table; hybrid | SD-12, FR-015/017 |
-| **UDR-20** | Cross-team access: 403 or 404? | API semantics + information leakage | all | 403 (AC-008); 404; 404 for reads, 403 for writes | BR-004 "403/404", AC-008, UC-002 |
-| **UDR-19** | Multi-alert request response shape and status (partial success) | API semantics | 03, 04 | 207-style per-alert results; all-or-error with details | FR-038, AC-044 |
-| **UDR-05** | Audit vocabulary and coverage: reconcile PRD vs DBS names; add missing event types (unassign/reassign, SLA breach, failures); audit for identity/config changes (§12.10)? | Producers' tx depends on valid event types; timeline completeness | 06 + all | single canonical list; metadata-typed events | SD-15, §12.10 |
-| **UDR-12** | Outbox event catalog: event types, payloads, routing | contract between producers and workers | 04, 05, 07, 08, 09, 10, 11, 12 | one event per domain action; coarse job events | ADR-009, §8 side effects |
-| **UDR-13** | SLA scheduling: delayed per-incident jobs vs periodic scanner vs outbox-triggered; once-only recording storage; behavior on severity change/config change/outage catch-up | Durability of SLA/escalation | 07, 02, 05, 08 | unique audit key; SLA state table; deterministic job IDs | FR-021–023, BR-052/054 |
-| **UDR-04** | AI triage result storage (no table): new table vs audit metadata vs reuse Investigation; confidence/evidence/category format (OQ-007); retry-on-demand | AC-006 requires stored suggestion | 10 | new `TriageSuggestion`; metadata; reuse | FR-008, OQ-007 |
-| **UDR-08** | Investigation model: state values, Evidence→Investigation FK, ≥1 evidence vs no-result, runbook source entity, retrieval mechanism, idempotency key scope/origin, sync/async response, retention (OQ-010) | Schema + API + retrieval design | 12 | see SD-08 | FR-041, UC-011 |
-| **UDR-09** | Authentication mechanism: token vs session, lifetime/refresh, deactivated-user handling, lockout, password hashing | PRD only requires "secure password/session/token handling" | 01 + all | JWT; server session; hybrid | §12.1, §12.12 |
-| **UDR-10** | Source auth specifics: signature algorithm, timestamp tolerance, replay store (Redis vs DB), replay-vs-valid-duplicate behavior, secret storage location, who manages AlertSource | Trust gate correctness | 03, 04 | see slice | FR-002, AC-002 vs AC-003 |
-| **UDR-18** | Alert→service mapping, source-severity mapping config (OQ-004), incident title/description derivation, source↔team permission | Ingestion cannot create incidents without it | 04, 02, 03 | per-source config in `AlertSource.configuration`; separate mapping table | BR-020, FR-037 |
-| **UDR-23** | Evaluation set storage/placement: test fixtures vs `Evaluation` table; metrics definition | BR-080/FR-046 vs DBS | 12 | repo fixtures; separate store | SD-11 |
+- MVP webhook source is a seeded `AlertSource`.
+- The webhook uses a common alert wire format for the implemented `GENERIC` source.
+- Real source-specific adapters can be added later.
+- There is **no AlertSource CRUD API** in the finalized API.
+- Sources are seeded/out-of-band configured.
 
-## SHOULD DECIDE
+### API-10 — Source authentication and replay
 
-| ID | Decision | Affected | Notes |
-|---|---|---|---|
-| **UDR-11** | Where to store source alert status (no column in DBS) | 04 | needed for FR-039 |
-| **UDR-14** | Notification event catalog (OQ-005), recipient resolution (assignee + which "Team Lead"), key derivation, type mapping, resolve at enqueue vs send time | 09, 05, 07 | |
-| **UDR-16** | LLM data allowed/redacted (OQ-006, OQ-012) | 10, 11, 12 | |
-| **UDR-21** | Redis outage behavior: rate limit fail-open/closed; queue; cache | 03, 08 | ADR-005 says handle separately |
-| **UDR-22** | Retry parameters, retry classes, DLQ tooling, outbox relay mechanism + status values (pooler constraint) | 08 + consumers | RD-024 defers to engineering |
+**Resolved.**
 
-## CAN DEFER
+- HMAC-SHA256.
+- Signature covers `"<X-Timestamp>.<raw body>"`.
+- Timestamp tolerance: ±300 seconds.
+- Replay signatures are stored in Redis.
+- Replay detection returns `409 REPLAY_DETECTED`.
+- Exact same signed request is a replay.
+- A freshly signed duplicate alert is accepted and deduplicated.
+- Source is identified by `alertSourceId`.
+- Signing secrets are never returned.
 
-- Exact SLA durations (OQ-001), escalation delay values (OQ-003) — configuration data, not code.
-- Indexes for tenant-scoped reads/timeline ordering (SLICE-06 §11.5) — decide at implementation.
-- Retention policy (OQ-010).
-- Append-only DB guard for `AuditEvent` (trigger/role).
-- Metric names/dashboards.
+### API-11 — Replay vs valid duplicate
 
-## Observation (not a decision)
+**Resolved.**
 
-The "Domain model" and "DB schema" disagree enough (SD-07, 08, 10, 11, 13) that **UDR-03, 04, 07, 08 should be settled before any migration is generated**; otherwise the first Prisma schema will bake in a mismatch.
+- Same signed request → `409 REPLAY_DETECTED`.
+- Freshly signed request with an already-known alert identity → accepted as a duplicate.
+- Alert identity uses source + source event ID, source fingerprint, or deterministic normalized fields.
+- Whole-payload hashing is explicitly not used.
+
+### API-12 — AlertSource administration
+
+**Resolved at API scope.**
+
+There is no AlertSource CRUD endpoint. Sources are seeded/out-of-band configuration.
+
+### API-13 — Rate limiting when Redis is down
+
+**Not resolved by API.**
+
+The API defines rate limits and `503 DEPENDENCY_UNAVAILABLE`, but does not settle the precise fail-open/fail-closed behavior of the rate limiter when Redis is unavailable.
 
 ---
 
-# Suggested order to resolve decisions (practical, not canonical)
+## 2.4 Alert ingestion / incident creation
 
-1. UDR-20, 09, 17, 02 → unblocks SLICE-01/05 and the API contract skeleton.
-2. UDR-05, 12, 22 → unblocks the audit and outbox contracts every slice calls (SLICE-06/08 are on the critical path for 04/05).
-3. UDR-01, 18, 19, 10, 11 → unblocks SLICE-03/04.
-4. UDR-03, 13 → unblocks SLICE-07.
-5. UDR-14 → SLICE-09. UDR-04, 16 → SLICE-10. UDR-06, 07, 15 → SLICE-11. UDR-08, 23 → SLICE-12.
+### API-14 — Alert recurrence after resolution
 
-This ordering is my suggestion; the dependency matrix in D.2 supports it.
+**Resolved.**
+
+- Identity uniqueness applies only while the matching incident is unresolved.
+- Duplicate against an unresolved incident → duplicate.
+- After `RESOLVED` or `CLOSED`, the same identity creates a **new incident**.
+- Concurrent creation is resolved by the database uniqueness mechanism.
+
+### API-15 — Alert → service / source permission
+
+**Resolved at API level.**
+
+- Incoming alert carries `serviceId`.
+- Service must exist and be ACTIVE.
+- Incident team is derived from `service.teamId`.
+- Webhook caller cannot choose an arbitrary team.
+- Source itself is not assigned a team in the API contract.
+
+### API-16 — Source severity mapping
+
+**Partially resolved.**
+
+The finalized API defines:
+
+- `sourceSeverity` as source-provided text.
+- `initialSeverity` as the resulting P0–P3 incident severity.
+- AI triage is advisory and does not autonomously change severity.
+- Severity can subsequently be changed through the incident lifecycle.
+
+**Still open:** the exact persistent configuration/algorithm for source-severity → P0–P3 mapping.
+
+### API-17 — Incident title/description derivation
+
+**Resolved sufficiently for API input.**
+
+The normalized alert contains `name`, `summary`, and `description`, and the resulting incident exposes title/description.
+
+**Still open only if implementation needs a more exact field-precedence rule than the API currently states.**
+
+### API-18 — Multi-alert request semantics
+
+**Resolved.**
+
+- Batch contains 1–100 alerts.
+- Each alert is processed independently.
+- Each alert has its own transaction.
+- Partial success returns per-alert results.
+- If all alerts are rejected, HTTP `400` is returned with the same results body.
+- Rate-limited batch items use item-level `RATE_LIMITED`.
+
+---
+
+## 2.5 Incident lifecycle
+
+### API-19 — Assignment model
+
+**Resolved.**
+
+- Assignment/reassignment/unassignment is synchronous incident lifecycle work.
+- Team Leads and Admins may assign/reassign/unassign.
+- Engineers cannot assign.
+- Assignment is not implicitly performed merely because an incident is acknowledged.
+- Escalation semantics are reflected in the finalized incident/SLA API and do not introduce an independent assignment API.
+
+### API-20 — Incident lifecycle authorization
+
+**Resolved.**
+
+The finalized API defines:
+
+- acknowledgement by allowed roles;
+- severity confirmation/change rules;
+- assignment by Team Lead/Admin;
+- resolve-by-assignee restriction for Engineer;
+- escalation-chain authorization;
+- explicit state guards;
+- row locking and re-check under the lock.
+
+### API-21 — Cross-slice concurrency semantics
+
+**Resolved.**
+
+- Incident commands lock the incident row.
+- State is re-checked under the lock.
+- First committed request wins.
+- Race losers receive the relevant `409`.
+- State change + audit + outbox are committed atomically.
+
+### API-22 — RESOLVED → CLOSED ownership/path
+
+**Resolved.**
+
+Closure occurs atomically with postmortem approval:
+
+- postmortem is reviewed;
+- incident becomes CLOSED;
+- audit events are written in order;
+- outbox event is written in the same transaction.
+
+There is no separate close endpoint.
+
+---
+
+## 2.6 Audit / timeline
+
+### API-23 — Canonical incident event vocabulary
+
+**Resolved for the API timeline.**
+
+The finalized API defines the event vocabulary, including:
+
+`ALERT_RECEIVED`, `ALERT_DUPLICATE`, `AI_TRIAGE_COMPLETED`, `ASSIGNED`, `REASSIGNED`, `INCIDENT_CREATED`, `ACKNOWLEDGED`, `SEVERITY_CONFIRMED`, `COMMENT_ADDED`, `SLA_WARNING`, `ESCALATED_L1..L4`, `SOURCE_ALERT_RESOLVED`, `RESOLVED`, `NOTIFIED`, `POSTMORTEM_GENERATED`, `POSTMORTEM_REVIEWED`, `AI_INVESTIGATION_COMPLETED`, `CLOSED`, `OPEN`.
+
+**Still open:** whether/how security-relevant non-incident administrative actions are represented in the audit store.
+
+---
+
+## 2.7 AI triage / postmortem / investigation
+
+### API-24 — AI triage output contract
+
+**Resolved at API level.**
+
+`AiTriage` contains:
+
+- `PENDING | COMPLETED | UNAVAILABLE`
+- category
+- suggested severity
+- confidence 0–1
+- evidence
+- reasoning summary
+- model
+- model version
+- generated timestamp
+
+It is advisory and never directly changes incident state.
+
+**Still open:** exact persistent storage implementation for the triage result if required beyond the API representation.
+
+### API-25 — Postmortem failure/manual path
+
+**Resolved.**
+
+- AI postmortem generation is asynchronous.
+- Failure does not reopen or invalidate RESOLVED.
+- Failed generation is retryable.
+- A manual postmortem path exists.
+- Manual postmortem can be created after generation failure.
+- Approval closes the incident atomically.
+
+### API-26 — Investigation request model
+
+**Resolved at API level.**
+
+- Investigation is asynchronous.
+- First request returns `202`.
+- `Idempotency-Key` is required.
+- Key is globally unique.
+- Same key + same incident + same user returns the existing investigation.
+- Failed investigation is terminal; retry uses a new key.
+- Status: `REQUESTED | RUNNING | COMPLETED | FAILED`.
+- Evidence is linked to the investigation.
+- Investigation never changes incident state/severity/assignment.
+
+**Still open:** knowledge-source/retrieval definition, retention, and evaluation-harness semantics.
+
+---
+
+# 3. Remaining Open Questions
+
+Only questions that were **not actually resolved by the eight API-question rounds/final API** belong here.
+
+These are the questions to answer manually. Do not re-answer anything from Section 2.
+
+## OPEN-01 — Password hashing algorithm
+
+**Owner:** Slice 01  
+**Source:** old UDR-09 / final API leaves hashing algorithm unspecified.
+
+**Question:**  
+Which password-hashing algorithm and parameters are required for the MVP?
+
+**Answer:**
+Argon2 password-hashing algorithm used. No parameters needed, use default configs.
+
+>
+
+---
+
+## OPEN-02 — Inter-responder escalation timing
+
+**Owner:** Slice 02 / Slice 07
+
+**Question:**  
+Is there a separate delay between escalation levels, and if so, where is that timing configured and how does it interact with response-SLA breach timing?
+
+**Answer:**
+No, not in MVP.
+
+>
+
+---
+
+## OPEN-03 — Source-severity → P0–P3 mapping
+
+**Owner:** Slice 04
+
+**Question:**  
+Where is source-severity mapping configured, what mappings exist, and what happens for an unrecognized source severity?
+
+**Answer:**
+
+- Map below config to existing ones.
+  "critical" → P0
+  "high" → P1
+  "warning" → P2
+  "info" → P3
+
+- If unrecognized, we fallback to default severity of a service.
+
+>
+
+---
+
+## OPEN-04 — Exact incident title/description derivation
+
+**Owner:** Slice 04
+
+**Question:**  
+What is the exact precedence/derivation rule when `name`, `summary`, and `description` from the normalized alert are combined into `Incident.title` and `Incident.description`?
+
+**Answer:**
+
+- Incident.title = `name`
+- Incident.description = `description` + `summary`
+
+>
+
+---
+
+## OPEN-05 — Audit coverage for non-incident administrative actions
+
+**Owner:** Slice 06
+
+**Question:**  
+Which security-relevant administrative actions must create audit records?
+
+Examples to decide explicitly:
+
+- user create/update/deactivate;
+- team create/update/deactivate;
+- service create/update/deactivate;
+- escalation-policy create/update;
+- AlertSource configuration changes, if any are recorded outside seed/configuration.
+
+**Answer:**
+
+- User / Team / Service / Escalation policy : Update / deactivate
+- AlertSource: Update (config change)
+
+>
+
+---
+
+## OPEN-06 — SLA evaluation scheduling and catch-up
+
+**Owner:** Slice 07
+
+**Question:**  
+What is the authoritative SLA scheduling mechanism?
+
+Choose/define:
+
+- delayed per-incident jobs;
+- periodic scanner;
+- outbox-triggered scheduling;
+- hybrid.
+
+Also define how overdue SLA work is recovered after worker/Redis downtime.
+
+**Answer:**
+
+- We will use a hybrid approach:
+  Primary:
+  delayed BullMQ jobs
+
+Safety net:
+periodic PostgreSQL scanner
+
+- This approach helps recovery with precision.
+
+>
+
+---
+
+## OPEN-07 — Once-only SLA milestone recording
+
+**Owner:** Slice 07
+
+**Question:**  
+How is once-only processing guaranteed for:
+
+- 80% response warning;
+- 80% resolution warning;
+- response breach;
+- resolution breach;
+- each escalation level;
+- escalation failure?
+
+**Answer:**
+
+- Use a unique idempotency key.
+- Enforced at application layer + DB layer.
+
+- Consider below setup:
+
+| SLA action             | Possible idempotency identity             |
+| ---------------------- | ----------------------------------------- |
+| 80% response warning   | `incidentId + RESPONSE_WARNING`           |
+| 80% resolution warning | `incidentId + RESOLUTION_WARNING`         |
+| Response breach        | `incidentId + RESPONSE_BREACH`            |
+| Resolution breach      | `incidentId + RESOLUTION_BREACH`          |
+| Escalation level 1     | `incidentId + ESCALATION_LEVEL_1`         |
+| Escalation level 2     | `incidentId + ESCALATION_LEVEL_2`         |
+| Escalation failure     | `incidentId + ESCALATION_FAILURE + level` |
+
+>
+
+---
+
+## OPEN-08 — SLA milestone audit/notification coverage
+
+**Owner:** Slice 07 / Slice 09
+
+**Question:**  
+Exactly which SLA milestones create audit/timeline events and exactly which create notifications?
+
+**Answer:**
+
+| SLA milestone          | Audit event?      | Notification? |
+| ---------------------- | ----------------- | ------------- |
+| 80% response warning   | Yes (SLA_WARNING) | Yes           |
+| 80% resolution warning | Yes (SLA_WARNING) | Yes           |
+| Response breach        | No                | Yes           |
+| Resolution breach      | No                | Yes           |
+| Escalation L1          | Yes               | Yes           |
+| Escalation L2          | Yes               | Yes           |
+| Escalation L3          | Yes               | Yes           |
+| Escalation L4          | Yes               | Yes           |
+| Escalation failure     | No                | Yes           |
+
+>
+
+---
+
+## OPEN-09 — Escalation chain progression after invalid/deactivated responder
+
+**Owner:** Slice 07
+
+**Question:**  
+When a configured responder is invalid/deactivated at execution time, what exact behavior occurs?
+
+Define:
+
+- failure event;
+- whether the level is considered consumed;
+- whether the next level is attempted immediately;
+- whether fallback is attempted;
+- whether the incident remains otherwise unchanged.
+
+**Answer:**
+
+- Failure event - ESCALATION_FAILED.
+- Is that escalation level finished? - Yes
+- Do we immediately try the next level? - Yes
+- Do we try the fallback Admin? - Yes, if it's next in chain.
+- Does anything else about the incident change?- only escalation/notification state is affected.
+
+>
+
+---
+
+## OPEN-10 — Outbox event catalog
+
+**Owner:** Slice 08
+
+**Question:**  
+What is the canonical outbox event catalog, including:
+
+- event type;
+- payload;
+- producer;
+- consumer;
+- routing;
+- idempotency identity;
+- whether the event is mandatory or optional?
+
+**Answer:**
+<COME BACK AGAIN>
+
+>
+
+---
+
+## OPEN-11 — Outbox relay/status/retention model
+
+**Owner:** Slice 08
+
+**Question:**  
+Define:
+
+- how pending outbox rows are claimed;
+- transaction/locking mechanism;
+- status values;
+- retry ownership;
+- processed-row retention/deletion;
+- behavior after a relay crash.
+
+**Answer:**
+
+>
+
+---
+
+## OPEN-12 — Retry classification and DLQ
+
+**Owner:** Slice 08
+
+**Question:**  
+Define the common worker policy:
+
+- maximum attempts;
+- backoff;
+- retryable errors;
+- non-retryable errors;
+- terminal failure state;
+- DLQ representation;
+- inspect/re-drive mechanism.
+
+**Answer:**
+
+>
+
+---
+
+## OPEN-13 — Redis / queue loss and recovery
+
+**Owner:** Slice 08
+
+**Question:**  
+If Redis/BullMQ becomes unavailable or is wiped:
+
+- what work is recoverable from PostgreSQL/outbox;
+- what work is lost;
+- how delayed SLA jobs are reconstructed;
+- how notifications/AI/postmortem/investigation jobs are recovered;
+- whether any Redis-only state is intentionally ephemeral.
+
+**Answer:**
+
+>
+
+---
+
+## OPEN-14 — Notification event catalog
+
+**Owner:** Slice 09
+
+**Question:**  
+Exactly which domain events generate notifications, and what notification severity/type does each use?
+
+**Answer:**
+
+>
+
+---
+
+## OPEN-15 — Notification recipient resolution
+
+**Owner:** Slice 09
+
+**Question:**  
+For every notification event, define the exact recipient rule:
+
+- current assignee;
+- assignee's lead;
+- service policy `level3`;
+- fallback Admin;
+- all active Team Leads;
+- behavior when no assignee exists;
+- resolve recipient at enqueue time or send time.
+
+**Answer:**
+
+>
+
+---
+
+## OPEN-16 — Notification record/idempotency model
+
+**Owner:** Slice 09
+
+**Question:**  
+Define:
+
+- one Notification row per recipient vs recipient collection;
+- idempotency-key derivation;
+- producer vs worker creation;
+- retrying vs FAILED representation;
+- duplicate notification prevention.
+
+**Answer:**
+
+>
+
+---
+
+## OPEN-17 — LLM data boundary / redaction
+
+**Owner:** Slices 10, 11, 12
+
+**Question:**  
+What IMS data may be sent to the LLM, what must be redacted/excluded, and what provenance must be stored?
+
+**Answer:**
+
+>
+
+---
+
+## OPEN-18 — AI triage persistence
+
+**Owner:** Slice 10
+
+**Question:**  
+Where is the triage result persisted so that the API's `aiTriage` representation survives process restart and can be audited?
+
+Define:
+
+- persistence structure;
+- lifecycle/status;
+- retry;
+- failure representation;
+- relation to Incident/Alert.
+
+**Answer:**
+
+>
+
+---
+
+## OPEN-19 — Investigation knowledge sources and retrieval
+
+**Owner:** Slice 12
+
+**Question:**  
+Which records are eligible as investigation evidence, how are they retrieved, where do runbooks live, and whether only reviewed postmortems are eligible?
+
+**Answer:**
+
+>
+
+---
+
+## OPEN-20 — Investigation retention
+
+**Owner:** Slice 12
+
+**Question:**  
+How long are investigation results and evidence retained?
+
+**Answer:**
+
+>
+
+---
+
+## OPEN-21 — Evaluation harness
+
+**Owner:** Slice 12
+
+**Question:**  
+Define:
+
+- whether evaluation fixtures live only in the repository or also in the database;
+- what is evaluated;
+- retrieval relevance definition;
+- evidence validity definition;
+- output validity definition;
+- evaluation execution/reporting format.
+
+**Answer:**
+
+>
+
+---
+
+# 4. New Questions Discovered During Manual Review
+
+Use this section for questions that were **not present in the old Index and were not answered by the API rounds**.
+
+Do not duplicate an existing question. If a new question is actually a sub-question of an existing `OPEN-*`, add it there instead.
+
+## IDX-01 — [TITLE]
+
+**Owner:**  
+**Affected slices:**  
+**Why it matters:**  
+**Evidence/source:**
+
+**Question:**
+
+>
+
+**Answer:**
+
+>
+
+**Status:** OPEN
+
+---
+
+# 5. Decision Record Format
+
+When answering an open question, use exactly this structure:
+
+```markdown
+## OPEN-XX — <title>
+
+**Decision:** <one unambiguous decision>
+
+**Rules:**
+
+1. <rule>
+2. <rule>
+3. <rule>
+
+**Exceptions:**
+
+- <exception or N/A>
+
+**Affected slices:** <slice IDs>
+
+**Implementation consequence:** <only if the decision creates one>
+
+**Status:** RESOLVED
+```
+
+If the answer intentionally leaves something implementation-defined:
+
+```markdown
+**Implementation-defined:** <what remains flexible>
+
+**Invariant that must still hold:** <non-negotiable requirement>
+```
+
+Do not use vague answers such as:
+
+- "handle appropriately"
+- "as needed"
+- "standard approach"
+- "reasonable"
+- "TBD"
+
+unless the exact implementation-defined boundary is explicitly stated.
+
+---
+
+# 6. Slice Readiness
+
+A slice can move to **READY FOR SLICE SPEC** only when:
+
+- all questions owned by that slice are `RESOLVED`, or explicitly marked `N/A`;
+- no unresolved dependency from another slice blocks it;
+- no canonical source conflict affecting its boundary remains unowned;
+- its transaction boundary is understood;
+- its synchronous dependencies are understood;
+- shared invariants are owned by exactly one slice;
+- the finalized API decisions relevant to the slice are already reflected.
+
+| Slice | Status  | Blocking Questions  |
+| ----- | ------- | ------------------- |
+| 01    | CLOSED  | OPEN-01             |
+| 02    | CLOSED  | OPEN-02             |
+| 03    | PARTIAL | OPEN-13             |
+| 04    | CLOSED  | OPEN-03, OPEN-04    |
+| 05    | READY\* | —                   |
+| 06    | CLOSED  | OPEN-05             |
+| 07    | CLOSED  | OPEN-06–09          |
+| 08    | OPEN    | OPEN-10–13          |
+| 09    | OPEN    | OPEN-14–16          |
+| 10    | OPEN    | OPEN-17–18          |
+| 11    | OPEN    | OPEN-17             |
+| 12    | OPEN    | OPEN-17, OPEN-19–21 |
+
+`*` Recheck against canonical design conflicts before freezing the slice.
+
+---
+
+# 7. Boundary Review
+
+The existing slice boundaries remain the working boundaries unless one of the remaining decisions proves a hard coupling.
+
+A boundary must be reconsidered only if the unresolved decision shows that two capabilities:
+
+- must share the same transaction;
+- must perform inseparable synchronous internal operations;
+- jointly enforce an invariant that cannot be owned by one slice;
+- or require shared mutable state that makes the separation misleading.
+
+Do **not** merge slices merely because they communicate.
+
+---
+
+# 8. Resolution Workflow
+
+Use this sequence:
+
+```text
+1. Resolve remaining OPEN questions for one slice
+        ↓
+2. Update this Index
+        ↓
+3. Freeze that slice's boundary/decisions
+        ↓
+4. Generate the permanent capability-slice specification
+        ↓
+5. Implement the slice
+        ↓
+6. Verify against canonical docs + API.md + slice spec
+        ↓
+7. Move to the next slice
+```
+
+### Important
+
+The API-question rounds are **closed history**.
+
+Do not ask the user to answer those questions again.
+
+This Index is now the place for the **remaining non-API design decisions only**.

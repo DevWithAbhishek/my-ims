@@ -9,6 +9,7 @@ module.exports = {
   transform: {
     '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.json', diagnostics: { ignoreCodes: [151002] } }],
   },
+  globalSetup: '<rootDir>/test/integration/global-setup.ts',
   setupFiles: ['<rootDir>/test/integration/env.ts'],
   maxWorkers: 1,
   testTimeout: 30000,

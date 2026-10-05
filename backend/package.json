@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "build": "prisma generate && tsc -p tsconfig.build.json",
     "prisma:generate": "prisma generate",
     "start": "node dist/main.js",
     "start:worker": "node dist/worker.js",
