@@ -1,0 +1,2107 @@
+diff --git a/backend/.env.example b/backend/.env.example
+new file mode 100644
+index 0000000..2f47879
+--- /dev/null
++++ b/backend/.env.example
+@@ -0,0 +1,17 @@
++# Copy to .env and adjust. Never commit real secrets.
++
++NODE_ENV=development
++PORT=3000
++
++# Pooled connection used by the API and workers.
++DATABASE_URL=postgresql://postgres:postgres@localhost:5431/ims
++# Direct connection used by Prisma migrations.
++DIRECT_URL=postgresql://postgres:postgres@localhost:5431/ims
++
++REDIS_URL=redis://localhost:6379
++
++# Replace with a long random value.
++JWT_SECRET=change-me
++# Optional; defaults shown.
++ACCESS_TOKEN_EXPIRY=15m
++REFRESH_TOKEN_EXPIRY=7d
+diff --git a/backend/.gitignore b/backend/.gitignore
+index 9f62ec0..e6c5937 100644
+--- a/backend/.gitignore
++++ b/backend/.gitignore
+@@ -2,4 +2,7 @@ node_modules
+ # Keep environment variables out of version control
+ .env
+ 
+-/generated/prisma
++# Generated Prisma client and build output
++/src/generated/prisma
++/dist
++*.tsbuildinfo
+diff --git a/backend/.prettierignore b/backend/.prettierignore
+index 37dac4f..efae700 100644
+--- a/backend/.prettierignore
++++ b/backend/.prettierignore
+@@ -1,4 +1,7 @@
+ node_modules
+ coverage
+ dist
+-build
+\ No newline at end of file
++build
++src/generated
++docs
++README.md
+diff --git a/backend/.prettierrc.json b/backend/.prettierrc.json
+index b8dd65d..4cbc711 100644
+--- a/backend/.prettierrc.json
++++ b/backend/.prettierrc.json
+@@ -1,7 +1,7 @@
+ {
+-    "semi": true,
+-    "singleQuote": true,
+-    "trailingComma": "all",
+-    "printWidth": 100,
+-    "tabWidth": 2
+-}
+\ No newline at end of file
++  "semi": true,
++  "singleQuote": true,
++  "trailingComma": "all",
++  "printWidth": 100,
++  "tabWidth": 2
++}
+diff --git a/backend/docker-compose.yml b/backend/docker-compose.yml
+index 05005a0..8522506 100644
+--- a/backend/docker-compose.yml
++++ b/backend/docker-compose.yml
+@@ -8,28 +8,28 @@ services:
+       POSTGRES_PASSWORD: postgres
+       POSTGRES_DB: ims
+     ports:
+-      - "5431:5432"
++      - '5431:5432'
+     volumes:
+       - postgres-data:/var/lib/postgresql/data
+     healthcheck:
+-      test: ["CMD-SHELL", "pg_isready -U ims -d ims"]
++      test: ['CMD-SHELL', 'pg_isready -U postgres -d ims']
+       interval: 5s
+       timeout: 3s
+       retries: 10
+ 
+-  # redis:
+-  #   image: redis:7-alpine
+-  #   # BullMQ requires noeviction; AOF keeps queued jobs across restarts (ADR-005).
+-  #   command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+-  #   ports:
+-  #     - "6379:6379"
+-  #   volumes:
+-  #     - redis-data:/data
+-  #   healthcheck:
+-  #     test: ["CMD", "redis-cli", "ping"]
+-  #     interval: 5s
+-  #     timeout: 3s
+-  #     retries: 10
++  redis:
++    image: redis:7-alpine
++    # BullMQ requires noeviction; AOF keeps queued jobs across restarts (ADR-005).
++    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
++    ports:
++      - '6379:6379'
++    volumes:
++      - redis-data:/data
++    healthcheck:
++      test: ['CMD', 'redis-cli', 'ping']
++      interval: 5s
++      timeout: 3s
++      retries: 10
+ 
+   # api:
+   #   build: .
+@@ -59,4 +59,4 @@ services:
+ 
+ volumes:
+   postgres-data:
+-  # redis-data:
++  redis-data:
+diff --git a/backend/eslint.config.mjs b/backend/eslint.config.mjs
+index 6f20879..afded90 100644
+--- a/backend/eslint.config.mjs
++++ b/backend/eslint.config.mjs
+@@ -1,16 +1,22 @@
+ import js from '@eslint/js';
+-import tseslint, { plugin } from 'typescript-eslint';
++import tseslint from 'typescript-eslint';
+ import boundaries from 'eslint-plugin-boundaries';
+ import prettierConfig from 'eslint-config-prettier';
+ 
+ export default tseslint.config(
+   // files ESLint should never look at all (global exclusion)
+-  { ignores: ['dist/**', 'node_modules/**', 'coverage/**'] },
++  { ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'src/generated/**'] },
+ 
+   // Eslint's and typescript-eslint's baseline correctness rules
+   js.configs.recommended,
+   ...tseslint.configs.recommended,
+ 
++  // CommonJS tool configs (jest.config.js, ...)
++  {
++    files: ['**/*.js'],
++    languageOptions: { sourceType: 'commonjs' },
++  },
++
+   {
+     files: ['src/**/*.ts'],
+     languageOptions: {
+@@ -29,7 +35,8 @@ export default tseslint.config(
+         // IMS's architecture declaration
+         { type: 'shared', pattern: 'src/shared/**' },
+         { type: 'infra', pattern: 'src/infra/**' },
+-        { type: 'module', pattern: 'src/module/*/**', capture: ['moduleName'] },
++        { type: 'workers', pattern: 'src/workers/**' },
++        { type: 'module', pattern: 'src/modules/*', capture: ['moduleName'] },
+       ],
+     },
+     rules: {
+@@ -50,17 +57,33 @@ export default tseslint.config(
+             // A module can use itself
+             {
+               from: 'module',
+-              allow: [['module', { moduleName: `${from.moduleName}` }]],
++              allow: [['module', { moduleName: '{{from.moduleName}}' }]],
+             },
+ 
+-            // alert -> incident, app-service
++            // alerts -> incidents, appService
+             {
+-              from: [['module', { moduleName: 'alert' }]],
++              from: [['module', { moduleName: 'alerts' }]],
+               allow: [
+-                ['module', { moduleName: 'incident' }],
+-                ['module', { moduleName: 'app-service' }],
++                ['module', { moduleName: 'incidents' }],
++                ['module', { moduleName: 'appService' }],
+               ],
+             },
++
++            // Workers are composition code: they may use modules, shared and infra
++            {
++              from: 'workers',
++              allow: ['module', 'shared', 'infra', 'workers'],
++            },
++
++            // infra and shared stay free of business modules
++            {
++              from: 'infra',
++              allow: ['shared', 'infra'],
++            },
++            {
++              from: 'shared',
++              allow: ['shared'],
++            },
+           ],
+         },
+       ],
+@@ -72,10 +95,17 @@ export default tseslint.config(
+           default: 'disallow',
+ 
+           rules: [
++            // Only a module's index.ts is public
+             {
+               target: 'module',
+               allow: 'index.ts',
+             },
++
++            // Everything else is importable file by file
++            {
++              target: ['shared', 'infra', 'workers'],
++              allow: '**',
++            },
+           ],
+         },
+       ],
+diff --git a/backend/jest.int.config.js b/backend/jest.int.config.js
+index 99370ed..20c557e 100644
+--- a/backend/jest.int.config.js
++++ b/backend/jest.int.config.js
+@@ -9,6 +9,7 @@ module.exports = {
+   transform: {
+     '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.json', diagnostics: { ignoreCodes: [151002] } }],
+   },
++  globalSetup: '<rootDir>/test/integration/global-setup.ts',
+   setupFiles: ['<rootDir>/test/integration/env.ts'],
+   maxWorkers: 1,
+   testTimeout: 30000,
+diff --git a/backend/package.json b/backend/package.json
+index 3a988e3..ab27736 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -4,6 +4,7 @@
+   "description": "",
+   "main": "index.js",
+   "scripts": {
++    "build": "prisma generate && tsc -p tsconfig.build.json",
+     "prisma:generate": "prisma generate",
+     "start": "node dist/main.js",
+     "start:worker": "node dist/worker.js",
+diff --git a/backend/prisma.config.ts b/backend/prisma.config.ts
+new file mode 100644
+index 0000000..ea181a4
+--- /dev/null
++++ b/backend/prisma.config.ts
+@@ -0,0 +1,14 @@
++import 'dotenv/config';
++import { defineConfig } from 'prisma/config';
++
++// Prisma CLI (generate, migrate) reads the process environment directly so it does not
++// depend on the application config. Migrations use the direct (non-pooled) connection.
++export default defineConfig({
++  schema: 'prisma/schema.prisma',
++  migrations: {
++    path: 'prisma/migrations',
++  },
++  datasource: {
++    url: process.env.DIRECT_URL ?? process.env.DATABASE_URL ?? '',
++  },
++});
+diff --git a/backend/prisma/schema.prisma b/backend/prisma/schema.prisma
+index f50a13f..2e7df49 100644
+--- a/backend/prisma/schema.prisma
++++ b/backend/prisma/schema.prisma
+@@ -1,6 +1,6 @@
+ generator client {
+   provider = "prisma-client"
+-  output   = "../generated/prisma"
++  output   = "../src/generated/prisma"
+ }
+ 
+ datasource db {
+diff --git a/backend/prisma7.config.ts b/backend/prisma7.config.ts
+deleted file mode 100644
+index 3df331e..0000000
+--- a/backend/prisma7.config.ts
++++ /dev/null
+@@ -1,12 +0,0 @@
+-import config from "./src/config/env.js"
+-import { defineConfig } from "prisma/config";
+-
+-export default defineConfig({
+-  schema: "prisma/schema.prisma",
+-  migrations: {
+-    path: "prisma/migrations",
+-  },
+-  datasource: {
+-    url: config.databaseUrl,
+-  },
+-});
+diff --git a/backend/src/app.spec.ts b/backend/src/app.spec.ts
+new file mode 100644
+index 0000000..c3e1d8f
+--- /dev/null
++++ b/backend/src/app.spec.ts
+@@ -0,0 +1,127 @@
++import { Router } from 'express';
++import request from 'supertest';
++import { createApp, JSON_BODY_LIMIT } from './app.js';
++import { READINESS_RETRY_AFTER_SECONDS, READINESS_TIMEOUT_MS } from './shared/http/health.js';
++import { logger } from './shared/observability/logger.js';
++
++logger.level = 'silent';
++
++const up = { name: 'up', check: () => Promise.resolve() };
++const down = { name: 'down', check: () => Promise.reject(new Error('connection refused')) };
++
++describe('createApp', () => {
++  describe('GET /health', () => {
++    it('is live without touching dependencies', async () => {
++      const check = jest.fn();
++      const res = await request(createApp({ readinessChecks: [{ name: 'x', check }] })).get(
++        '/health',
++      );
++      expect(res.status).toBe(200);
++      expect(res.body).toEqual({ status: 'ok' });
++      expect(check).not.toHaveBeenCalled();
++    });
++
++    it('is not mounted under /api/v1', async () => {
++      const res = await request(createApp({ readinessChecks: [] })).get('/api/v1/health');
++      expect(res.status).toBe(404);
++    });
++  });
++
++  describe('GET /ready', () => {
++    it('returns 200 when every dependency responds', async () => {
++      const res = await request(createApp({ readinessChecks: [up, up] })).get('/ready');
++      expect(res.status).toBe(200);
++      expect(res.body).toEqual({ data: { status: 'ok' } });
++    });
++
++    it('returns 503 DEPENDENCY_UNAVAILABLE with Retry-After when a check fails', async () => {
++      const res = await request(createApp({ readinessChecks: [up, down] }))
++        .get('/ready')
++        .set('X-Request-Id', 'ready-1');
++      expect(res.status).toBe(503);
++      expect(res.headers['retry-after']).toBe(String(READINESS_RETRY_AFTER_SECONDS));
++      expect(res.body).toEqual({
++        error: {
++          code: 'DEPENDENCY_UNAVAILABLE',
++          message: expect.any(String),
++          details: [],
++          requestId: 'ready-1',
++        },
++      });
++      expect(JSON.stringify(res.body)).not.toContain('connection refused');
++    });
++
++    it(
++      'returns 503 when a check hangs past the timeout',
++      async () => {
++        const hang = { name: 'hang', check: () => new Promise<never>(() => undefined) };
++        const res = await request(createApp({ readinessChecks: [hang] })).get('/ready');
++        expect(res.status).toBe(503);
++      },
++      READINESS_TIMEOUT_MS + 3000,
++    );
++  });
++
++  describe('/api/v1 mounting', () => {
++    it('mounts the api router under /api/v1 only', async () => {
++      const apiRouter = Router();
++      apiRouter.get('/ping', (_req, res) => {
++        res.json({ data: 'pong' });
++      });
++      const app = createApp({ readinessChecks: [], apiRouter });
++
++      expect((await request(app).get('/api/v1/ping')).body).toEqual({ data: 'pong' });
++      expect((await request(app).get('/ping')).status).toBe(404);
++    });
++
++    it('does not serve the old welcome route', async () => {
++      expect((await request(createApp({ readinessChecks: [] })).get('/')).status).toBe(404);
++    });
++  });
++
++  describe('request handling', () => {
++    const apiRouter = Router();
++    apiRouter.post('/echo', (req, res) => {
++      res.json({ data: req.body });
++    });
++    apiRouter.get('/boom', () => {
++      throw new Error('kaboom');
++    });
++    const app = createApp({ readinessChecks: [], apiRouter });
++
++    it('parses JSON bodies', async () => {
++      const res = await request(app).post('/api/v1/echo').send({ a: 1 });
++      expect(res.body).toEqual({ data: { a: 1 } });
++    });
++
++    it('maps malformed JSON to 400 BAD_REQUEST', async () => {
++      const res = await request(app)
++        .post('/api/v1/echo')
++        .set('Content-Type', 'application/json')
++        .send('{oops');
++      expect(res.status).toBe(400);
++      expect(res.body.error.code).toBe('BAD_REQUEST');
++    });
++
++    it(`applies the explicit ${JSON_BODY_LIMIT} body limit`, async () => {
++      const res = await request(app)
++        .post('/api/v1/echo')
++        .send({ blob: 'x'.repeat(200 * 1024) });
++      expect(res.status).toBe(400);
++      expect(res.body.error.code).toBe('BAD_REQUEST');
++    });
++
++    it('turns unexpected errors into INTERNAL_ERROR with the request id', async () => {
++      const res = await request(app).get('/api/v1/boom');
++      expect(res.status).toBe(500);
++      expect(res.body.error.code).toBe('INTERNAL_ERROR');
++      expect(res.body.error.requestId).toBe(res.headers['x-request-id']);
++      expect(JSON.stringify(res.body)).not.toContain('kaboom');
++    });
++
++    it('echoes X-Request-Id on success responses', async () => {
++      const res = await request(app).post('/api/v1/echo').set('X-Request-Id', 'abc-1').send({});
++      expect(res.headers['x-request-id']).toBe('abc-1');
++    });
++  });
++});
+diff --git a/backend/src/app.ts b/backend/src/app.ts
+index d2fd497..676e4d7 100644
+--- a/backend/src/app.ts
++++ b/backend/src/app.ts
+@@ -1,21 +1,28 @@
+-import express, { Request, Response } from "express";
+-import { requestMiddleware } from "./shared/middleware/request-ids.js";
+-import { errorMappingMiddleware } from "./shared/middleware/error-mapping.js";
++import express, { Router, type Express } from 'express';
++import { createHealthRouter, type ReadinessCheck } from './shared/http/health.js';
++import { errorMappingMiddleware } from './shared/middleware/error-mapping.js';
++import { requestMiddleware } from './shared/middleware/request-ids.js';
++import { httpLogger } from './shared/observability/http-logger.js';
+ 
+-const app = express();
++export const JSON_BODY_LIMIT = '100kb';
+ 
+-app.use(express.json());
+-app.use(requestMiddleware);
++export type AppOptions = {
++  readinessChecks: ReadinessCheck[];
++  /** Router mounted at `/api/v1`; feature slices register their routes on it. */
++  apiRouter?: Router;
++};
+ 
++export function createApp({ readinessChecks, apiRouter = Router() }: AppOptions): Express {
++  const app = express();
+ 
+-app.get("/", (_req: Request, res: Response) => {
+-    res.status(200).send("Welcome to IMS");
+-});
++  app.use(requestMiddleware);
++  app.use(httpLogger);
++  app.use(express.json({ limit: JSON_BODY_LIMIT }));
+ 
+-app.get("/health", (_req: Request, res: Response) => {
+-    res.status(200).json({ status: "ok" });
+-})
++  app.use(createHealthRouter(readinessChecks));
++  app.use('/api/v1', apiRouter);
+ 
+-app.use(errorMappingMiddleware);
++  app.use(errorMappingMiddleware);
+ 
+-export default app;
+\ No newline at end of file
++  return app;
++}
+diff --git a/backend/src/config/env.spec.ts b/backend/src/config/env.spec.ts
+new file mode 100644
+index 0000000..c894ea5
+--- /dev/null
++++ b/backend/src/config/env.spec.ts
+@@ -0,0 +1,91 @@
++import { ConfigError, parseConfig } from './env.js';
++
++const validEnv: NodeJS.ProcessEnv = {
++  NODE_ENV: 'development',
++  PORT: '4000',
++  DATABASE_URL: 'postgresql://user:pw@localhost:5432/ims',
++  DIRECT_URL: 'postgresql://user:pw@localhost:5432/ims',
++  JWT_SECRET: 'jwt-secret-value',
++  REDIS_URL: 'redis://localhost:6379',
++};
++
++function configErrorFor(env: NodeJS.ProcessEnv): ConfigError {
++  try {
++    parseConfig(env);
++  } catch (error) {
++    expect(error).toBeInstanceOf(ConfigError);
++    return error as ConfigError;
++  }
++  throw new Error('expected parseConfig to throw');
++}
++
++describe('parseConfig', () => {
++  it('returns the typed config with default token expiries', () => {
++    expect(parseConfig(validEnv)).toEqual({
++      nodeEnv: 'development',
++      port: 4000,
++      databaseUrl: validEnv.DATABASE_URL,
++      directUrl: validEnv.DIRECT_URL,
++      jwtSecret: 'jwt-secret-value',
++      redisUrl: 'redis://localhost:6379',
++      accessTokenExpiry: '15m',
++      refreshTokenExpiry: '7d',
++    });
++  });
++
++  it('honors explicit token expiries', () => {
++    const config = parseConfig({
++      ...validEnv,
++      ACCESS_TOKEN_EXPIRY: '30m',
++      REFRESH_TOKEN_EXPIRY: '14d',
++    });
++    expect(config.accessTokenExpiry).toBe('30m');
++    expect(config.refreshTokenExpiry).toBe('14d');
++  });
++
++  it.each(['NODE_ENV', 'PORT', 'DATABASE_URL', 'DIRECT_URL', 'JWT_SECRET', 'REDIS_URL'])(
++    'fails naming %s when it is missing',
++    (name) => {
++      const env = { ...validEnv };
++      delete env[name];
++      const error = configErrorFor(env);
++      expect(error.variables).toEqual([name]);
++      expect(error.message).toContain(`${name} is required`);
++    },
++  );
++
++  it('treats an empty value as missing', () => {
++    expect(configErrorFor({ ...validEnv, JWT_SECRET: '' }).variables).toEqual(['JWT_SECRET']);
++  });
++
++  it.each([
++    ['NODE_ENV', 'staging'],
++    ['PORT', 'abc'],
++    ['PORT', '70000'],
++    ['DATABASE_URL', 'mysql://user:pw@localhost/ims'],
++    ['DIRECT_URL', 'not-a-url'],
++    ['REDIS_URL', 'http://localhost:6379'],
++    ['ACCESS_TOKEN_EXPIRY', 'soon'],
++    ['REFRESH_TOKEN_EXPIRY', '7 days'],
++  ])('rejects an invalid %s (%s)', (name, value) => {
++    expect(configErrorFor({ ...validEnv, [name]: value }).variables).toEqual([name]);
++  });
++
++  it('reports every invalid variable at once', () => {
++    const error = configErrorFor({ NODE_ENV: 'development' });
++    expect(error.variables).toEqual(
++      expect.arrayContaining(['PORT', 'DATABASE_URL', 'DIRECT_URL', 'JWT_SECRET', 'REDIS_URL']),
++    );
++  });
++
++  it('never prints values in the error message', () => {
++    const error = configErrorFor({
++      ...validEnv,
++      DATABASE_URL: 'mysql://admin:hunter2-secret@db.internal/ims',
++      PORT: 'port-value-leak',
++    });
++    expect(error.message).not.toContain('hunter2-secret');
++    expect(error.message).not.toContain('db.internal');
++    expect(error.message).not.toContain('port-value-leak');
++  });
++});
+diff --git a/backend/src/config/env.ts b/backend/src/config/env.ts
+index 5d79c0c..9e8448a 100644
+--- a/backend/src/config/env.ts
++++ b/backend/src/config/env.ts
+@@ -1,26 +1,83 @@
+-import dotenv from "dotenv";
+-import type { StringValue } from "ms";
+-
+-dotenv.config();
+-
+-interface Config {
+-    port: number,
+-    nodeEnv: string,
+-    databaseUrl: string,
+-    directUrl: string,
+-    jwtSecret: string,
+-    accessTokenExpiry: StringValue,
+-    refreshTokenExpiry: StringValue
+-};
+-
+-const config: Config = {
+-    port: Number(process.env.PORT) || 3000,
+-    nodeEnv: process.env.NODE_ENV || 'development',
+-    databaseUrl: process.env.DATABASE_URL!,
+-    directUrl: process.env.DIRECT_URL!,
+-    jwtSecret: process.env.JWT_SECRET!,
+-    accessTokenExpiry: (process.env.ACCESS_TOKEN_EXPIRY || "15m") as StringValue,
+-    refreshTokenExpiry: (process.env.REFRESH_TOKEN_EXPIRY || "7d") as StringValue
+-};
+-
+-export default config;
++import dotenv from 'dotenv';
++import { z } from 'zod';
++
++type Duration = `${number}${'s' | 'm' | 'h' | 'd'}`;
++
++export interface Config {
++  nodeEnv: 'development' | 'test' | 'production';
++  port: number;
++  databaseUrl: string;
++  directUrl: string;
++  jwtSecret: string;
++  redisUrl: string;
++  accessTokenExpiry: Duration;
++  refreshTokenExpiry: Duration;
++}
++
++const postgresUrl = z.string().regex(/^postgres(ql)?:\/\/.+/, 'must be a PostgreSQL URL');
++const redisUrl = z.string().regex(/^rediss?:\/\/.+/, 'must be a Redis URL');
++const duration = z
++  .string()
++  .regex(/^\d+[smhd]$/, 'must be a duration such as 15m, 7d')
++  .transform((value) => value as Duration);
++
++const envSchema = z.object({
++  NODE_ENV: z.enum(['development', 'test', 'production']),
++  PORT: z.coerce.number().int().min(1).max(65535),
++  DATABASE_URL: postgresUrl,
++  DIRECT_URL: postgresUrl,
++  JWT_SECRET: z.string().min(1),
++  REDIS_URL: redisUrl,
++  ACCESS_TOKEN_EXPIRY: duration.default('15m'),
++  REFRESH_TOKEN_EXPIRY: duration.default('7d'),
++});
++
++/** Thrown for invalid configuration. The message names variables only, never their values. */
++export class ConfigError extends Error {
++  constructor(
++    readonly variables: string[],
++    message: string,
++  ) {
++    super(message);
++    this.name = 'ConfigError';
++  }
++}
++
++export function parseConfig(env: NodeJS.ProcessEnv): Config {
++  const result = envSchema.safeParse(env);
++
++  if (!result.success) {
++    const problems = new Map<string, string>();
++    for (const issue of result.error.issues) {
++      const name = String(issue.path[0] ?? 'environment');
++      const missing = env[name] === undefined || env[name] === '';
++      problems.set(name, missing ? 'is required' : issue.message);
++    }
++    const variables = [...problems.keys()];
++    const detail = [...problems].map(([name, problem]) => `${name} ${problem}`).join('; ');
++    throw new ConfigError(variables, `Invalid configuration: ${detail}`);
++  }
++
++  const values = result.data;
++  return {
++    nodeEnv: values.NODE_ENV,
++    port: values.PORT,
++    databaseUrl: values.DATABASE_URL,
++    directUrl: values.DIRECT_URL,
++    jwtSecret: values.JWT_SECRET,
++    redisUrl: values.REDIS_URL,
++    accessTokenExpiry: values.ACCESS_TOKEN_EXPIRY,
++    refreshTokenExpiry: values.REFRESH_TOKEN_EXPIRY,
++  };
++}
++
++let cached: Config | undefined;
++
++/** Loads `.env` (if present) and returns the validated configuration, parsing it once. */
++export function getConfig(): Config {
++  if (!cached) {
++    dotenv.config({ quiet: true });
++    cached = parseConfig(process.env);
++  }
++  return cached;
++}
+diff --git a/backend/src/infra/db/prisma.ts b/backend/src/infra/db/prisma.ts
+new file mode 100644
+index 0000000..3de7170
+--- /dev/null
++++ b/backend/src/infra/db/prisma.ts
+@@ -0,0 +1,70 @@
++import { PrismaPg } from '@prisma/adapter-pg';
++import { getConfig } from '../../config/env.js';
++import { Prisma, PrismaClient } from '../../generated/prisma/client.js';
++
++export type TransactionClient = Prisma.TransactionClient;
++
++/** Small per-process pool (API and worker each get their own). */
++export const DB_POOL_MAX = 10;
++const DB_CONNECTION_TIMEOUT_MS = 5000;
++
++let client: PrismaClient | undefined;
++
++/**
++ * The process-wide Prisma client. TLS follows the `sslmode` parameter of `DATABASE_URL`
++ * (interpreted by `pg`).
++ */
++export function getPrisma(): PrismaClient {
++  if (!client) {
++    const adapter = new PrismaPg({
++      connectionString: getConfig().databaseUrl,
++      max: DB_POOL_MAX,
++      connectionTimeoutMillis: DB_CONNECTION_TIMEOUT_MS,
++    });
++    client = new PrismaClient({ adapter });
++  }
++  return client;
++}
++
++export async function disconnectPrisma(): Promise<void> {
++  if (client) {
++    const current = client;
++    client = undefined;
++    await current.$disconnect();
++  }
++}
++
++export async function pingDatabase(): Promise<void> {
++  await getPrisma().$queryRaw`SELECT 1`;
++}
++
++export function runInTransaction<T>(
++  work: (tx: TransactionClient) => Promise<T>,
++  options?: {
++    maxWait?: number;
++    timeout?: number;
++    isolationLevel?: Prisma.TransactionIsolationLevel;
++  },
++): Promise<T> {
++  return getPrisma().$transaction(work, options);
++}
++
++const MODEL_NAMES: readonly string[] = Object.values(Prisma.ModelName);
++
++/**
++ * `SELECT … FOR UPDATE` on one row by id, inside a transaction. Returns whether the row exists.
++ * Callers must re-check state after the lock is held.
++ */
++export async function lockRowForUpdate(
++  tx: TransactionClient,
++  model: Prisma.ModelName,
++  id: string,
++): Promise<boolean> {
++  if (!MODEL_NAMES.includes(model)) {
++    throw new Error(`Unknown model: ${String(model)}`);
++  }
++  const rows = await tx.$queryRaw<{ id: string }[]>(
++    Prisma.sql`SELECT "id" FROM ${Prisma.raw(`"${model}"`)} WHERE "id" = ${id}::uuid FOR UPDATE`,
++  );
++  return rows.length > 0;
++}
+diff --git a/backend/src/infra/readiness.ts b/backend/src/infra/readiness.ts
+new file mode 100644
+index 0000000..9ecf323
+--- /dev/null
++++ b/backend/src/infra/readiness.ts
+@@ -0,0 +1,10 @@
++import type { ReadinessCheck } from '../shared/http/health.js';
++import { pingDatabase } from './db/prisma.js';
++import { pingRedis } from './redis/redis.js';
++
++export function buildReadinessChecks(): ReadinessCheck[] {
++  return [
++    { name: 'postgresql', check: () => pingDatabase() },
++    { name: 'redis', check: () => pingRedis() },
++  ];
++}
+diff --git a/backend/src/infra/redis/redis.ts b/backend/src/infra/redis/redis.ts
+new file mode 100644
+index 0000000..611b850
+--- /dev/null
++++ b/backend/src/infra/redis/redis.ts
+@@ -0,0 +1,46 @@
++import { Redis } from 'ioredis';
++import { getConfig } from '../../config/env.js';
++import { logger } from '../../shared/observability/logger.js';
++
++export type RedisPurpose = 'general' | 'bullmq';
++
++/**
++ * Creates a Redis connection. BullMQ requires `maxRetriesPerRequest: null`; general-purpose
++ * connections fail commands quickly when Redis is unreachable. The connection is established on
++ * first use.
++ */
++export function createRedisConnection(
++  purpose: RedisPurpose = 'general',
++  url: string = getConfig().redisUrl,
++): Redis {
++  const connection = new Redis(url, {
++    lazyConnect: true,
++    maxRetriesPerRequest: purpose === 'bullmq' ? null : 1,
++    connectTimeout: 5000,
++    retryStrategy: (attempt) => Math.min(attempt * 200, 2000),
++  });
++  connection.on('error', (err) => {
++    logger.warn({ err, purpose }, 'Redis connection error');
++  });
++  return connection;
++}
++
++let shared: Redis | undefined;
++
++/** The process-wide general-purpose connection. */
++export function getRedis(): Redis {
++  shared ??= createRedisConnection('general');
++  return shared;
++}
++
++export async function pingRedis(connection: Redis = getRedis()): Promise<void> {
++  await connection.ping();
++}
++
++export async function closeRedis(): Promise<void> {
++  if (shared) {
++    const current = shared;
++    shared = undefined;
++    await current.quit().catch(() => current.disconnect());
++  }
++}
+diff --git a/backend/src/main.ts b/backend/src/main.ts
+new file mode 100644
+index 0000000..82bf45f
+--- /dev/null
++++ b/backend/src/main.ts
+@@ -0,0 +1,38 @@
++import type { Server } from 'node:http';
++import { createApp } from './app.js';
++import { getConfig } from './config/env.js';
++import { disconnectPrisma, pingDatabase } from './infra/db/prisma.js';
++import { buildReadinessChecks } from './infra/readiness.js';
++import { closeRedis, pingRedis } from './infra/redis/redis.js';
++import { onShutdownSignal } from './shared/lifecycle/shutdown.js';
++import { logger } from './shared/observability/logger.js';
++
++async function main(): Promise<void> {
++  const config = getConfig();
++
++  await pingDatabase();
++  await pingRedis();
++
++  const app = createApp({ readinessChecks: buildReadinessChecks() });
++  // Express 5 passes a listen failure (e.g. EADDRINUSE) to this callback.
++  const server = await new Promise<Server>((resolve, reject) => {
++    const listening = app.listen(config.port, (err?: Error) =>
++      err ? reject(err) : resolve(listening),
++    );
++  });
++  logger.info({ port: config.port }, 'Server listening');
++
++  onShutdownSignal(async () => {
++    await new Promise<void>((resolve, reject) => {
++      server.close((err) => (err ? reject(err) : resolve()));
++      server.closeIdleConnections();
++    });
++    await disconnectPrisma();
++    await closeRedis();
++  });
++}
++
++main().catch((err: unknown) => {
++  logger.fatal({ err }, 'Server failed to start');
++  process.exit(1);
++});
+diff --git a/backend/src/server.ts b/backend/src/server.ts
+deleted file mode 100644
+index 08f1526..0000000
+--- a/backend/src/server.ts
++++ /dev/null
+@@ -1,13 +0,0 @@
+-import app from "./app.js";
+-import { logger } from "./shared/observability/logger.js";
+-
+-const PORT = 3000;
+-
+-const server = app.listen(PORT, () => {
+-    logger.info({ port: 3000 }, "Server Listening");
+-});
+-
+-server.on("error", (error) => {
+-    logger.fatal({ error }, "Server failed to start");
+-    process.exit(1);
+-})
+\ No newline at end of file
+diff --git a/backend/src/shared/errors/AppError.ts b/backend/src/shared/errors/AppError.ts
+index 3907e45..f50ac74 100644
+--- a/backend/src/shared/errors/AppError.ts
++++ b/backend/src/shared/errors/AppError.ts
+@@ -1,56 +1,106 @@
++export type ErrorDetail = Record<string, unknown>;
++
+ export type AppErrorOptions = {
+-    statusCode: number,
+-    code: string,
+-    message: string,
+-    expose?: boolean
++  statusCode: number;
++  code: string;
++  message: string;
++  details?: ErrorDetail[];
++  /** Seconds for the `Retry-After` header (429 and 503). */
++  retryAfterSeconds?: number;
++  expose?: boolean;
+ };
+ 
+ export class AppError extends Error {
+-    readonly statusCode: number;
+-    readonly code: string;
+-    readonly expose: boolean;
++  readonly statusCode: number;
++  readonly code: string;
++  readonly details: ErrorDetail[];
++  readonly retryAfterSeconds?: number;
++  readonly expose: boolean;
+ 
+-    constructor({ statusCode, code, message, expose = true }: AppErrorOptions) {
+-        super(message);
+-        this.name = new.target.name;
+-        this.statusCode = statusCode;
+-        this.code = code;
+-        this.expose = expose;
+-    }
++  constructor({
++    statusCode,
++    code,
++    message,
++    details = [],
++    retryAfterSeconds,
++    expose = true,
++  }: AppErrorOptions) {
++    super(message);
++    this.name = new.target.name;
++    this.statusCode = statusCode;
++    this.code = code;
++    this.details = details;
++    this.retryAfterSeconds = retryAfterSeconds;
++    this.expose = expose;
++  }
+ }
+ 
+ export class BadRequestError extends AppError {
+-    constructor(message: string, code = "BAD_REQUEST") {
+-        super({ statusCode: 400, code, message });
+-    }
++  constructor(message: string, code = 'BAD_REQUEST', details: ErrorDetail[] = []) {
++    super({ statusCode: 400, code, message, details });
++  }
+ }
+ 
+ export class UnauthorizedError extends AppError {
+-    constructor(message = "Unauthorized", code = "UNAUTHORIZED") {
+-        super({ statusCode: 401, code, message });
+-    }
++  constructor(message = 'Unauthorized', code = 'UNAUTHENTICATED', details: ErrorDetail[] = []) {
++    super({ statusCode: 401, code, message, details });
++  }
+ }
+ 
+ export class ForbiddenError extends AppError {
+-    constructor(message = "Forbidden", code = "FORBIDDEN") {
+-        super({ statusCode: 403, code, message });
+-    }
++  constructor(message = 'Forbidden', code = 'FORBIDDEN', details: ErrorDetail[] = []) {
++    super({ statusCode: 403, code, message, details });
++  }
+ }
+ 
+ export class NotFoundError extends AppError {
+-    constructor(message = "Not found", code = "NOT_FOUND") {
+-        super({ statusCode: 404, code, message });
+-    }
++  constructor(message: string, code: string, details: ErrorDetail[] = []) {
++    super({ statusCode: 404, code, message, details });
++  }
+ }
+ 
+ export class ConflictError extends AppError {
+-    constructor(message: string, code = "CONFLICT") {
+-        super({ statusCode: 409, code, message });
+-    }
++  constructor(message: string, code: string, details: ErrorDetail[] = []) {
++    super({ statusCode: 409, code, message, details });
++  }
++}
++
++export class PayloadTooLargeError extends AppError {
++  constructor(message: string, code: string, details: ErrorDetail[] = []) {
++    super({ statusCode: 413, code, message, details });
++  }
++}
++
++export class ValidationError extends AppError {
++  constructor(message: string, code = 'VALIDATION_FAILED', details: ErrorDetail[] = []) {
++    super({ statusCode: 422, code, message, details });
++  }
++}
++
++export class TooManyRequestsError extends AppError {
++  constructor(
++    message: string,
++    code: string,
++    retryAfterSeconds?: number,
++    details: ErrorDetail[] = [],
++  ) {
++    super({ statusCode: 429, code, message, details, retryAfterSeconds });
++  }
++}
++
++export class InternalError extends AppError {
++  constructor(message = 'Internal server error', code = 'INTERNAL_ERROR') {
++    super({ statusCode: 500, code, message, expose: false });
++  }
+ }
+ 
+ export class ServiceUnavailableError extends AppError {
+-    constructor(message = "Service unavailable", code = "SERVICE_UNAVAILABLE") {
+-        super({ statusCode: 503, code, message });
+-    }
+-}
+\ No newline at end of file
++  constructor(
++    message = 'Service unavailable',
++    code = 'DEPENDENCY_UNAVAILABLE',
++    retryAfterSeconds?: number,
++    details: ErrorDetail[] = [],
++  ) {
++    super({ statusCode: 503, code, message, details, retryAfterSeconds });
++  }
++}
+diff --git a/backend/src/shared/errors/zod.spec.ts b/backend/src/shared/errors/zod.spec.ts
+new file mode 100644
+index 0000000..0bf579e
+--- /dev/null
++++ b/backend/src/shared/errors/zod.spec.ts
+@@ -0,0 +1,58 @@
++import { z } from 'zod';
++import { BadRequestError, ValidationError } from './AppError.js';
++import { parseOrThrow, zodErrorToAppError } from './zod.js';
++
++const schema = z.strictObject({
++  name: z.string(),
++  nested: z.strictObject({ count: z.number().int() }),
++});
++
++function failureOf(input: unknown) {
++  const result = schema.safeParse(input);
++  if (result.success) throw new Error('expected validation to fail');
++  return zodErrorToAppError(result.error);
++}
++
++describe('zodErrorToAppError', () => {
++  it('maps missing and invalid fields to 422 VALIDATION_FAILED with field details', () => {
++    const error = failureOf({ nested: { count: 'x' } });
++    expect(error).toBeInstanceOf(ValidationError);
++    expect(error.statusCode).toBe(422);
++    expect(error.code).toBe('VALIDATION_FAILED');
++    expect(error.details).toEqual([
++      { field: 'name', issue: expect.any(String) },
++      { field: 'nested.count', issue: expect.any(String) },
++    ]);
++  });
++
++  it('maps an unknown key to 400 BAD_REQUEST', () => {
++    const error = failureOf({ name: 'a', nested: { count: 1 }, extra: true });
++    expect(error).toBeInstanceOf(BadRequestError);
++    expect(error.statusCode).toBe(400);
++    expect(error.code).toBe('BAD_REQUEST');
++    expect(error.details).toEqual([{ field: 'extra', issue: 'Unknown field' }]);
++  });
++
++  it('reports a nested unknown key with its full path', () => {
++    const error = failureOf({ name: 'a', nested: { count: 1, other: 1 } });
++    expect(error.statusCode).toBe(400);
++    expect(error.details).toEqual([{ field: 'nested.other', issue: 'Unknown field' }]);
++  });
++
++  it('prefers 400 when unknown keys and validation failures occur together', () => {
++    expect(failureOf({ nested: { count: 1 }, extra: 1 }).statusCode).toBe(400);
++  });
++});
++
++describe('parseOrThrow', () => {
++  it('returns parsed data on success', () => {
++    expect(parseOrThrow(schema, { name: 'a', nested: { count: 2 } })).toEqual({
++      name: 'a',
++      nested: { count: 2 },
++    });
++  });
++
++  it('throws the mapped AppError on failure', () => {
++    expect(() => parseOrThrow(schema, {})).toThrow(ValidationError);
++  });
++});
+diff --git a/backend/src/shared/errors/zod.ts b/backend/src/shared/errors/zod.ts
+new file mode 100644
+index 0000000..2e54eca
+--- /dev/null
++++ b/backend/src/shared/errors/zod.ts
+@@ -0,0 +1,41 @@
++import { z } from 'zod';
++import { AppError, BadRequestError, ValidationError } from './AppError.js';
++
++/**
++ * Maps a Zod failure to the API error: any unknown (strict) key → `400 BAD_REQUEST`,
++ * every other validation failure → `422 VALIDATION_FAILED` with `details: [{ field, issue }]`.
++ */
++export function zodErrorToAppError(error: z.ZodError): AppError {
++  const unknownFields: string[] = [];
++  const failures: { field: string; issue: string }[] = [];
++
++  for (const issue of error.issues) {
++    const parent = issue.path.map(String);
++    if (issue.code === 'unrecognized_keys') {
++      for (const key of issue.keys) {
++        unknownFields.push([...parent, key].join('.'));
++      }
++    } else {
++      failures.push({ field: parent.join('.'), issue: issue.message });
++    }
++  }
++
++  if (unknownFields.length > 0) {
++    return new BadRequestError(
++      'Request contains unknown fields',
++      'BAD_REQUEST',
++      unknownFields.map((field) => ({ field, issue: 'Unknown field' })),
++    );
++  }
++
++  return new ValidationError('Request validation failed', 'VALIDATION_FAILED', failures);
++}
++
++/** Parses `data` with `schema`, throwing the mapped `AppError` on failure. */
++export function parseOrThrow<S extends z.ZodType>(schema: S, data: unknown): z.output<S> {
++  const result = schema.safeParse(data);
++  if (!result.success) {
++    throw zodErrorToAppError(result.error);
++  }
++  return result.data;
++}
+diff --git a/backend/src/shared/http/health.ts b/backend/src/shared/http/health.ts
+new file mode 100644
+index 0000000..3f6bd6d
+--- /dev/null
++++ b/backend/src/shared/http/health.ts
+@@ -0,0 +1,56 @@
++import { Router } from 'express';
++import { ServiceUnavailableError } from '../errors/AppError.js';
++import { childLogger } from '../observability/logger.js';
++
++export type ReadinessCheck = {
++  name: string;
++  check: () => Promise<unknown>;
++};
++
++export const READINESS_TIMEOUT_MS = 2000;
++export const READINESS_RETRY_AFTER_SECONDS = 5;
++
++function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
++  let timer: NodeJS.Timeout | undefined;
++  const timeout = new Promise<never>((_resolve, reject) => {
++    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
++  });
++  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
++}
++
++/** `GET /health` (liveness, no dependencies) and `GET /ready` (dependency checks). */
++export function createHealthRouter(checks: ReadinessCheck[]): Router {
++  const router = Router();
++
++  router.get('/health', (_req, res) => {
++    res.status(200).json({ status: 'ok' });
++  });
++
++  router.get('/ready', async (_req, res) => {
++    const results = await Promise.allSettled(
++      checks.map(({ check }) => withTimeout(check(), READINESS_TIMEOUT_MS)),
++    );
++
++    const failed = checks.filter((_check, index) => results[index].status === 'rejected');
++    if (failed.length > 0) {
++      const log = childLogger({ requestId: res.locals.requestId as string });
++      results.forEach((result, index) => {
++        if (result.status === 'rejected') {
++          log.warn(
++            { dependency: checks[index].name, err: result.reason },
++            'Readiness check failed',
++          );
++        }
++      });
++      throw new ServiceUnavailableError(
++        'A required dependency is unavailable',
++        'DEPENDENCY_UNAVAILABLE',
++        READINESS_RETRY_AFTER_SECONDS,
++      );
++    }
++
++    res.status(200).json({ data: { status: 'ok' } });
++  });
++
++  return router;
++}
+diff --git a/backend/src/shared/lifecycle/shutdown.ts b/backend/src/shared/lifecycle/shutdown.ts
+new file mode 100644
+index 0000000..9f64446
+--- /dev/null
++++ b/backend/src/shared/lifecycle/shutdown.ts
+@@ -0,0 +1,33 @@
++import { logger } from '../observability/logger.js';
++
++export const SHUTDOWN_TIMEOUT_MS = 10_000;
++
++/**
++ * Runs `shutdown` once on SIGTERM/SIGINT, then exits 0 (1 if it fails or exceeds the timeout).
++ */
++export function onShutdownSignal(shutdown: () => Promise<void>): void {
++  let shuttingDown = false;
++
++  const handle = (signal: NodeJS.Signals) => {
++    if (shuttingDown) return;
++    shuttingDown = true;
++    logger.info({ signal }, 'Shutting down');
++
++    const forceExit = setTimeout(() => {
++      logger.error('Shutdown timed out');
++      process.exit(1);
++    }, SHUTDOWN_TIMEOUT_MS);
++    forceExit.unref();
++
++    shutdown().then(
++      () => process.exit(0),
++      (err: unknown) => {
++        logger.error({ err }, 'Shutdown failed');
++        process.exit(1);
++      },
++    );
++  };
++
++  process.on('SIGTERM', handle);
++  process.on('SIGINT', handle);
++}
+diff --git a/backend/src/shared/middleware/error-mapping.spec.ts b/backend/src/shared/middleware/error-mapping.spec.ts
+new file mode 100644
+index 0000000..9740fb2
+--- /dev/null
++++ b/backend/src/shared/middleware/error-mapping.spec.ts
+@@ -0,0 +1,243 @@
++import express, { type Express, type RequestHandler } from 'express';
++import request from 'supertest';
++import { z } from 'zod';
++import {
++  AppError,
++  BadRequestError,
++  ConflictError,
++  ForbiddenError,
++  InternalError,
++  NotFoundError,
++  PayloadTooLargeError,
++  ServiceUnavailableError,
++  TooManyRequestsError,
++  UnauthorizedError,
++  ValidationError,
++} from '../errors/AppError.js';
++import { parseOrThrow } from '../errors/zod.js';
++import * as loggerModule from '../observability/logger.js';
++import { errorMappingMiddleware } from './error-mapping.js';
++import { requestMiddleware } from './request-ids.js';
++
++const log = { error: jest.fn(), warn: jest.fn() };
++
++beforeEach(() => {
++  log.error.mockClear();
++  log.warn.mockClear();
++  jest
++    .spyOn(loggerModule, 'childLogger')
++    .mockReturnValue(log as unknown as ReturnType<typeof loggerModule.childLogger>);
++});
++
++afterEach(() => {
++  jest.restoreAllMocks();
++});
++
++const detail = { field: 'x', issue: 'bad' };
++
++const cases: [string, () => AppError, number, string, Record<string, string>][] = [
++  [
++    'BadRequestError',
++    () => new BadRequestError('bad', 'BAD_REQUEST', [detail]),
++    400,
++    'BAD_REQUEST',
++    {},
++  ],
++  ['UnauthorizedError', () => new UnauthorizedError(), 401, 'UNAUTHENTICATED', {}],
++  ['ForbiddenError', () => new ForbiddenError(), 403, 'FORBIDDEN', {}],
++  ['NotFoundError', () => new NotFoundError('nope', 'THING_NOT_FOUND'), 404, 'THING_NOT_FOUND', {}],
++  ['ConflictError', () => new ConflictError('clash', 'THING_CONFLICT'), 409, 'THING_CONFLICT', {}],
++  ['PayloadTooLargeError', () => new PayloadTooLargeError('big', 'TOO_BIG'), 413, 'TOO_BIG', {}],
++  [
++    'ValidationError',
++    () => new ValidationError('invalid', 'VALIDATION_FAILED', [detail]),
++    422,
++    'VALIDATION_FAILED',
++    {},
++  ],
++  [
++    'TooManyRequestsError',
++    () => new TooManyRequestsError('slow', 'RATE_LIMITED', 30),
++    429,
++    'RATE_LIMITED',
++    { 'retry-after': '30' },
++  ],
++  ['InternalError', () => new InternalError(), 500, 'INTERNAL_ERROR', {}],
++  [
++    'ServiceUnavailableError',
++    () => new ServiceUnavailableError('down', 'DEPENDENCY_UNAVAILABLE', 7),
++    503,
++    'DEPENDENCY_UNAVAILABLE',
++    { 'retry-after': '7' },
++  ],
++];
++
++function buildApp(route: RequestHandler): Express {
++  const app = express();
++  app.use(requestMiddleware);
++  app.use(express.json());
++  app.post('/fail', route);
++  app.use(errorMappingMiddleware);
++  return app;
++}
++
++describe('errorMappingMiddleware', () => {
++  it.each(cases)('maps %s to the envelope', async (_name, make, status, code, headers) => {
++    const error = make();
++    const res = await request(
++      buildApp(() => {
++        throw error;
++      }),
++    )
++      .post('/fail')
++      .set('X-Request-Id', 'req-1');
++
++    expect(res.status).toBe(status);
++    expect(res.body).toEqual({
++      error: {
++        code,
++        message: status === 500 ? 'Internal server error' : error.message,
++        details: error.details,
++        requestId: 'req-1',
++      },
++    });
++    expect(Array.isArray(res.body.error.details)).toBe(true);
++    for (const [name, value] of Object.entries(headers)) {
++      expect(res.headers[name]).toBe(value);
++    }
++  });
++
++  it('does not set Retry-After when none is configured', async () => {
++    const res = await request(
++      buildApp(() => {
++        throw new ServiceUnavailableError();
++      }),
++    ).post('/fail');
++    expect(res.status).toBe(503);
++    expect(res.headers['retry-after']).toBeUndefined();
++  });
++
++  it('forwards errors rejected from async handlers', async () => {
++    const res = await request(
++      buildApp(async () => {
++        throw new ConflictError('clash', 'X_CONFLICT');
++      }),
++    ).post('/fail');
++    expect(res.status).toBe(409);
++    expect(res.body.error.code).toBe('X_CONFLICT');
++  });
++
++  it('echoes the generated request id in error.requestId', async () => {
++    const res = await request(
++      buildApp(() => {
++        throw new ForbiddenError();
++      }),
++    ).post('/fail');
++    expect(res.body.error.requestId).toBe(res.headers['x-request-id']);
++  });
++
++  describe('unknown errors', () => {
++    it('returns only INTERNAL_ERROR and the request id, without leaking details', async () => {
++      const secret = 'select * from "User" where password = $1 -- leaked';
++      const res = await request(
++        buildApp(() => {
++          throw new Error(secret);
++        }),
++      )
++        .post('/fail')
++        .set('X-Request-Id', 'req-500');
++
++      expect(res.status).toBe(500);
++      expect(res.body).toEqual({
++        error: {
++          code: 'INTERNAL_ERROR',
++          message: 'Internal server error',
++          details: [],
++          requestId: 'req-500',
++        },
++      });
++      expect(JSON.stringify(res.body)).not.toContain('leaked');
++      expect(JSON.stringify(res.body)).not.toContain('at ');
++    });
++
++    it('logs at error level with the stack', async () => {
++      const error = new Error('boom');
++      await request(
++        buildApp(() => {
++          throw error;
++        }),
++      ).post('/fail');
++
++      expect(log.error).toHaveBeenCalledWith({ err: error }, 'Unhandled error');
++      expect(log.warn).not.toHaveBeenCalled();
++    });
++  });
++
++  describe('logging of AppErrors', () => {
++    it('logs 4xx at warn without a stack', async () => {
++      await request(
++        buildApp(() => {
++          throw new ForbiddenError();
++        }),
++      ).post('/fail');
++
++      expect(log.warn).toHaveBeenCalledWith(
++        { errorCode: 'FORBIDDEN', statusCode: 403 },
++        'Forbidden',
++      );
++      expect(log.error).not.toHaveBeenCalled();
++    });
++
++    it('logs 5xx at error', async () => {
++      await request(
++        buildApp(() => {
++          throw new ServiceUnavailableError();
++        }),
++      ).post('/fail');
++
++      expect(log.error).toHaveBeenCalledTimes(1);
++    });
++  });
++
++  describe('Zod errors', () => {
++    const schema = z.strictObject({ name: z.string() });
++    const validated: RequestHandler = (req) => {
++      parseOrThrow(schema, req.body);
++    };
++    const rawParse: RequestHandler = (req) => {
++      schema.parse(req.body);
++    };
++
++    it('maps a validation failure to 422 with details', async () => {
++      const res = await request(buildApp(validated)).post('/fail').send({});
++      expect(res.status).toBe(422);
++      expect(res.body.error.code).toBe('VALIDATION_FAILED');
++      expect(res.body.error.details).toEqual([{ field: 'name', issue: expect.any(String) }]);
++    });
++
++    it('maps an unknown key to 400 BAD_REQUEST', async () => {
++      const res = await request(buildApp(validated)).post('/fail').send({ name: 'a', extra: 1 });
++      expect(res.status).toBe(400);
++      expect(res.body.error.code).toBe('BAD_REQUEST');
++    });
++
++    it('also maps a ZodError thrown directly by schema.parse', async () => {
++      const res = await request(buildApp(rawParse)).post('/fail').send({});
++      expect(res.status).toBe(422);
++      expect(res.body.error.code).toBe('VALIDATION_FAILED');
++    });
++  });
++
++  describe('body parser errors', () => {
++    it('maps malformed JSON to 400 BAD_REQUEST', async () => {
++      const res = await request(buildApp(() => undefined))
++        .post('/fail')
++        .set('Content-Type', 'application/json')
++        .send('{"name": ');
++      expect(res.status).toBe(400);
++      expect(res.body.error.code).toBe('BAD_REQUEST');
++      expect(res.body.error.details).toEqual([]);
++      expect(typeof res.body.error.requestId).toBe('string');
++    });
++  });
++});
+diff --git a/backend/src/shared/middleware/error-mapping.ts b/backend/src/shared/middleware/error-mapping.ts
+index 33347be..f905a8e 100644
+--- a/backend/src/shared/middleware/error-mapping.ts
++++ b/backend/src/shared/middleware/error-mapping.ts
+@@ -1,39 +1,62 @@
+ import type { ErrorRequestHandler } from 'express';
+-import { AppError } from '../errors/AppError.js';
+-import { logger } from '../observability/logger.js';
+-
+-export const errorMappingMiddleware: ErrorRequestHandler = (error, _rq, res, _next) => {
+-    const requestId = res.locals.requestId as string | undefined;
+-
+-    if (error instanceof AppError) {
+-        logger.warn(
+-            {
+-                requestId,
+-                errorCode: error.code,
+-                statusCode: error.statusCode,
+-            },
+-            error.message,
+-        );
+-
+-        res.status(error.statusCode).json({
+-            error: {
+-                code: error.code,
+-                message: error.expose ? error.message : 'Internal server error',
+-            },
+-        });
+-
+-        return;
+-    }
+-
+-    logger.warn({
+-        requestId,
+-        error
+-    }, "Unhandled Error");
+-
+-    res.status(500).json({
+-        error: {
+-            code: "INTERNAL_SERVER_ERROR",
+-            message: "Internal Server Error",
+-        }
+-    });
++import { ZodError } from 'zod';
++import { AppError, BadRequestError, InternalError } from '../errors/AppError.js';
++import { zodErrorToAppError } from '../errors/zod.js';
++import { childLogger } from '../observability/logger.js';
++
++/** Errors raised by Express' body parser (malformed JSON, bad encoding, aborted request, ...). */
++function isBodyParserError(error: unknown): boolean {
++  if (typeof error !== 'object' || error === null) return false;
++  const { type, status } = error as { type?: unknown; status?: unknown };
++  return typeof type === 'string' && typeof status === 'number' && status >= 400 && status < 500;
++}
++
++function toAppError(error: unknown): AppError | undefined {
++  if (error instanceof AppError) return error;
++  if (error instanceof ZodError) return zodErrorToAppError(error);
++  if (isBodyParserError(error)) return new BadRequestError('Malformed request body');
++  return undefined;
++}
++
++export const errorMappingMiddleware: ErrorRequestHandler = (error, _req, res, next) => {
++  if (res.headersSent) {
++    next(error);
++    return;
++  }
++
++  const requestId = res.locals.requestId as string | undefined;
++  const log = childLogger({ requestId });
++  const appError = toAppError(error);
++
++  if (!appError) {
++    log.error({ err: error }, 'Unhandled error');
++    sendError(res, new InternalError(), requestId);
++    return;
++  }
++
++  if (appError.statusCode >= 500) {
++    log.error({ err: appError, errorCode: appError.code }, appError.message);
++  } else {
++    log.warn({ errorCode: appError.code, statusCode: appError.statusCode }, appError.message);
++  }
++  sendError(res, appError, requestId);
+ };
++
++function sendError(
++  res: Parameters<ErrorRequestHandler>[2],
++  error: AppError,
++  requestId: string | undefined,
++): void {
++  if (error.retryAfterSeconds !== undefined) {
++    res.setHeader('Retry-After', String(error.retryAfterSeconds));
++  }
++
++  res.status(error.statusCode).json({
++    error: {
++      code: error.code,
++      message: error.expose ? error.message : 'Internal server error',
++      details: error.expose ? error.details : [],
++      requestId: requestId ?? null,
++    },
++  });
++}
+diff --git a/backend/src/shared/middleware/request-ids.spec.ts b/backend/src/shared/middleware/request-ids.spec.ts
+new file mode 100644
+index 0000000..d90dbeb
+--- /dev/null
++++ b/backend/src/shared/middleware/request-ids.spec.ts
+@@ -0,0 +1,44 @@
++import express from 'express';
++import request from 'supertest';
++import { requestIdHeader, requestMiddleware } from './request-ids.js';
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
++
++const app = express();
++app.use(requestMiddleware);
++app.get('/id', (_req, res) => {
++  res.json({ requestId: res.locals.requestId });
++});
++
++describe('requestMiddleware', () => {
++  it('accepts a valid incoming request id and echoes it', async () => {
++    const res = await request(app).get('/id').set(requestIdHeader, 'client-req_123-ABC');
++    expect(res.headers['x-request-id']).toBe('client-req_123-ABC');
++    expect(res.body.requestId).toBe('client-req_123-ABC');
++  });
++
++  it('accepts an id of exactly 128 characters', async () => {
++    const id = 'a'.repeat(128);
++    const res = await request(app).get('/id').set(requestIdHeader, id);
++    expect(res.headers['x-request-id']).toBe(id);
++  });
++
++  it('replaces an id longer than 128 characters', async () => {
++    const res = await request(app).get('/id').set(requestIdHeader, 'a'.repeat(129));
++    expect(res.headers['x-request-id']).toMatch(UUID);
++  });
++
++  it.each(['bad id', 'bad.id', 'bad/id', 'bad;id', 'bad\u00e9id'])(
++    'replaces an id with invalid characters (%s)',
++    async (id) => {
++      const res = await request(app).get('/id').set(requestIdHeader, id);
++      expect(res.headers['x-request-id']).toMatch(UUID);
++      expect(res.body.requestId).toBe(res.headers['x-request-id']);
++    },
++  );
++
++  it('generates a UUID when no id is sent', async () => {
++    const res = await request(app).get('/id');
++    expect(res.headers['x-request-id']).toMatch(UUID);
++  });
++});
+diff --git a/backend/src/shared/middleware/request-ids.ts b/backend/src/shared/middleware/request-ids.ts
+index ab8b9d1..ada2e1c 100644
+--- a/backend/src/shared/middleware/request-ids.ts
++++ b/backend/src/shared/middleware/request-ids.ts
+@@ -1,13 +1,15 @@
+-import crypto from "node:crypto";
+-import type { NextFunction, Request, Response } from "express";
++import crypto from 'node:crypto';
++import type { NextFunction, Request, Response } from 'express';
+ 
+-export const requestIdHeader = "x-request-id";
++export const requestIdHeader = 'x-request-id';
++
++const VALID_REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/;
+ 
+ export function requestMiddleware(req: Request, res: Response, next: NextFunction) {
+-    const incoming = req.header(requestIdHeader);
+-    const requestId = incoming && incoming.trim().length > 0 ? incoming : crypto.randomUUID();
++  const incoming = req.header(requestIdHeader);
++  const requestId = incoming && VALID_REQUEST_ID.test(incoming) ? incoming : crypto.randomUUID();
+ 
+-    res.locals.requestId = requestId;
+-    res.setHeader("X-Request-Id", requestId);
+-    next();
+-}
+\ No newline at end of file
++  res.locals.requestId = requestId;
++  res.setHeader('X-Request-Id', requestId);
++  next();
++}
+diff --git a/backend/src/shared/observability/http-logger.ts b/backend/src/shared/observability/http-logger.ts
+new file mode 100644
+index 0000000..11fbcef
+--- /dev/null
++++ b/backend/src/shared/observability/http-logger.ts
+@@ -0,0 +1,18 @@
++import type { Request, Response } from 'express';
++import { pinoHttp } from 'pino-http';
++import { logger } from './logger.js';
++
++/**
++ * Request-scoped logging (`req.log`). Only the method, path and status are serialized:
++ * headers (Authorization), query strings and bodies are never logged.
++ */
++export const httpLogger = pinoHttp({
++  logger,
++  genReqId: (_req, res) => (res as Response).locals.requestId as string,
++  customProps: (req) => ({ requestId: (req as Request).res?.locals.requestId as string }),
++  autoLogging: { ignore: (req) => req.url === '/health' },
++  serializers: {
++    req: (req: Request) => ({ id: req.id, method: req.method, url: req.url.split('?')[0] }),
++    res: (res: Response) => ({ statusCode: res.statusCode }),
++  },
++});
+diff --git a/backend/src/shared/observability/logger.ts b/backend/src/shared/observability/logger.ts
+index 7f56f46..7bcd74e 100644
+--- a/backend/src/shared/observability/logger.ts
++++ b/backend/src/shared/observability/logger.ts
+@@ -1,25 +1,24 @@
+-import pino from "pino";
+-// import {env} from "../config/env.js"
++import pino from 'pino';
+ 
+ export type LogContext = {
+-    requestId?: string;
+-    actorId?: string;
+-    actorRole?: string;
+-    teamId?: string;
+-    incidentId?: string;
++  requestId?: string;
++  actorId?: string;
++  actorRole?: string;
++  teamId?: string;
++  incidentId?: string;
+ };
+ 
+ export const logger = pino({
+-    level: "info",
+-    base: null,
+-    timestamp: pino.stdTimeFunctions.isoTime,
+-    formatters: {
+-        level(label) {
+-            return { level: label };
+-        },
++  level: 'info',
++  base: null,
++  timestamp: pino.stdTimeFunctions.isoTime,
++  formatters: {
++    level(label) {
++      return { level: label };
+     },
++  },
+ });
+ 
+ export function childLogger(context: LogContext) {
+-    return logger.child(context);
+-}
+\ No newline at end of file
++  return logger.child(context);
++}
+diff --git a/backend/src/shared/types/auth-context.ts b/backend/src/shared/types/auth-context.ts
+new file mode 100644
+index 0000000..ab017ba
+--- /dev/null
++++ b/backend/src/shared/types/auth-context.ts
+@@ -0,0 +1,10 @@
++export type UserRole = 'ENGINEER' | 'TEAM_LEAD' | 'ADMIN';
++
++/** The authenticated caller, derived from the access token. Populated by the auth guard. */
++export interface AuthContext {
++  userId: string;
++  email: string;
++  role: UserRole;
++  teamId: string | null;
++  sessionId: string;
++}
+diff --git a/backend/src/shared/types/express.d.ts b/backend/src/shared/types/express.d.ts
+new file mode 100644
+index 0000000..3ab1093
+--- /dev/null
++++ b/backend/src/shared/types/express.d.ts
+@@ -0,0 +1,10 @@
++import type { AuthContext } from './auth-context.js';
++
++declare global {
++  namespace Express {
++    interface Request {
++      /** Set by the authentication guard; absent on unauthenticated routes. */
++      auth?: AuthContext;
++    }
++  }
++}
+diff --git a/backend/src/worker.ts b/backend/src/worker.ts
+new file mode 100644
+index 0000000..8a72a95
+--- /dev/null
++++ b/backend/src/worker.ts
+@@ -0,0 +1,24 @@
++import { getConfig } from './config/env.js';
++import { disconnectPrisma, pingDatabase } from './infra/db/prisma.js';
++import { closeRedis, pingRedis } from './infra/redis/redis.js';
++import { onShutdownSignal } from './shared/lifecycle/shutdown.js';
++import { logger } from './shared/observability/logger.js';
++
++async function main(): Promise<void> {
++  const config = getConfig();
++
++  await pingDatabase();
++  await pingRedis();
++
++  logger.info({ nodeEnv: config.nodeEnv }, 'Worker ready');
++
++  onShutdownSignal(async () => {
++    await disconnectPrisma();
++    await closeRedis();
++  });
++}
++
++main().catch((err: unknown) => {
++  logger.fatal({ err }, 'Worker failed to start');
++  process.exit(1);
++});
+diff --git a/backend/test/helpers/app.ts b/backend/test/helpers/app.ts
+new file mode 100644
+index 0000000..92d4829
+--- /dev/null
++++ b/backend/test/helpers/app.ts
+@@ -0,0 +1,9 @@
++import type { Express } from 'express';
++import { createApp } from '../../src/app';
++import { buildReadinessChecks } from '../../src/infra/readiness';
++import type { ReadinessCheck } from '../../src/shared/http/health';
++
++/** The real application wired to the real PostgreSQL and Redis from the test environment. */
++export function buildTestApp(readinessChecks: ReadinessCheck[] = buildReadinessChecks()): Express {
++  return createApp({ readinessChecks });
++}
+diff --git a/backend/test/helpers/db-setup.ts b/backend/test/helpers/db-setup.ts
+new file mode 100644
+index 0000000..6e17f1f
+--- /dev/null
++++ b/backend/test/helpers/db-setup.ts
+@@ -0,0 +1,30 @@
++import { Client } from 'pg';
++import { applyMigrations } from './migrations';
++import { assertTestDatabase, databaseName, testDatabaseUrl, withDatabase } from './test-env';
++
++/** Drops and recreates the test database's schema, then applies all migrations. */
++export async function prepareTestDatabase(): Promise<void> {
++  const url = testDatabaseUrl();
++  assertTestDatabase(url);
++
++  const admin = new Client({ connectionString: withDatabase(url, 'postgres') });
++  await admin.connect();
++  try {
++    const name = databaseName(url);
++    const exists = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [name]);
++    if (exists.rowCount === 0) {
++      await admin.query(`CREATE DATABASE "${name}"`);
++    }
++  } finally {
++    await admin.end();
++  }
++
++  const client = new Client({ connectionString: url });
++  await client.connect();
++  try {
++    await client.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
++    await applyMigrations(client);
++  } finally {
++    await client.end();
++  }
++}
+diff --git a/backend/test/helpers/db.ts b/backend/test/helpers/db.ts
+new file mode 100644
+index 0000000..312fafc
+--- /dev/null
++++ b/backend/test/helpers/db.ts
+@@ -0,0 +1,14 @@
++import { getPrisma } from '../../src/infra/db/prisma';
++import { assertTestDatabase, testDatabaseUrl } from './test-env';
++
++/** Empties every application table. Use between tests that write data. */
++export async function resetDatabase(): Promise<void> {
++  assertTestDatabase(testDatabaseUrl());
++  const tables = await getPrisma().$queryRaw<{ tablename: string }[]>`
++    SELECT tablename FROM pg_tables
++    WHERE schemaname = 'public' AND tablename <> '_prisma_migrations'`;
++  if (tables.length === 0) return;
++
++  const list = tables.map(({ tablename }) => `"${tablename}"`).join(', ');
++  await getPrisma().$executeRawUnsafe(`TRUNCATE TABLE ${list} RESTART IDENTITY CASCADE`);
++}
+diff --git a/backend/test/helpers/migrations.ts b/backend/test/helpers/migrations.ts
+new file mode 100644
+index 0000000..3b57803
+--- /dev/null
++++ b/backend/test/helpers/migrations.ts
+@@ -0,0 +1,18 @@
++import { readdirSync, readFileSync } from 'node:fs';
++import path from 'node:path';
++import type { Client } from 'pg';
++
++const MIGRATIONS_DIR = path.resolve(__dirname, '../../prisma/migrations');
++
++/** Applies every `prisma/migrations/<name>/migration.sql` in order, as `migrate deploy` would. */
++export async function applyMigrations(client: Client): Promise<string[]> {
++  const names = readdirSync(MIGRATIONS_DIR, { withFileTypes: true })
++    .filter((entry) => entry.isDirectory())
++    .map((entry) => entry.name)
++    .sort();
++
++  for (const name of names) {
++    await client.query(readFileSync(path.join(MIGRATIONS_DIR, name, 'migration.sql'), 'utf8'));
++  }
++  return names;
++}
+diff --git a/backend/test/helpers/test-env.ts b/backend/test/helpers/test-env.ts
+new file mode 100644
+index 0000000..805e3ae
+--- /dev/null
++++ b/backend/test/helpers/test-env.ts
+@@ -0,0 +1,29 @@
++/** Integration tests run against a dedicated database so they never touch development data. */
++export const DEFAULT_TEST_DATABASE_URL = 'postgresql://postgres:postgres@localhost:5431/ims_test';
++export const DEFAULT_TEST_REDIS_URL = 'redis://localhost:6379/15';
++
++export function testDatabaseUrl(): string {
++  return process.env.TEST_DATABASE_URL ?? DEFAULT_TEST_DATABASE_URL;
++}
++
++export function testRedisUrl(): string {
++  return process.env.TEST_REDIS_URL ?? DEFAULT_TEST_REDIS_URL;
++}
++
++export function databaseName(url: string): string {
++  return decodeURIComponent(new URL(url).pathname.slice(1));
++}
++
++/** Same server, different database. */
++export function withDatabase(url: string, name: string): string {
++  const next = new URL(url);
++  next.pathname = `/${name}`;
++  return next.toString();
++}
++
++/** Refuses to run destructive helpers against anything that is not a test database. */
++export function assertTestDatabase(url: string): void {
++  if (!/_test$|^ims_migrate_check_/.test(databaseName(url))) {
++    throw new Error('Refusing to run against a database whose name does not end in "_test"');
++  }
++}
+diff --git a/backend/test/integration/env.ts b/backend/test/integration/env.ts
+new file mode 100644
+index 0000000..277fefd
+--- /dev/null
++++ b/backend/test/integration/env.ts
+@@ -0,0 +1,12 @@
++import { logger } from '../../src/shared/observability/logger';
++import { testDatabaseUrl, testRedisUrl } from '../helpers/test-env';
++
++// Runs before every integration test file: point the app at the test services.
++process.env.NODE_ENV = 'test';
++process.env.PORT = process.env.PORT ?? '3000';
++process.env.DATABASE_URL = testDatabaseUrl();
++process.env.DIRECT_URL = testDatabaseUrl();
++process.env.REDIS_URL = testRedisUrl();
++process.env.JWT_SECRET = process.env.JWT_SECRET ?? 'integration-test-secret';
++
++logger.level = 'silent';
+diff --git a/backend/test/integration/global-setup.ts b/backend/test/integration/global-setup.ts
+new file mode 100644
+index 0000000..1bec708
+--- /dev/null
++++ b/backend/test/integration/global-setup.ts
+@@ -0,0 +1,5 @@
++import { prepareTestDatabase } from '../helpers/db-setup';
++
++export default async function globalSetup(): Promise<void> {
++  await prepareTestDatabase();
++}
+diff --git a/backend/test/integration/migrations.int-spec.ts b/backend/test/integration/migrations.int-spec.ts
+new file mode 100644
+index 0000000..417d31b
+--- /dev/null
++++ b/backend/test/integration/migrations.int-spec.ts
+@@ -0,0 +1,44 @@
++import { Client } from 'pg';
++import { applyMigrations } from '../helpers/migrations';
++import { testDatabaseUrl, withDatabase } from '../helpers/test-env';
++
++const scratchName = `ims_migrate_check_${Date.now()}`;
++let admin: Client;
++
++beforeAll(async () => {
++  admin = new Client({ connectionString: withDatabase(testDatabaseUrl(), 'postgres') });
++  await admin.connect();
++  await admin.query(`CREATE DATABASE "${scratchName}"`);
++});
++
++afterAll(async () => {
++  await admin.query(`DROP DATABASE IF EXISTS "${scratchName}"`);
++  await admin.end();
++});
++
++describe('migrations', () => {
++  it('apply cleanly to an empty database and create the full schema', async () => {
++    const client = new Client({ connectionString: withDatabase(testDatabaseUrl(), scratchName) });
++    await client.connect();
++    try {
++      const applied = await applyMigrations(client);
++      expect(applied.length).toBeGreaterThan(0);
++
++      const tables = await client.query<{ tablename: string }>(
++        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
++      );
++      expect(tables.rows.map((row) => row.tablename)).toEqual(
++        expect.arrayContaining(['User', 'Incident', 'Alert', 'AlertSource', 'OutboxEvent']),
++      );
++
++      const indexes = await client.query<{ indexname: string }>(
++        "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'",
++      );
++      expect(indexes.rows.map((row) => row.indexname)).toEqual(
++        expect.arrayContaining(['uq_alert_source_event_id', 'uq_alert_source_fingerprint']),
++      );
++    } finally {
++      await client.end();
++    }
++  });
++});
+diff --git a/backend/test/integration/ready.int-spec.ts b/backend/test/integration/ready.int-spec.ts
+new file mode 100644
+index 0000000..a69a9a7
+--- /dev/null
++++ b/backend/test/integration/ready.int-spec.ts
+@@ -0,0 +1,60 @@
++import { Redis } from 'ioredis';
++import request from 'supertest';
++import { disconnectPrisma, pingDatabase } from '../../src/infra/db/prisma';
++import { buildReadinessChecks } from '../../src/infra/readiness';
++import { closeRedis, pingRedis } from '../../src/infra/redis/redis';
++import { buildTestApp } from '../helpers/app';
++
++afterAll(async () => {
++  await disconnectPrisma();
++  await closeRedis();
++});
++
++describe('GET /health', () => {
++  it('returns 200 without authentication', async () => {
++    const res = await request(buildTestApp()).get('/health');
++    expect(res.status).toBe(200);
++    expect(res.body).toEqual({ status: 'ok' });
++  });
++});
++
++describe('GET /ready', () => {
++  it('returns 200 when PostgreSQL and Redis respond', async () => {
++    const res = await request(buildTestApp()).get('/ready');
++    expect(res.status).toBe(200);
++    expect(res.body).toEqual({ data: { status: 'ok' } });
++  });
++
++  it('returns 503 with Retry-After when Redis is unreachable', async () => {
++    // Never reconnects, so the failed client leaves no timers behind.
++    const unreachable = new Redis('redis://127.0.0.1:1', {
++      lazyConnect: true,
++      maxRetriesPerRequest: 0,
++      retryStrategy: () => null,
++    });
++    unreachable.on('error', () => undefined);
++    const app = buildTestApp([
++      { name: 'postgresql', check: () => pingDatabase() },
++      { name: 'redis', check: () => pingRedis(unreachable) },
++    ]);
++
++    try {
++      const res = await request(app).get('/ready').set('X-Request-Id', 'ready-int-1');
++      expect(res.status).toBe(503);
++      expect(res.headers['retry-after']).toBe('5');
++      expect(res.body.error).toEqual({
++        code: 'DEPENDENCY_UNAVAILABLE',
++        message: expect.any(String),
++        details: [],
++        requestId: 'ready-int-1',
++      });
++    } finally {
++      if (unreachable.status !== 'end') unreachable.disconnect();
++    }
++  });
++
++  it('recovers once the dependency is back', async () => {
++    const res = await request(buildTestApp(buildReadinessChecks())).get('/ready');
++    expect(res.status).toBe(200);
++  });
++});
+diff --git a/backend/tsconfig.build.json b/backend/tsconfig.build.json
+index e9cc3ec..595c081 100644
+--- a/backend/tsconfig.build.json
++++ b/backend/tsconfig.build.json
+@@ -1,6 +1,11 @@
+ {
+   "extends": "./tsconfig.json",
+-  "compilerOptions": { "types": ["node"] },
++  "compilerOptions": {
++    "rootDir": "src",
++    "outDir": "./dist",
++    "types": ["node"],
++    "incremental": false
++  },
+   "include": ["src/**/*"],
+   "exclude": ["node_modules", "dist", "test", "**/*.spec.ts"]
+ }

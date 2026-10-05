@@ -1,11 +1,11 @@
 # Domain Model
 
 ```
-User -> Team | 1
-Team -> User | 1..N
+User -> Team | 0..1
+Team -> User | 0..N
 
 Team -> Service | 0..N
-Service -> Escalation Policy | 1..4
+Service -> Escalation Policy | 1..1
 
 Alert_Source -> Alert | 0..N
 Alert -> Incident | 0..1
@@ -31,8 +31,8 @@ AuditLog -> User | 0..1
 Postmortem -> human_reviewer | 0..1
 Incident -> AI_Investigation | 0..N
 
-AI_Investigation -> Investigation_Evidence | 0..N
-AI_Investigation -> investigating_user | 0..1
+AI_Investigation -> Investigation_Evidence | 1..N
+AI_Investigation -> requested_by | 1
 
 AI_Evaluation_Case | independent
 
@@ -42,15 +42,13 @@ AI_Evaluation_Case | independent
 
 | Relationship                               | Cardinality            |
 | ------------------------------------------ | ---------------------- |
-| User -> Team                               | One-to-one             |
-| Team -> User                               | One-to-many            |
 | Team -> Service                            | One-to-many            |
-| Service -> Escalation_Policy               | One-to-many            |
+| Team -> Incident                           | One-to-many            |
+| Service -> Escalation_Policy               | One-to-one            |
 | Alert_Source -> Alert                      | One-to-many            |
 | Alert -> Incident                          | Many-to-one            |
-| Incident -> Team                           | One-to-one             |
 | Incident -> Comment                        | One-to-many            |
-| Comment -> User                            | One-to-one             |
+| User -> Comment                            | One-to-many            |
 | Incident -> Notification                   | One-to-many            |
 | Incident -> Postmortem                     | One-to-one             |
 | Incident -> AI_Investigation               | One-to-many            |
@@ -64,8 +62,8 @@ AI_Evaluation_Case | independent
 
 | Entity                 | Owns                                                      | Lifecycle                                                | Key Invariant                                                             | Owning Module |
 | ---------------------- | --------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------- | ------------- |
-| User                   | Identity, role                                            | -                                                        | Every user has exactly one role per team and belongs to only one team.    | Identity         |
-| Team                   | Membership                                                | -                                                        | Every engineer has exactly one lead.                                      | Identity         |
+| User                   | Identity, role                                            | -                                                        | Every user has exactly one role and belongs to atmost one team.           | Identity      |
+| Team                   | Membership                                                | -                                                        | Every engineer has atmost one lead.                                       | Identity      |
 | Service                | severity default                                          | -                                                        | Every Service belongs to exactly one Team.                                | AppService    |
 | Escalation_Policy      | Escalation tree, Timing config                            | -                                                        | Every service has atleast one policy.                                     | AppService    |
 | Alert                  | payload, service affected                                 | FIRING -> RESOLVED                                       | Every accepted alert belongs to exactly one incident.                     | Alerts        |
@@ -74,22 +72,22 @@ AI_Evaluation_Case | independent
 | Comment                | Remarks                                                   | -                                                        | -                                                                         | Incident      |
 | Incident               | timestamps                                                | -                                                        | Every successful Incident transition has an atomic AuditLog event.        | Incident      |
 | Notification           | receiver                                                  | -                                                        | Required notification events have an atomic outbox record.                | Notifications |
-| Postmortem             | root cause, fix, learnings, model                         | GENERATING -> DRAFT -> REVIEWED              | Postmortem approval is required before Incident → CLOSED..                | AI            |
-| AI_Investigation       | investigation request, execution state, analysis metadata | REQUESTED -> RUNNING -> COMPLETED -> FAILED              | -                                                                         | AI            |
+| Postmortem             | root cause, fix, learnings, model                         | GENERATING -> DRAFT -> REVIEWED                          | Postmortem approval is required before Incident → CLOSED..                | AI            |
+| AI_Investigation       | investigation request, execution state, analysis metadata | PENDING -> DONE              | -                                                                         | AI            |
 | Investigation_Evidence | facts, data                                               | -                                                        | Every AI Investigation has at least one Investigation_Evidence record.    | AI            |
-
 
 - UNIQUE(service_id, escalation_policy.severity)
 - Every Incident belongs to exactly one Team and Service.
 - Every Incident has at most one current assignee.
 - Every Incident has at most one Postmortem.
 - acknowledged_by and current_assignee may refer to different users.
-
+- Every accepted alert belongs to exactly one incident.
+Rejected/unaccepted alerts may have no incident.
 
 - AI evaluation fixtures/test cases
-    → development/testing artifact
-    → not a production domain entity
-    → no production API
+  → development/testing artifact
+  → not a production domain entity
+  → no production API
 
 ---
 

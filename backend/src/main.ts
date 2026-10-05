@@ -1,5 +1,6 @@
 import type { Server } from 'node:http';
 import { createApp } from './app.js';
+import { createApiRouter } from './api-router.js';
 import { getConfig } from './config/env.js';
 import { disconnectPrisma, pingDatabase } from './infra/db/prisma.js';
 import { buildReadinessChecks } from './infra/readiness.js';
@@ -13,7 +14,10 @@ async function main(): Promise<void> {
   await pingDatabase();
   await pingRedis();
 
-  const app = createApp({ readinessChecks: buildReadinessChecks() });
+  const app = createApp({
+    readinessChecks: buildReadinessChecks(),
+    apiRouter: createApiRouter(),
+  });
   // Express 5 passes a listen failure (e.g. EADDRINUSE) to this callback.
   const server = await new Promise<Server>((resolve, reject) => {
     const listening = app.listen(config.port, (err?: Error) =>

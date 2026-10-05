@@ -1,0 +1,3909 @@
+diff --git a/backend/.env.example b/backend/.env.example
+new file mode 100644
+index 0000000..0f5e65e
+--- /dev/null
++++ b/backend/.env.example
+@@ -0,0 +1,14 @@
++# Copy to .env for local development. Never commit real secrets.
++NODE_ENV=development
++PORT=3000
++DATABASE_URL=postgresql://postgres:postgres@localhost:5431/ims
++DIRECT_URL=postgresql://postgres:postgres@localhost:5431/ims
++REDIS_URL=redis://localhost:6379
++JWT_SECRET=change-me
++ACCESS_TOKEN_EXPIRY=15m
++REFRESH_TOKEN_EXPIRY=7d
++
++# Only read by `npm run seed:admin` (creates an ADMIN user, idempotent by email).
++SEED_ADMIN_NAME=
++SEED_ADMIN_EMAIL=
++SEED_ADMIN_PASSWORD=
+diff --git a/backend/eslint.config.mjs b/backend/eslint.config.mjs
+index afded90..0e34518 100644
+--- a/backend/eslint.config.mjs
++++ b/backend/eslint.config.mjs
+@@ -60,6 +60,12 @@ export default tseslint.config(
+               allow: [['module', { moduleName: '{{from.moduleName}}' }]],
+             },
+ 
++            // Every module can use identity (auth guard and authorization helpers)
++            {
++              from: 'module',
++              allow: [['module', { moduleName: 'identity' }]],
++            },
++
+             // alerts -> incidents, appService
+             {
+               from: [['module', { moduleName: 'alerts' }]],
+diff --git a/backend/package.json b/backend/package.json
+index ab27736..c62d799 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -8,6 +8,7 @@
+     "prisma:generate": "prisma generate",
+     "start": "node dist/main.js",
+     "start:worker": "node dist/worker.js",
++    "seed:admin": "tsx src/scripts/seed-admin.ts",
+     "typecheck": "tsc -p tsconfig.json --noEmit",
+     "test": "jest --config jest.config.js",
+     "test:int": "jest --config jest.int.config.js",
+diff --git a/backend/src/api-router.ts b/backend/src/api-router.ts
+new file mode 100644
+index 0000000..c8df779
+--- /dev/null
++++ b/backend/src/api-router.ts
+@@ -0,0 +1,9 @@
++import { Router } from 'express';
++import { createIdentityRouter } from './modules/identity/index.js';
++
++/** Composes the module routers mounted at `/api/v1`. */
++export function createApiRouter(): Router {
++  const router = Router();
++  router.use(createIdentityRouter());
++  return router;
++}
+diff --git a/backend/src/infra/db/errors.ts b/backend/src/infra/db/errors.ts
+new file mode 100644
+index 0000000..a9bfa3b
+--- /dev/null
++++ b/backend/src/infra/db/errors.ts
+@@ -0,0 +1,20 @@
++import { Prisma } from '../../generated/prisma/client.js';
++
++function sqlState(error: unknown): string | undefined {
++  if (typeof error !== 'object' || error === null) return undefined;
++  const { code } = error as { code?: unknown };
++  return typeof code === 'string' ? code : undefined;
++}
++
++/** A PostgreSQL unique-constraint violation (Prisma `P2002` or raw SQLSTATE `23505`). */
++export function isUniqueViolation(error: unknown): boolean {
++  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return true;
++  return sqlState(error) === '23505';
++}
++
++/** Deadlock, serialization failure or lock timeout (Prisma `P2034` or SQLSTATE 40001/40P01/55P03). */
++export function isConcurrencyFailure(error: unknown): boolean {
++  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2034') return true;
++  const state = sqlState(error);
++  return state === '40001' || state === '40P01' || state === '55P03';
++}
+diff --git a/backend/src/main.ts b/backend/src/main.ts
+index 82bf45f..59d0413 100644
+--- a/backend/src/main.ts
++++ b/backend/src/main.ts
+@@ -1,5 +1,6 @@
+ import type { Server } from 'node:http';
+ import { createApp } from './app.js';
++import { createApiRouter } from './api-router.js';
+ import { getConfig } from './config/env.js';
+ import { disconnectPrisma, pingDatabase } from './infra/db/prisma.js';
+ import { buildReadinessChecks } from './infra/readiness.js';
+@@ -13,7 +14,10 @@ async function main(): Promise<void> {
+   await pingDatabase();
+   await pingRedis();
+ 
+-  const app = createApp({ readinessChecks: buildReadinessChecks() });
++  const app = createApp({
++    readinessChecks: buildReadinessChecks(),
++    apiRouter: createApiRouter(),
++  });
+   // Express 5 passes a listen failure (e.g. EADDRINUSE) to this callback.
+   const server = await new Promise<Server>((resolve, reject) => {
+     const listening = app.listen(config.port, (err?: Error) =>
+diff --git a/backend/src/modules/identity/auth/auth.controller.ts b/backend/src/modules/identity/auth/auth.controller.ts
+new file mode 100644
+index 0000000..2ce59c1
+--- /dev/null
++++ b/backend/src/modules/identity/auth/auth.controller.ts
+@@ -0,0 +1,50 @@
++import type { Request, RequestHandler, Response } from 'express';
++import { UnauthorizedError } from '../../../shared/errors/AppError.js';
++import { parseOrThrow } from '../../../shared/errors/zod.js';
++import { getAuth } from './guard.js';
++import { loginBodySchema } from './auth.schema.js';
++import * as authService from './auth.service.js';
++import { clearedRefreshCookieHeader, readRefreshCookie, refreshCookieHeader } from './tokens.js';
++
++function clientInfo(req: Request): authService.ClientInfo {
++  return {
++    ip: req.ip ?? 'unknown',
++    userAgent: req.get('user-agent')?.slice(0, 512) ?? null,
++  };
++}
++
++function sendTokens(res: Response, tokens: authService.IssuedTokens): void {
++  res.setHeader('Authorization', `Bearer ${tokens.accessToken}`);
++  res.setHeader(
++    'Set-Cookie',
++    refreshCookieHeader(tokens.refreshToken, tokens.refreshMaxAgeSeconds),
++  );
++  res.status(200).json({ data: { tokenType: 'Bearer', expiresIn: tokens.expiresIn } });
++}
++
++export const loginHandler: RequestHandler = async (req, res) => {
++  const body = parseOrThrow(loginBodySchema, req.body);
++  sendTokens(res, await authService.login(body, clientInfo(req)));
++};
++
++export const refreshHandler: RequestHandler = async (req, res) => {
++  const cookie = readRefreshCookie(req.get('cookie'));
++  if (!cookie) throw new UnauthorizedError('Refresh token is missing', 'INVALID_REQUEST');
++  sendTokens(res, await authService.refresh(cookie, clientInfo(req)));
++};
++
++function sendLoggedOut(res: Response): void {
++  res.setHeader('Set-Cookie', clearedRefreshCookieHeader());
++  res.status(200).json({ data: { message: 'Logged out successfully' } });
++}
++
++export const logoutHandler: RequestHandler = async (req, res) => {
++  const auth = getAuth(req);
++  await authService.logout(auth.userId, auth.sessionId);
++  sendLoggedOut(res);
++};
++
++export const logoutAllHandler: RequestHandler = async (req, res) => {
++  await authService.logoutAll(getAuth(req).userId);
++  sendLoggedOut(res);
++};
+diff --git a/backend/src/modules/identity/auth/auth.repository.ts b/backend/src/modules/identity/auth/auth.repository.ts
+new file mode 100644
+index 0000000..cc8b5b4
+--- /dev/null
++++ b/backend/src/modules/identity/auth/auth.repository.ts
+@@ -0,0 +1,58 @@
++import type { Db } from '../transaction.js';
++
++export function findUserByEmail(db: Db, email: string) {
++  return db.user.findUnique({ where: { email } });
++}
++
++export function findSessionWithUser(db: Db, sessionId: string) {
++  return db.userSession.findUnique({ where: { id: sessionId }, include: { user: true } });
++}
++
++export function createSession(
++  db: Db,
++  data: {
++    userId: string;
++    refreshTokenHash: string;
++    ip: string;
++    userAgent: string | null;
++    expiresIn: Date;
++  },
++) {
++  const now = new Date();
++  return db.userSession.create({
++    data: {
++      userId: data.userId,
++      refreshTokenHash: data.refreshTokenHash,
++      ip: data.ip,
++      lastIp: data.ip,
++      userAgent: data.userAgent,
++      lastSeen: now,
++      expiresIn: data.expiresIn,
++    },
++  });
++}
++
++/**
++ * Rotates the session's refresh token only if it still holds `expectedHash`. Returns whether this
++ * call won (a concurrent rotation of the same token leaves the loser with `false`).
++ */
++export async function rotateSession(
++  db: Db,
++  sessionId: string,
++  expectedHash: string,
++  data: { newHash: string; ip: string; expiresIn: Date },
++): Promise<boolean> {
++  const now = new Date();
++  const result = await db.userSession.updateMany({
++    where: { id: sessionId, refreshTokenHash: expectedHash, revoked: false },
++    data: {
++      lastRefreshHash: expectedHash,
++      refreshTokenHash: data.newHash,
++      lastSeen: now,
++      lastIp: data.ip,
++      expiresIn: data.expiresIn,
++      updatedAt: now,
++    },
++  });
++  return result.count === 1;
++}
+diff --git a/backend/src/modules/identity/auth/auth.schema.ts b/backend/src/modules/identity/auth/auth.schema.ts
+new file mode 100644
+index 0000000..3813924
+--- /dev/null
++++ b/backend/src/modules/identity/auth/auth.schema.ts
+@@ -0,0 +1,12 @@
++import { z } from 'zod';
++
++export const emailSchema = z
++  .email()
++  .max(72)
++  .transform((email) => email.toLowerCase());
++
++export const passwordSchema = z.string().min(8).max(24);
++
++export const loginBodySchema = z.object({ email: emailSchema, password: passwordSchema }).strict();
++
++export type LoginBody = z.output<typeof loginBodySchema>;
+diff --git a/backend/src/modules/identity/auth/auth.service.ts b/backend/src/modules/identity/auth/auth.service.ts
+new file mode 100644
+index 0000000..c8b06e5
+--- /dev/null
++++ b/backend/src/modules/identity/auth/auth.service.ts
+@@ -0,0 +1,153 @@
++import { ForbiddenError, UnauthorizedError } from '../../../shared/errors/AppError.js';
++import { runIdentityTransaction } from '../transaction.js';
++import {
++  createSession,
++  findSessionWithUser,
++  findUserByEmail,
++  rotateSession,
++} from './auth.repository.js';
++import { verifyPasswordOrDummy } from './password.js';
++import { consumeRateLimit, resetRateLimit } from './rate-limit.js';
++import { revokeSession, revokeSessionsForUsers } from './session.repository.js';
++import {
++  buildRefreshToken,
++  generateRefreshSecret,
++  hashesMatch,
++  hashRefreshSecret,
++  parseRefreshToken,
++  refreshTokenSeconds,
++  signAccessToken,
++} from './tokens.js';
++import { getPrisma } from '../../../infra/db/prisma.js';
++
++export type ClientInfo = { ip: string; userAgent: string | null };
++
++export type IssuedTokens = {
++  accessToken: string;
++  expiresIn: number;
++  refreshToken: string;
++  refreshMaxAgeSeconds: number;
++};
++
++function accountDeactivated(): ForbiddenError {
++  return new ForbiddenError('Account is deactivated', 'ACCOUNT_DEACTIVATED');
++}
++
++function invalidRefreshToken(): UnauthorizedError {
++  return new UnauthorizedError('Invalid refresh token', 'INVALID_REFRESH_TOKEN');
++}
++
++export async function login(
++  input: { email: string; password: string },
++  client: ClientInfo,
++): Promise<IssuedTokens> {
++  const { email, password } = input;
++  await consumeRateLimit('login', client.ip, [email]);
++
++  const user = await findUserByEmail(getPrisma(), email);
++  const passwordValid = await verifyPasswordOrDummy(user?.passwordHash, password);
++  if (!user || !passwordValid) {
++    throw new UnauthorizedError('Invalid email or password', 'INVALID_CREDENTIALS');
++  }
++  if (user.status === 'DEACTIVATED') throw accountDeactivated();
++
++  const refreshMaxAgeSeconds = refreshTokenSeconds();
++  const secret = generateRefreshSecret();
++  const session = await createSession(getPrisma(), {
++    userId: user.id,
++    refreshTokenHash: hashRefreshSecret(secret),
++    ip: client.ip,
++    userAgent: client.userAgent,
++    expiresIn: new Date(Date.now() + refreshMaxAgeSeconds * 1000),
++  });
++
++  await resetRateLimit('login', client.ip, [email]);
++
++  const access = signAccessToken({
++    userId: user.id,
++    email: user.email,
++    role: user.role,
++    teamId: user.teamId,
++    sessionId: session.id,
++  });
++  return {
++    accessToken: access.token,
++    expiresIn: access.expiresIn,
++    refreshToken: buildRefreshToken(session.id, user.email, secret),
++    refreshMaxAgeSeconds,
++  };
++}
++
++type RefreshOutcome =
++  | { kind: 'ok'; tokens: IssuedTokens }
++  | { kind: 'invalid' }
++  | { kind: 'reuse' }
++  | { kind: 'deactivated' };
++
++export async function refresh(cookieValue: string, client: ClientInfo): Promise<IssuedTokens> {
++  const parsed = parseRefreshToken(cookieValue);
++  await consumeRateLimit('refresh', client.ip, [parsed?.email ?? '', parsed?.sessionId ?? '']);
++  if (!parsed) throw invalidRefreshToken();
++
++  const presentedHash = hashRefreshSecret(parsed.secret);
++  const refreshMaxAgeSeconds = refreshTokenSeconds();
++
++  // Reuse must revoke every session and still report 401, so the outcome is returned from the
++  // transaction (committing the revocation) and the error is thrown afterwards.
++  const outcome = await runIdentityTransaction<RefreshOutcome>(async (tx) => {
++    const session = await findSessionWithUser(tx, parsed.sessionId);
++    if (!session || session.revoked || session.expiresIn.getTime() <= Date.now()) {
++      return { kind: 'invalid' };
++    }
++    if (hashesMatch(session.lastRefreshHash, presentedHash)) {
++      await revokeSessionsForUsers(tx, [session.userId]);
++      return { kind: 'reuse' };
++    }
++    if (!hashesMatch(session.refreshTokenHash, presentedHash)) return { kind: 'invalid' };
++    if (session.user.status === 'DEACTIVATED') return { kind: 'deactivated' };
++
++    const secret = generateRefreshSecret();
++    const rotated = await rotateSession(tx, session.id, session.refreshTokenHash, {
++      newHash: hashRefreshSecret(secret),
++      ip: client.ip,
++      expiresIn: new Date(Date.now() + refreshMaxAgeSeconds * 1000),
++    });
++    if (!rotated) {
++      // A concurrent request already rotated this token: this one is a reuse.
++      await revokeSessionsForUsers(tx, [session.userId]);
++      return { kind: 'reuse' };
++    }
++
++    const { user } = session;
++    const access = signAccessToken({
++      userId: user.id,
++      email: user.email,
++      role: user.role,
++      teamId: user.teamId,
++      sessionId: session.id,
++    });
++    return {
++      kind: 'ok',
++      tokens: {
++        accessToken: access.token,
++        expiresIn: access.expiresIn,
++        refreshToken: buildRefreshToken(session.id, user.email, secret),
++        refreshMaxAgeSeconds,
++      },
++    };
++  });
++
++  if (outcome.kind === 'deactivated') throw accountDeactivated();
++  if (outcome.kind !== 'ok') throw invalidRefreshToken();
++
++  await resetRateLimit('refresh', client.ip, [parsed.email, parsed.sessionId]);
++  return outcome.tokens;
++}
++
++export async function logout(userId: string, sessionId: string): Promise<void> {
++  await revokeSession(getPrisma(), sessionId, userId);
++}
++
++export async function logoutAll(userId: string): Promise<void> {
++  await revokeSessionsForUsers(getPrisma(), [userId]);
++}
+diff --git a/backend/src/modules/identity/auth/guard.spec.ts b/backend/src/modules/identity/auth/guard.spec.ts
+new file mode 100644
+index 0000000..808ca7b
+--- /dev/null
++++ b/backend/src/modules/identity/auth/guard.spec.ts
+@@ -0,0 +1,102 @@
++import { randomUUID } from 'node:crypto';
++import express from 'express';
++import request from 'supertest';
++
++process.env.NODE_ENV = 'test';
++process.env.PORT = '3000';
++process.env.DATABASE_URL = 'postgresql://u:p@localhost:5432/db';
++process.env.DIRECT_URL = 'postgresql://u:p@localhost:5432/db';
++process.env.REDIS_URL = 'redis://localhost:6379';
++process.env.JWT_SECRET = 'unit-test-secret';
++
++import jwt from 'jsonwebtoken';
++import { errorMappingMiddleware } from '../../../shared/middleware/error-mapping.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import { assertSameTeam, authenticate, requireRoles, requireTeam } from './guard.js';
++import { signAccessToken } from './tokens.js';
++
++// The guard must be verifiable offline: any database access in these tests is a failure.
++jest.mock('../../../infra/db/prisma.js', () => ({
++  getPrisma: () => {
++    throw new Error('guard must not read the database');
++  },
++}));
++
++const caller: AuthContext = {
++  userId: randomUUID(),
++  email: 'a@example.com',
++  role: 'ENGINEER',
++  teamId: randomUUID(),
++  sessionId: randomUUID(),
++};
++
++function buildApp() {
++  const app = express();
++  app.get('/any', authenticate, (req, res) => {
++    res.json({ auth: req.auth });
++  });
++  app.get('/lead', authenticate, requireRoles('TEAM_LEAD', 'ADMIN'), (_req, res) => {
++    res.json({ ok: true });
++  });
++  app.use(errorMappingMiddleware);
++  return app;
++}
++
++describe('authenticate', () => {
++  it('sets req.auth from a valid Bearer token without any database read', async () => {
++    const { token } = signAccessToken(caller);
++    const res = await request(buildApp()).get('/any').set('Authorization', `Bearer ${token}`);
++    expect(res.status).toBe(200);
++    expect(res.body.auth).toEqual(caller);
++  });
++
++  it.each([
++    ['no header', undefined],
++    ['wrong scheme', 'Basic abc'],
++    ['empty token', 'Bearer '],
++    ['garbage token', 'Bearer not.a.jwt'],
++    ['wrong secret', `Bearer ${jwt.sign(caller, 'other')}`],
++    ['expired token', `Bearer ${jwt.sign(caller, 'unit-test-secret', { expiresIn: -5 })}`],
++  ])('rejects %s with 401 UNAUTHENTICATED', async (_name, header) => {
++    const req = request(buildApp()).get('/any');
++    const res = await (header ? req.set('Authorization', header) : req);
++    expect(res.status).toBe(401);
++    expect(res.body.error.code).toBe('UNAUTHENTICATED');
++  });
++});
++
++describe('requireRoles', () => {
++  it('rejects a role outside the list with 403 FORBIDDEN_ROLE', async () => {
++    const { token } = signAccessToken(caller);
++    const res = await request(buildApp()).get('/lead').set('Authorization', `Bearer ${token}`);
++    expect(res.status).toBe(403);
++    expect(res.body.error.code).toBe('FORBIDDEN_ROLE');
++  });
++
++  it('lets a listed role through', async () => {
++    const { token } = signAccessToken({ ...caller, role: 'TEAM_LEAD' });
++    const res = await request(buildApp()).get('/lead').set('Authorization', `Bearer ${token}`);
++    expect(res.status).toBe(200);
++  });
++});
++
++describe('team helpers', () => {
++  it('requireTeam returns the team id or throws 403 INVALID_ACTION', () => {
++    expect(requireTeam(caller)).toBe(caller.teamId);
++    expect(() => requireTeam({ ...caller, teamId: null })).toThrow(
++      expect.objectContaining({ statusCode: 403, code: 'INVALID_ACTION' }),
++    );
++  });
++
++  it('assertSameTeam passes for the same team and throws 403 TEAM_ACCESS_DENIED otherwise', () => {
++    expect(() => assertSameTeam(caller, caller.teamId)).not.toThrow();
++    for (const other of [randomUUID(), null]) {
++      expect(() => assertSameTeam(caller, other)).toThrow(
++        expect.objectContaining({ statusCode: 403, code: 'TEAM_ACCESS_DENIED' }),
++      );
++    }
++    expect(() => assertSameTeam({ ...caller, teamId: null }, null)).toThrow(
++      expect.objectContaining({ code: 'TEAM_ACCESS_DENIED' }),
++    );
++  });
++});
+diff --git a/backend/src/modules/identity/auth/guard.ts b/backend/src/modules/identity/auth/guard.ts
+new file mode 100644
+index 0000000..d6e33a1
+--- /dev/null
++++ b/backend/src/modules/identity/auth/guard.ts
+@@ -0,0 +1,45 @@
++import type { Request, RequestHandler } from 'express';
++import { ForbiddenError, UnauthorizedError } from '../../../shared/errors/AppError.js';
++import type { AuthContext, UserRole } from '../../../shared/types/auth-context.js';
++import { verifyAccessToken } from './tokens.js';
++
++const BEARER = /^Bearer (\S+)$/;
++
++/** Gate 0: verifies the Bearer JWT (signature and expiry) and sets `req.auth`. No database read. */
++export const authenticate: RequestHandler = (req, _res, next) => {
++  const match = BEARER.exec(req.header('authorization') ?? '');
++  if (!match) throw new UnauthorizedError('Authentication required');
++  req.auth = verifyAccessToken(match[1]);
++  next();
++};
++
++/** The authenticated caller; throws `401` if `authenticate` did not run. */
++export function getAuth(req: Request): AuthContext {
++  if (!req.auth) throw new UnauthorizedError('Authentication required');
++  return req.auth;
++}
++
++/** Gate 1: the caller must hold one of `roles` (`403 FORBIDDEN_ROLE`). */
++export function requireRoles(...roles: UserRole[]): RequestHandler {
++  return (req, _res, next) => {
++    if (!roles.includes(getAuth(req).role)) {
++      throw new ForbiddenError('Role is not allowed to perform this action', 'FORBIDDEN_ROLE');
++    }
++    next();
++  };
++}
++
++/** Rejects a caller without a team (`403 INVALID_ACTION`) and returns the caller's team id. */
++export function requireTeam(auth: AuthContext): string {
++  if (auth.teamId === null) {
++    throw new ForbiddenError('Caller does not belong to a team', 'INVALID_ACTION');
++  }
++  return auth.teamId;
++}
++
++/** Gate 2: the resource must belong to the caller's team (`403 TEAM_ACCESS_DENIED`). */
++export function assertSameTeam(auth: AuthContext, resourceTeamId: string | null): void {
++  if (auth.teamId === null || resourceTeamId !== auth.teamId) {
++    throw new ForbiddenError('Resource belongs to another team', 'TEAM_ACCESS_DENIED');
++  }
++}
+diff --git a/backend/src/modules/identity/auth/password.ts b/backend/src/modules/identity/auth/password.ts
+new file mode 100644
+index 0000000..7092052
+--- /dev/null
++++ b/backend/src/modules/identity/auth/password.ts
+@@ -0,0 +1,31 @@
++import { randomBytes } from 'node:crypto';
++import argon2 from 'argon2';
++
++/** Argon2 with the library's default configuration (no custom cost parameters). */
++export function hashPassword(password: string): Promise<string> {
++  return argon2.hash(password);
++}
++
++export async function verifyPassword(hash: string, password: string): Promise<boolean> {
++  try {
++    return await argon2.verify(hash, password);
++  } catch {
++    return false;
++  }
++}
++
++let dummyHash: Promise<string> | undefined;
++
++/**
++ * Verifies `password` against `hash`, or against a throwaway hash when there is no user, so that
++ * an unknown email costs the same as a wrong password.
++ */
++export async function verifyPasswordOrDummy(
++  hash: string | undefined,
++  password: string,
++): Promise<boolean> {
++  if (hash !== undefined) return verifyPassword(hash, password);
++  dummyHash ??= hashPassword(randomBytes(16).toString('hex'));
++  await verifyPassword(await dummyHash, password);
++  return false;
++}
+diff --git a/backend/src/modules/identity/auth/rate-limit.spec.ts b/backend/src/modules/identity/auth/rate-limit.spec.ts
+new file mode 100644
+index 0000000..3170f20
+--- /dev/null
++++ b/backend/src/modules/identity/auth/rate-limit.spec.ts
+@@ -0,0 +1,39 @@
++import { blockDurationMs, RATE_LIMIT, rateLimitKeys } from './rate-limit.js';
++
++describe('rate limit ladder', () => {
++  it('escalates 10 min → 20 min → 60 min → 4 h, then blocks the IP', () => {
++    const minutes = [1, 2, 3, 4].map((n) => (blockDurationMs(n) ?? 0) / 60_000);
++    expect(minutes).toEqual([10, 20, 60, 240]);
++    expect(blockDurationMs(5)).toBeNull();
++  });
++
++  it('allows 10 requests per minute', () => {
++    expect(RATE_LIMIT.maxRequests).toBe(10);
++    expect(RATE_LIMIT.windowMs).toBe(60_000);
++  });
++});
++
++describe('rateLimitKeys', () => {
++  it('never embeds the raw email or IP', () => {
++    const keys = rateLimitKeys('login', '203.0.113.9', ['person@example.com']);
++    for (const key of Object.values(keys)) {
++      expect(key).not.toContain('person@example.com');
++      expect(key).not.toContain('203.0.113.9');
++    }
++  });
++
++  it('separates scopes, identities and IPs but shares the IP block', () => {
++    const base = rateLimitKeys('login', '1.1.1.1', ['a@x.com']);
++    expect(rateLimitKeys('refresh', '1.1.1.1', ['a@x.com']).count).not.toBe(base.count);
++    expect(rateLimitKeys('login', '1.1.1.1', ['b@x.com']).count).not.toBe(base.count);
++    expect(rateLimitKeys('login', '2.2.2.2', ['a@x.com']).count).not.toBe(base.count);
++    expect(rateLimitKeys('refresh', '1.1.1.1', ['b@x.com']).ipBlock).toBe(base.ipBlock);
++    expect(rateLimitKeys('login', '2.2.2.2', ['a@x.com']).ipBlock).not.toBe(base.ipBlock);
++  });
++
++  it('includes email and session id in the refresh key', () => {
++    const a = rateLimitKeys('refresh', '1.1.1.1', ['a@x.com', 's1']);
++    expect(rateLimitKeys('refresh', '1.1.1.1', ['a@x.com', 's2']).count).not.toBe(a.count);
++    expect(rateLimitKeys('refresh', '1.1.1.1', ['b@x.com', 's1']).count).not.toBe(a.count);
++  });
++});
+diff --git a/backend/src/modules/identity/auth/rate-limit.ts b/backend/src/modules/identity/auth/rate-limit.ts
+new file mode 100644
+index 0000000..10426cc
+--- /dev/null
++++ b/backend/src/modules/identity/auth/rate-limit.ts
+@@ -0,0 +1,122 @@
++import { createHash } from 'node:crypto';
++import type { Redis } from 'ioredis';
++import { getRedis } from '../../../infra/redis/redis.js';
++import { ServiceUnavailableError, TooManyRequestsError } from '../../../shared/errors/AppError.js';
++import { logger } from '../../../shared/observability/logger.js';
++
++export type RateLimitScope = 'login' | 'refresh';
++
++const MINUTE_MS = 60_000;
++const HOUR_MS = 60 * MINUTE_MS;
++
++export const RATE_LIMIT = {
++  maxRequests: 10,
++  windowMs: MINUTE_MS,
++  /** Block per consecutive violation: 10 min → 20 min → 60 min → 4 h, then the IP is blocked. */
++  blockStepsMs: [10 * MINUTE_MS, 20 * MINUTE_MS, 60 * MINUTE_MS, 4 * HOUR_MS],
++  ipBlockMs: 24 * HOUR_MS,
++  /** How long violations are remembered; each violation refreshes it. */
++  ladderMemoryMs: 24 * HOUR_MS,
++  unavailableRetryAfterSeconds: 5,
++} as const;
++
++/** Atomically checks blocks, counts the request, and escalates the ladder on a violation. */
++const CHECK_SCRIPT = `
++local ipTtl = redis.call('PTTL', KEYS[1])
++if ipTtl > 0 then return {1, ipTtl} end
++local blockTtl = redis.call('PTTL', KEYS[2])
++if blockTtl > 0 then return {1, blockTtl} end
++local count = redis.call('INCR', KEYS[3])
++if count == 1 then redis.call('PEXPIRE', KEYS[3], ARGV[2]) end
++if count <= tonumber(ARGV[1]) then return {0, 0} end
++redis.call('DEL', KEYS[3])
++local level = redis.call('INCR', KEYS[4])
++redis.call('PEXPIRE', KEYS[4], ARGV[3])
++local steps = #ARGV - 4
++if level > steps then
++  redis.call('SET', KEYS[1], '1', 'PX', ARGV[4])
++  return {1, tonumber(ARGV[4])}
++end
++local ms = tonumber(ARGV[4 + level])
++redis.call('SET', KEYS[2], '1', 'PX', ms)
++return {1, ms}
++`;
++
++/** Block duration (ms) for the n-th consecutive violation (1-based); `null` means block the IP. */
++export function blockDurationMs(violation: number): number | null {
++  return RATE_LIMIT.blockStepsMs[violation - 1] ?? null;
++}
++
++function digest(value: string): string {
++  return createHash('sha256').update(value).digest('hex').slice(0, 32);
++}
++
++/** Redis keys never contain raw emails or IPs. */
++export function rateLimitKeys(scope: RateLimitScope, ip: string, parts: readonly string[]) {
++  const id = digest([ip, ...parts].join('\n'));
++  return {
++    ipBlock: `rl:ip-block:${digest(ip)}`,
++    block: `rl:block:${scope}:${id}`,
++    count: `rl:count:${scope}:${id}`,
++    level: `rl:level:${scope}:${id}`,
++  };
++}
++
++/**
++ * Counts one attempt for (IP + `parts`) and throws `429 RATE_LIMITED` while blocked.
++ * Fails closed (`503 DEPENDENCY_UNAVAILABLE`) when Redis cannot be reached.
++ */
++export async function consumeRateLimit(
++  scope: RateLimitScope,
++  ip: string,
++  parts: readonly string[],
++  redis: Redis = getRedis(),
++): Promise<void> {
++  const keys = rateLimitKeys(scope, ip, parts);
++  let result: [number, number];
++  try {
++    result = (await redis.eval(
++      CHECK_SCRIPT,
++      4,
++      keys.ipBlock,
++      keys.block,
++      keys.count,
++      keys.level,
++      RATE_LIMIT.maxRequests,
++      RATE_LIMIT.windowMs,
++      RATE_LIMIT.ladderMemoryMs,
++      RATE_LIMIT.ipBlockMs,
++      ...RATE_LIMIT.blockStepsMs,
++    )) as [number, number];
++  } catch (err) {
++    logger.warn({ err }, 'Rate limiter unavailable');
++    throw new ServiceUnavailableError(
++      'Service temporarily unavailable',
++      'DEPENDENCY_UNAVAILABLE',
++      RATE_LIMIT.unavailableRetryAfterSeconds,
++    );
++  }
++
++  const [blocked, remainingMs] = result;
++  if (blocked === 1) {
++    throw new TooManyRequestsError(
++      'Too many requests',
++      'RATE_LIMITED',
++      Math.max(1, Math.ceil(remainingMs / 1000)),
++    );
++  }
++}
++
++/** Clears this key's request counter after a success. Best effort: never fails the request. */
++export async function resetRateLimit(
++  scope: RateLimitScope,
++  ip: string,
++  parts: readonly string[],
++  redis: Redis = getRedis(),
++): Promise<void> {
++  try {
++    await redis.del(rateLimitKeys(scope, ip, parts).count);
++  } catch (err) {
++    logger.warn({ err }, 'Rate limiter reset failed');
++  }
++}
+diff --git a/backend/src/modules/identity/auth/session.repository.ts b/backend/src/modules/identity/auth/session.repository.ts
+new file mode 100644
+index 0000000..a8581af
+--- /dev/null
++++ b/backend/src/modules/identity/auth/session.repository.ts
+@@ -0,0 +1,17 @@
++import type { Db } from '../transaction.js';
++
++/** Revokes every non-revoked session of the given users. */
++export async function revokeSessionsForUsers(db: Db, userIds: string[]): Promise<void> {
++  if (userIds.length === 0) return;
++  await db.userSession.updateMany({
++    where: { userId: { in: userIds }, revoked: false },
++    data: { revoked: true, updatedAt: new Date() },
++  });
++}
++
++export async function revokeSession(db: Db, sessionId: string, userId: string): Promise<void> {
++  await db.userSession.updateMany({
++    where: { id: sessionId, userId, revoked: false },
++    data: { revoked: true, updatedAt: new Date() },
++  });
++}
+diff --git a/backend/src/modules/identity/auth/tokens.spec.ts b/backend/src/modules/identity/auth/tokens.spec.ts
+new file mode 100644
+index 0000000..5a5966a
+--- /dev/null
++++ b/backend/src/modules/identity/auth/tokens.spec.ts
+@@ -0,0 +1,141 @@
++import { randomUUID } from 'node:crypto';
++import jwt from 'jsonwebtoken';
++
++process.env.NODE_ENV = 'test';
++process.env.PORT = '3000';
++process.env.DATABASE_URL = 'postgresql://u:p@localhost:5432/db';
++process.env.DIRECT_URL = 'postgresql://u:p@localhost:5432/db';
++process.env.REDIS_URL = 'redis://localhost:6379';
++process.env.JWT_SECRET = 'unit-test-secret';
++
++import {
++  buildRefreshToken,
++  clearedRefreshCookieHeader,
++  durationToSeconds,
++  generateRefreshSecret,
++  hashesMatch,
++  hashRefreshSecret,
++  parseRefreshToken,
++  readRefreshCookie,
++  refreshCookieHeader,
++  refreshTokenSeconds,
++  signAccessToken,
++  verifyAccessToken,
++} from './tokens.js';
++
++const claims = {
++  userId: randomUUID(),
++  email: 'a@example.com',
++  role: 'ENGINEER' as const,
++  teamId: randomUUID(),
++  sessionId: randomUUID(),
++};
++
++describe('durationToSeconds', () => {
++  it.each([
++    ['30s', 30],
++    ['15m', 900],
++    ['2h', 7200],
++    ['7d', 604800],
++  ])('%s → %i', (input, expected) => {
++    expect(durationToSeconds(input)).toBe(expected);
++  });
++
++  it('rejects malformed durations', () => {
++    expect(() => durationToSeconds('15')).toThrow();
++  });
++
++  it('defaults the refresh token to 7 days', () => {
++    expect(refreshTokenSeconds()).toBe(604800);
++  });
++});
++
++describe('access token', () => {
++  it('carries the documented claims and a 15 minute lifetime', () => {
++    const { token, expiresIn } = signAccessToken(claims);
++    const decoded = jwt.decode(token) as Record<string, unknown>;
++    expect(expiresIn).toBe(900);
++    expect(decoded).toMatchObject(claims);
++    expect((decoded.exp as number) - (decoded.iat as number)).toBe(900);
++    expect(verifyAccessToken(token)).toEqual(claims);
++  });
++
++  it('keeps a null teamId', () => {
++    const { token } = signAccessToken({ ...claims, teamId: null });
++    expect(verifyAccessToken(token).teamId).toBeNull();
++  });
++
++  it('rejects a wrong signature, an expired token, alg none and missing claims', () => {
++    const wrongSecret = jwt.sign(claims, 'other-secret');
++    const expired = jwt.sign(claims, 'unit-test-secret', { expiresIn: -10 });
++    const none = `${Buffer.from('{"alg":"none"}').toString('base64url')}.${Buffer.from(
++      JSON.stringify(claims),
++    ).toString('base64url')}.`;
++    const incomplete = jwt.sign({ userId: claims.userId }, 'unit-test-secret');
++    for (const token of [wrongSecret, expired, none, incomplete, 'garbage']) {
++      expect(() => verifyAccessToken(token)).toThrow(
++        expect.objectContaining({ statusCode: 401, code: 'UNAUTHENTICATED' }),
++      );
++    }
++  });
++});
++
++describe('refresh token', () => {
++  it('round-trips session id, email and secret', () => {
++    const secret = generateRefreshSecret();
++    const value = buildRefreshToken(claims.sessionId, 'Mixed@Example.com', secret);
++    expect(parseRefreshToken(value)).toEqual({
++      sessionId: claims.sessionId,
++      email: 'mixed@example.com',
++      secret,
++    });
++  });
++
++  it('generates distinct high-entropy secrets', () => {
++    expect(generateRefreshSecret()).not.toBe(generateRefreshSecret());
++    expect(generateRefreshSecret().length).toBeGreaterThanOrEqual(43);
++  });
++
++  it.each(['', 'a.b', 'not-a-uuid.YQ.secret', `${randomUUID()}.YQ.`, `${randomUUID()}.YQ.s.extra`])(
++    'rejects malformed value %p',
++    (value) => {
++      expect(parseRefreshToken(value)).toBeNull();
++    },
++  );
++
++  it('hashes deterministically and never returns the secret', () => {
++    const secret = generateRefreshSecret();
++    expect(hashRefreshSecret(secret)).toBe(hashRefreshSecret(secret));
++    expect(hashRefreshSecret(secret)).not.toContain(secret);
++    expect(hashRefreshSecret(secret)).toMatch(/^[0-9a-f]{64}$/);
++  });
++
++  it('compares hashes safely', () => {
++    const hash = hashRefreshSecret('x');
++    expect(hashesMatch(hash, hash)).toBe(true);
++    expect(hashesMatch(hash, hashRefreshSecret('y'))).toBe(false);
++    expect(hashesMatch(null, hash)).toBe(false);
++    expect(hashesMatch('short', hash)).toBe(false);
++  });
++});
++
++describe('refresh cookie', () => {
++  it('sets exactly the documented attributes', () => {
++    expect(refreshCookieHeader('v', 604800)).toBe(
++      'ims_refresh_cookie=v; Max-Age=604800; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Lax',
++    );
++  });
++
++  it('clears the cookie on the same path', () => {
++    expect(clearedRefreshCookieHeader()).toBe(
++      'ims_refresh_cookie=; Max-Age=0; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Lax',
++    );
++  });
++
++  it('reads the cookie among others and ignores an empty value', () => {
++    expect(readRefreshCookie('a=1; ims_refresh_cookie=abc.def; b=2')).toBe('abc.def');
++    expect(readRefreshCookie('ims_refresh_cookie=')).toBeUndefined();
++    expect(readRefreshCookie('other=1')).toBeUndefined();
++    expect(readRefreshCookie(undefined)).toBeUndefined();
++  });
++});
+diff --git a/backend/src/modules/identity/auth/tokens.ts b/backend/src/modules/identity/auth/tokens.ts
+new file mode 100644
+index 0000000..2494679
+--- /dev/null
++++ b/backend/src/modules/identity/auth/tokens.ts
+@@ -0,0 +1,113 @@
++import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
++import jwt from 'jsonwebtoken';
++import { z } from 'zod';
++import { getConfig } from '../../../config/env.js';
++import { UnauthorizedError } from '../../../shared/errors/AppError.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++
++export const REFRESH_COOKIE_NAME = 'ims_refresh_cookie';
++export const REFRESH_COOKIE_PATH = '/api/v1/auth';
++
++const UNITS_IN_SECONDS = { s: 1, m: 60, h: 3600, d: 86400 } as const;
++
++/** Converts a configured duration such as `15m` or `7d` to seconds. */
++export function durationToSeconds(duration: string): number {
++  const match = /^(\d+)([smhd])$/.exec(duration);
++  if (!match) throw new Error('Invalid duration');
++  return Number(match[1]) * UNITS_IN_SECONDS[match[2] as keyof typeof UNITS_IN_SECONDS];
++}
++
++export function refreshTokenSeconds(): number {
++  return durationToSeconds(getConfig().refreshTokenExpiry);
++}
++
++const accessClaimsSchema = z.object({
++  userId: z.uuid(),
++  email: z.string().min(1),
++  role: z.enum(['ENGINEER', 'TEAM_LEAD', 'ADMIN']),
++  teamId: z.uuid().nullable(),
++  sessionId: z.uuid(),
++});
++
++export function signAccessToken(claims: AuthContext): { token: string; expiresIn: number } {
++  const { jwtSecret, accessTokenExpiry } = getConfig();
++  const expiresIn = durationToSeconds(accessTokenExpiry);
++  const token = jwt.sign({ ...claims }, jwtSecret, { algorithm: 'HS256', expiresIn });
++  return { token, expiresIn };
++}
++
++/** Verifies signature and expiry only; never touches the database. */
++export function verifyAccessToken(token: string): AuthContext {
++  let decoded: string | jwt.JwtPayload;
++  try {
++    decoded = jwt.verify(token, getConfig().jwtSecret, { algorithms: ['HS256'] });
++  } catch {
++    throw new UnauthorizedError('Invalid or expired access token');
++  }
++  const claims = accessClaimsSchema.safeParse(decoded);
++  if (!claims.success) throw new UnauthorizedError('Invalid or expired access token');
++  return claims.data;
++}
++
++export type ParsedRefreshToken = { sessionId: string; email: string; secret: string };
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++const MAX_SECRET_LENGTH = 128;
++
++export function generateRefreshSecret(): string {
++  return randomBytes(32).toString('base64url');
++}
++
++/**
++ * The cookie value: `<sessionId>.<base64url(email)>.<secret>`. Only the secret is stored (hashed).
++ * The email is client-visible context for rate limiting; it is never trusted for authorization.
++ */
++export function buildRefreshToken(sessionId: string, email: string, secret: string): string {
++  return `${sessionId}.${Buffer.from(email, 'utf8').toString('base64url')}.${secret}`;
++}
++
++export function parseRefreshToken(value: string): ParsedRefreshToken | null {
++  const parts = value.split('.');
++  if (parts.length !== 3) return null;
++  const [sessionId, encodedEmail, secret] = parts;
++  if (!UUID.test(sessionId) || secret.length === 0 || secret.length > MAX_SECRET_LENGTH) {
++    return null;
++  }
++  const email = Buffer.from(encodedEmail, 'base64url').toString('utf8').toLowerCase();
++  return { sessionId, email, secret };
++}
++
++export function hashRefreshSecret(secret: string): string {
++  return createHash('sha256').update(secret).digest('hex');
++}
++
++/** Constant-time comparison of two hex digests. */
++export function hashesMatch(stored: string | null | undefined, candidate: string): boolean {
++  if (!stored) return false;
++  const a = Buffer.from(stored);
++  const b = Buffer.from(candidate);
++  return a.length === b.length && timingSafeEqual(a, b);
++}
++
++const COOKIE_ATTRIBUTES = `Path=${REFRESH_COOKIE_PATH}; HttpOnly; Secure; SameSite=Lax`;
++
++export function refreshCookieHeader(value: string, maxAgeSeconds: number): string {
++  return `${REFRESH_COOKIE_NAME}=${value}; Max-Age=${maxAgeSeconds}; ${COOKIE_ATTRIBUTES}`;
++}
++
++export function clearedRefreshCookieHeader(): string {
++  return `${REFRESH_COOKIE_NAME}=; Max-Age=0; ${COOKIE_ATTRIBUTES}`;
++}
++
++export function readRefreshCookie(cookieHeader: string | undefined): string | undefined {
++  if (!cookieHeader) return undefined;
++  for (const pair of cookieHeader.split(';')) {
++    const index = pair.indexOf('=');
++    if (index === -1) continue;
++    if (pair.slice(0, index).trim() === REFRESH_COOKIE_NAME) {
++      const value = pair.slice(index + 1).trim();
++      return value.length > 0 ? value : undefined;
++    }
++  }
++  return undefined;
++}
+diff --git a/backend/src/modules/identity/identity.common.ts b/backend/src/modules/identity/identity.common.ts
+new file mode 100644
+index 0000000..0844f30
+--- /dev/null
++++ b/backend/src/modules/identity/identity.common.ts
+@@ -0,0 +1,32 @@
++import { z } from 'zod';
++import { ForbiddenError, NotFoundError } from '../../shared/errors/AppError.js';
++
++export const uuidSchema = z.uuid();
++
++export const sortSchema = z.enum(['asc', 'desc']).default('asc');
++export const limitSchema = z.coerce.number().int().min(1).max(50).default(10);
++export const offsetSchema = z.coerce.number().int().min(0).default(0);
++
++export type Page<T> = { items: T[]; limit: number; offset: number; hasMore: boolean };
++
++/** Splits a `limit + 1` fetch into the page and its `hasMore` flag. */
++export function toPage<T>(rows: T[], limit: number, offset: number): Page<T> {
++  return { items: rows.slice(0, limit), limit, offset, hasMore: rows.length > limit };
++}
++
++export function pageResponse<T>(page: Page<T>) {
++  return {
++    data: page.items,
++    pagination: { limit: page.limit, offset: page.offset, hasMore: page.hasMore },
++  };
++}
++
++export function invalidAction(message: string): ForbiddenError {
++  return new ForbiddenError(message, 'INVALID_ACTION');
++}
++
++export function notFound(resource: 'team' | 'user', code: string): NotFoundError {
++  return new NotFoundError(`${resource === 'team' ? 'Team' : 'User'} not found`, code, [
++    { resource },
++  ]);
++}
+diff --git a/backend/src/modules/identity/identity.routes.ts b/backend/src/modules/identity/identity.routes.ts
+new file mode 100644
+index 0000000..efae6d1
+--- /dev/null
++++ b/backend/src/modules/identity/identity.routes.ts
+@@ -0,0 +1,77 @@
++import { Router } from 'express';
++import { requireJsonBody } from '../../shared/middleware/json-body.js';
++import {
++  loginHandler,
++  logoutAllHandler,
++  logoutHandler,
++  refreshHandler,
++} from './auth/auth.controller.js';
++import { authenticate, requireRoles } from './auth/guard.js';
++import {
++  createTeamHandler,
++  getTeamHandler,
++  listTeamsHandler,
++  updateTeamHandler,
++} from './teams/team.controller.js';
++import {
++  createUserHandler,
++  getUserHandler,
++  listTeamUsersHandler,
++  updateUserHandler,
++} from './users/user.controller.js';
++
++/** Routes of the identity module, to be mounted at `/api/v1`. */
++export function createIdentityRouter(): Router {
++  const router = Router();
++
++  router.post('/auth/login', requireJsonBody, loginHandler);
++  router.post('/auth/refresh', refreshHandler);
++  router.post('/auth/logout', authenticate, logoutHandler);
++  router.post('/auth/logout-all', authenticate, logoutAllHandler);
++
++  router.post(
++    '/identity/teams',
++    authenticate,
++    requireRoles('ADMIN'),
++    requireJsonBody,
++    createTeamHandler,
++  );
++  router.get('/identity/teams', authenticate, requireRoles('ADMIN'), listTeamsHandler);
++  router.get('/identity/teams/:teamId', authenticate, getTeamHandler);
++  router.patch(
++    '/identity/teams/:teamId',
++    authenticate,
++    requireRoles('ADMIN'),
++    requireJsonBody,
++    updateTeamHandler,
++  );
++
++  router.post(
++    '/identity/users',
++    authenticate,
++    requireRoles('ADMIN'),
++    requireJsonBody,
++    createUserHandler,
++  );
++  router.get(
++    '/identity/teams/:teamId/users',
++    authenticate,
++    requireRoles('ADMIN', 'TEAM_LEAD'),
++    listTeamUsersHandler,
++  );
++  router.get(
++    '/identity/users/:userId',
++    authenticate,
++    requireRoles('ADMIN', 'TEAM_LEAD'),
++    getUserHandler,
++  );
++  router.patch(
++    '/identity/users/:userId',
++    authenticate,
++    requireRoles('ADMIN'),
++    requireJsonBody,
++    updateUserHandler,
++  );
++
++  return router;
++}
+diff --git a/backend/src/modules/identity/index.ts b/backend/src/modules/identity/index.ts
+new file mode 100644
+index 0000000..6b3600b
+--- /dev/null
++++ b/backend/src/modules/identity/index.ts
+@@ -0,0 +1,3 @@
++export { authenticate, assertSameTeam, getAuth, requireRoles, requireTeam } from './auth/guard.js';
++export { createIdentityRouter } from './identity.routes.js';
++export { seedAdminUser, type SeedAdminInput } from './seed-admin.js';
+diff --git a/backend/src/modules/identity/seed-admin.ts b/backend/src/modules/identity/seed-admin.ts
+new file mode 100644
+index 0000000..55eeff9
+--- /dev/null
++++ b/backend/src/modules/identity/seed-admin.ts
+@@ -0,0 +1,30 @@
++import { isUniqueViolation } from '../../infra/db/errors.js';
++import { getPrisma } from '../../infra/db/prisma.js';
++import { hashPassword } from './auth/password.js';
++
++export type SeedAdminInput = { name: string; email: string; password: string };
++
++/**
++ * Creates an `ADMIN` user unless one with this email already exists (idempotent by email).
++ * Returns whether a user was created.
++ */
++export async function seedAdminUser(input: SeedAdminInput): Promise<boolean> {
++  const db = getPrisma();
++  const email = input.email.toLowerCase();
++  if (await db.user.findUnique({ where: { email }, select: { id: true } })) return false;
++
++  try {
++    await db.user.create({
++      data: {
++        name: input.name,
++        email,
++        passwordHash: await hashPassword(input.password),
++        role: 'ADMIN',
++      },
++    });
++    return true;
++  } catch (error) {
++    if (isUniqueViolation(error)) return false;
++    throw error;
++  }
++}
+diff --git a/backend/src/modules/identity/teams/team.controller.ts b/backend/src/modules/identity/teams/team.controller.ts
+new file mode 100644
+index 0000000..e3234d6
+--- /dev/null
++++ b/backend/src/modules/identity/teams/team.controller.ts
+@@ -0,0 +1,32 @@
++import type { RequestHandler } from 'express';
++import { parseOrThrow } from '../../../shared/errors/zod.js';
++import { getAuth } from '../auth/guard.js';
++import { pageResponse } from '../identity.common.js';
++import * as teamService from './team.service.js';
++import {
++  createTeamBodySchema,
++  listTeamsQuerySchema,
++  teamParamsSchema,
++  updateTeamBodySchema,
++} from './team.schema.js';
++
++export const createTeamHandler: RequestHandler = async (req, res) => {
++  const body = parseOrThrow(createTeamBodySchema, req.body);
++  res.status(201).json({ data: await teamService.createTeam(body.name) });
++};
++
++export const listTeamsHandler: RequestHandler = async (req, res) => {
++  const query = parseOrThrow(listTeamsQuerySchema, req.query);
++  res.status(200).json(pageResponse(await teamService.listTeams(query)));
++};
++
++export const getTeamHandler: RequestHandler = async (req, res) => {
++  const { teamId } = parseOrThrow(teamParamsSchema, req.params);
++  res.status(200).json({ data: await teamService.getTeam(getAuth(req), teamId) });
++};
++
++export const updateTeamHandler: RequestHandler = async (req, res) => {
++  const { teamId } = parseOrThrow(teamParamsSchema, req.params);
++  const body = parseOrThrow(updateTeamBodySchema, req.body);
++  res.status(200).json({ data: await teamService.updateTeam(teamId, body) });
++};
+diff --git a/backend/src/modules/identity/teams/team.mapper.ts b/backend/src/modules/identity/teams/team.mapper.ts
+new file mode 100644
+index 0000000..c03d9db
+--- /dev/null
++++ b/backend/src/modules/identity/teams/team.mapper.ts
+@@ -0,0 +1,19 @@
++import type { Team } from '../../../generated/prisma/client.js';
++
++export type TeamResponse = {
++  id: string;
++  name: string;
++  status: 'ACTIVE' | 'DEACTIVATED';
++  createdAt: Date;
++  updatedAt: Date;
++};
++
++export function toTeamResponse(team: Team): TeamResponse {
++  return {
++    id: team.id,
++    name: team.name,
++    status: team.status,
++    createdAt: team.createdAt,
++    updatedAt: team.updatedAt,
++  };
++}
+diff --git a/backend/src/modules/identity/teams/team.repository.ts b/backend/src/modules/identity/teams/team.repository.ts
+new file mode 100644
+index 0000000..16493ca
+--- /dev/null
++++ b/backend/src/modules/identity/teams/team.repository.ts
+@@ -0,0 +1,58 @@
++import type { Db } from '../transaction.js';
++import type { ListTeamsQuery } from './team.schema.js';
++
++/** Statuses that make an incident "unresolved". */
++export const UNRESOLVED_INCIDENT_STATUSES = ['OPEN', 'ACKNOWLEDGED', 'MITIGATING'] as const;
++
++export function createTeam(db: Db, name: string) {
++  return db.team.create({ data: { name } });
++}
++
++export function findTeamById(db: Db, id: string) {
++  return db.team.findUnique({ where: { id } });
++}
++
++/** Fetches `limit + 1` rows so the caller can compute `hasMore`. */
++export function listTeams(db: Db, query: ListTeamsQuery) {
++  return db.team.findMany({
++    orderBy: [{ [query.orderBy]: query.sort }, { id: query.sort }],
++    skip: query.offset,
++    take: query.limit + 1,
++  });
++}
++
++export function updateTeam(
++  db: Db,
++  id: string,
++  data: { name?: string; status?: 'ACTIVE' | 'DEACTIVATED' },
++) {
++  return db.team.update({ where: { id }, data: { ...data, updatedAt: new Date() } });
++}
++
++/** Read-only: unresolved incidents of the team (the `Incident` table belongs to another slice). */
++export async function hasUnresolvedIncidents(db: Db, teamId: string): Promise<boolean> {
++  const found = await db.incident.findFirst({
++    where: { teamId, status: { in: [...UNRESOLVED_INCIDENT_STATUSES] } },
++    select: { id: true },
++  });
++  return found !== null;
++}
++
++/** Read-only: services still attached to the team, whatever their status. */
++export async function hasAttachedServices(db: Db, teamId: string): Promise<boolean> {
++  const found = await db.appService.findFirst({ where: { teamId }, select: { id: true } });
++  return found !== null;
++}
++
++/** Removes every user from the team (`teamId` and `leadId` to null); returns the affected ids. */
++export async function detachUsersFromTeam(db: Db, teamId: string): Promise<string[]> {
++  const members = await db.user.findMany({ where: { teamId }, select: { id: true } });
++  const ids = members.map((member) => member.id);
++  if (ids.length > 0) {
++    await db.user.updateMany({
++      where: { id: { in: ids } },
++      data: { teamId: null, leadId: null, updatedAt: new Date() },
++    });
++  }
++  return ids;
++}
+diff --git a/backend/src/modules/identity/teams/team.schema.ts b/backend/src/modules/identity/teams/team.schema.ts
+new file mode 100644
+index 0000000..8ba57f3
+--- /dev/null
++++ b/backend/src/modules/identity/teams/team.schema.ts
+@@ -0,0 +1,28 @@
++import { z } from 'zod';
++import { limitSchema, offsetSchema, sortSchema, uuidSchema } from '../identity.common.js';
++
++const teamName = z.string().min(1).max(50);
++const teamStatus = z.enum(['ACTIVE', 'DEACTIVATED']);
++
++export const createTeamBodySchema = z.object({ name: teamName }).strict();
++
++export const updateTeamBodySchema = z
++  .object({ name: teamName.optional(), status: teamStatus.optional() })
++  .strict()
++  .refine((body) => body.name !== undefined || body.status !== undefined, {
++    message: 'At least one field is required',
++  });
++
++export const teamParamsSchema = z.object({ teamId: uuidSchema }).strict();
++
++export const listTeamsQuerySchema = z
++  .object({
++    limit: limitSchema,
++    offset: offsetSchema,
++    orderBy: z.enum(['name', 'createdAt']).default('name'),
++    sort: sortSchema,
++  })
++  .strict();
++
++export type UpdateTeamBody = z.output<typeof updateTeamBodySchema>;
++export type ListTeamsQuery = z.output<typeof listTeamsQuerySchema>;
+diff --git a/backend/src/modules/identity/teams/team.service.ts b/backend/src/modules/identity/teams/team.service.ts
+new file mode 100644
+index 0000000..173bd70
+--- /dev/null
++++ b/backend/src/modules/identity/teams/team.service.ts
+@@ -0,0 +1,77 @@
++import { isUniqueViolation } from '../../../infra/db/errors.js';
++import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
++import { ConflictError } from '../../../shared/errors/AppError.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import { assertSameTeam, requireTeam } from '../auth/guard.js';
++import { revokeSessionsForUsers } from '../auth/session.repository.js';
++import { invalidAction, notFound, toPage, type Page } from '../identity.common.js';
++import { runIdentityTransaction } from '../transaction.js';
++import { toTeamResponse, type TeamResponse } from './team.mapper.js';
++import {
++  createTeam as insertTeam,
++  detachUsersFromTeam,
++  findTeamById,
++  hasAttachedServices,
++  hasUnresolvedIncidents,
++  listTeams as selectTeams,
++  updateTeam as writeTeam,
++} from './team.repository.js';
++import type { ListTeamsQuery, UpdateTeamBody } from './team.schema.js';
++
++const duplicateTeam = () => new ConflictError('Team name already exists', 'DUPLICATE_TEAM');
++const teamNotFound = () => notFound('team', 'TEAM_NOT_FOUND');
++
++export async function createTeam(name: string): Promise<TeamResponse> {
++  try {
++    return toTeamResponse(await insertTeam(getPrisma(), name));
++  } catch (error) {
++    if (isUniqueViolation(error)) throw duplicateTeam();
++    throw error;
++  }
++}
++
++export async function listTeams(query: ListTeamsQuery): Promise<Page<TeamResponse>> {
++  const rows = await selectTeams(getPrisma(), query);
++  return toPage(rows.map(toTeamResponse), query.limit, query.offset);
++}
++
++export async function getTeam(auth: AuthContext, teamId: string): Promise<TeamResponse> {
++  if (auth.role !== 'ADMIN') {
++    requireTeam(auth);
++    assertSameTeam(auth, teamId);
++  }
++  const team = await findTeamById(getPrisma(), teamId);
++  if (!team) throw teamNotFound();
++  return toTeamResponse(team);
++}
++
++export async function updateTeam(teamId: string, body: UpdateTeamBody): Promise<TeamResponse> {
++  try {
++    return await runIdentityTransaction(async (tx) => {
++      if (!(await lockRowForUpdate(tx, 'Team', teamId))) throw teamNotFound();
++      const team = await findTeamById(tx, teamId);
++      if (!team) throw teamNotFound();
++
++      const deactivating = body.status === 'DEACTIVATED' && team.status === 'ACTIVE';
++      if (deactivating) {
++        // Open incidents take precedence over attached services when both apply.
++        if (await hasUnresolvedIncidents(tx, teamId)) {
++          throw new ConflictError('Team has unresolved incidents', 'TEAM_WITH_OPEN_INCIDENT');
++        }
++        if (await hasAttachedServices(tx, teamId)) {
++          throw invalidAction('Reassign the team services before deactivating it');
++        }
++      }
++
++      const updated = await writeTeam(tx, teamId, { name: body.name, status: body.status });
++      if (deactivating) {
++        const userIds = await detachUsersFromTeam(tx, teamId);
++        await revokeSessionsForUsers(tx, userIds);
++      }
++      return toTeamResponse(updated);
++    });
++  } catch (error) {
++    if (isUniqueViolation(error)) throw duplicateTeam();
++    throw error;
++  }
++}
+diff --git a/backend/src/modules/identity/transaction.ts b/backend/src/modules/identity/transaction.ts
+new file mode 100644
+index 0000000..1a431c9
+--- /dev/null
++++ b/backend/src/modules/identity/transaction.ts
+@@ -0,0 +1,22 @@
++import { isConcurrencyFailure } from '../../infra/db/errors.js';
++import { runInTransaction, type TransactionClient } from '../../infra/db/prisma.js';
++import { ConflictError } from '../../shared/errors/AppError.js';
++
++export type Db = TransactionClient;
++
++/** Runs `work` in one transaction; lock timeouts and deadlocks become `409 CONCURRENCY_CONFLICT`. */
++export async function runIdentityTransaction<T>(work: (tx: Db) => Promise<T>): Promise<T> {
++  try {
++    return await runInTransaction(work);
++  } catch (error) {
++    if (isConcurrencyFailure(error)) throw concurrencyConflict();
++    throw error;
++  }
++}
++
++export function concurrencyConflict(): ConflictError {
++  return new ConflictError(
++    'The request conflicted with a concurrent change; retry',
++    'CONCURRENCY_CONFLICT',
++  );
++}
+diff --git a/backend/src/modules/identity/users/user-update.rules.spec.ts b/backend/src/modules/identity/users/user-update.rules.spec.ts
+new file mode 100644
+index 0000000..138a9ae
+--- /dev/null
++++ b/backend/src/modules/identity/users/user-update.rules.spec.ts
+@@ -0,0 +1,278 @@
++import { planUserUpdate, type UpdateFacts, type UpdateTarget } from './user-update.rules.js';
++
++const TEAM_A = 'a0000000-0000-4000-8000-00000000000a';
++const TEAM_B = 'b0000000-0000-4000-8000-00000000000b';
++const LEAD = 'c0000000-0000-4000-8000-00000000000c';
++
++const engineer: UpdateTarget = {
++  id: 'e0000000-0000-4000-8000-00000000000e',
++  role: 'ENGINEER',
++  status: 'ACTIVE',
++  teamId: TEAM_A,
++  leadId: LEAD,
++};
++const teamLead: UpdateTarget = { ...engineer, id: LEAD, role: 'TEAM_LEAD', leadId: null };
++const admin: UpdateTarget = { ...engineer, role: 'ADMIN', leadId: null };
++
++const noFacts: UpdateFacts = {
++  newTeam: null,
++  lead: null,
++  assignedToUnresolvedIncident: false,
++  reportingUsers: 0,
++};
++const activeTeam = { status: 'ACTIVE' as const };
++const activeLead = { role: 'TEAM_LEAD' as const, status: 'ACTIVE' as const, teamId: TEAM_A };
++
++const fails = (code: string, status: number) =>
++  expect.objectContaining({ code, statusCode: status });
++
++describe('planUserUpdate', () => {
++  describe('plain fields', () => {
++    it('updates the name without revoking sessions', () => {
++      expect(planUserUpdate(engineer, { name: 'New' }, noFacts)).toEqual({
++        data: { name: 'New' },
++        revokeSessions: false,
++      });
++    });
++
++    it('revokes sessions when a password is provided', () => {
++      const plan = planUserUpdate(engineer, { password: 'longenough1' }, noFacts);
++      expect(plan).toEqual({ data: {}, revokeSessions: true });
++    });
++
++    it('treats a role, team or status equal to the current value as no change', () => {
++      const plan = planUserUpdate(
++        engineer,
++        { role: 'ENGINEER', status: 'ACTIVE', teamId: TEAM_A },
++        { ...noFacts, newTeam: activeTeam },
++      );
++      expect(plan).toEqual({ data: {}, revokeSessions: false });
++    });
++  });
++
++  describe('teamId', () => {
++    it('rejects a missing or deactivated team with 403 INVALID_ACTION', () => {
++      for (const newTeam of [null, { status: 'DEACTIVATED' as const }]) {
++        expect(() => planUserUpdate(engineer, { teamId: TEAM_B }, { ...noFacts, newTeam })).toThrow(
++          fails('INVALID_ACTION', 403),
++        );
++      }
++    });
++
++    it('changing team clears the lead and revokes sessions', () => {
++      const plan = planUserUpdate(
++        engineer,
++        { teamId: TEAM_B },
++        { ...noFacts, newTeam: activeTeam },
++      );
++      expect(plan).toEqual({ data: { teamId: TEAM_B, leadId: null }, revokeSessions: true });
++    });
++
++    it('setting a team on a user without one needs no incident check', () => {
++      const unassigned = { ...engineer, teamId: null, leadId: null };
++      const plan = planUserUpdate(
++        unassigned,
++        { teamId: TEAM_A },
++        { ...noFacts, newTeam: activeTeam, assignedToUnresolvedIncident: true },
++      );
++      expect(plan.data).toEqual({ teamId: TEAM_A });
++    });
++
++    it('rejects moving a user who is acknowledgedBy an unresolved incident', () => {
++      expect(() =>
++        planUserUpdate(
++          engineer,
++          { teamId: TEAM_B },
++          { ...noFacts, newTeam: activeTeam, assignedToUnresolvedIncident: true },
++        ),
++      ).toThrow(fails('USER_ASSIGNED_CURRENTLY', 409));
++    });
++
++    it('rejects moving a Team Lead who still has engineers', () => {
++      expect(() =>
++        planUserUpdate(
++          teamLead,
++          { teamId: TEAM_B },
++          { ...noFacts, newTeam: activeTeam, reportingUsers: 2 },
++        ),
++      ).toThrow(fails('CONFLICT_STILL_HAS_ENGINEERS', 409));
++    });
++
++    it('validates a leadId sent in the same request against the resulting team', () => {
++      const lead = { ...activeLead, teamId: TEAM_B };
++      const plan = planUserUpdate(
++        engineer,
++        { teamId: TEAM_B, leadId: LEAD },
++        { ...noFacts, newTeam: activeTeam, lead },
++      );
++      expect(plan.data).toEqual({ teamId: TEAM_B });
++      expect(() =>
++        planUserUpdate(
++          engineer,
++          { teamId: TEAM_B, leadId: LEAD },
++          { ...noFacts, newTeam: activeTeam, lead: activeLead },
++        ),
++      ).toThrow(fails('INVALID_ACTION', 403));
++    });
++  });
++
++  describe('leadId', () => {
++    it('accepts an active Team Lead of the same team', () => {
++      const unled = { ...engineer, leadId: null };
++      const plan = planUserUpdate(unled, { leadId: LEAD }, { ...noFacts, lead: activeLead });
++      expect(plan).toEqual({ data: { leadId: LEAD }, revokeSessions: false });
++    });
++
++    it.each([
++      ['missing', null],
++      ['deactivated', { ...activeLead, status: 'DEACTIVATED' as const }],
++      ['not a Team Lead', { ...activeLead, role: 'ENGINEER' as const }],
++      ['in another team', { ...activeLead, teamId: TEAM_B }],
++    ])('rejects a lead that is %s', (_name, lead) => {
++      expect(() => planUserUpdate(engineer, { leadId: LEAD }, { ...noFacts, lead })).toThrow(
++        fails('INVALID_ACTION', 403),
++      );
++    });
++
++    it('rejects a leadId for an Admin, for a Team Lead and when the user has no team', () => {
++      expect(() =>
++        planUserUpdate(admin, { leadId: LEAD }, { ...noFacts, lead: activeLead }),
++      ).toThrow(fails('INVALID_ACTION', 403));
++      expect(() =>
++        planUserUpdate(teamLead, { leadId: LEAD }, { ...noFacts, lead: activeLead }),
++      ).toThrow(fails('INVALID_ACTION', 403));
++      const teamless = { ...engineer, teamId: null, leadId: null };
++      expect(() =>
++        planUserUpdate(teamless, { leadId: LEAD }, { ...noFacts, lead: activeLead }),
++      ).toThrow(fails('INVALID_ACTION', 403));
++    });
++
++    it('rejects a leadId that would make an engineer a Team Lead of someone in the same request', () => {
++      expect(() =>
++        planUserUpdate(
++          engineer,
++          { role: 'TEAM_LEAD', leadId: LEAD },
++          { ...noFacts, lead: activeLead },
++        ),
++      ).toThrow(fails('INVALID_ACTION', 403));
++    });
++
++    it('rejects a user as their own lead', () => {
++      const demoting = { ...teamLead };
++      expect(() =>
++        planUserUpdate(
++          demoting,
++          { role: 'ENGINEER', leadId: LEAD },
++          { ...noFacts, lead: activeLead },
++        ),
++      ).toThrow(fails('INVALID_ACTION', 403));
++    });
++  });
++
++  describe('role', () => {
++    it('forbids any role change on an Admin', () => {
++      expect(() => planUserUpdate(admin, { role: 'ENGINEER' }, noFacts)).toThrow(
++        fails('INVALID_ACTION', 403),
++      );
++    });
++
++    it('still lets an Admin be updated in other fields', () => {
++      const plan = planUserUpdate(
++        admin,
++        { name: 'Root', status: 'DEACTIVATED', teamId: TEAM_B },
++        { ...noFacts, newTeam: activeTeam },
++      );
++      expect(plan.data).toEqual({ name: 'Root', status: 'DEACTIVATED', teamId: TEAM_B });
++      expect(plan.revokeSessions).toBe(true);
++    });
++
++    it('ENGINEER → TEAM_LEAD clears the lead and revokes sessions', () => {
++      expect(planUserUpdate(engineer, { role: 'TEAM_LEAD' }, noFacts)).toEqual({
++        data: { role: 'TEAM_LEAD', leadId: null },
++        revokeSessions: true,
++      });
++    });
++
++    it('TEAM_LEAD → ENGINEER is allowed without engineers and rejected with them', () => {
++      expect(planUserUpdate(teamLead, { role: 'ENGINEER' }, noFacts).data).toEqual({
++        role: 'ENGINEER',
++      });
++      expect(() =>
++        planUserUpdate(teamLead, { role: 'ENGINEER' }, { ...noFacts, reportingUsers: 1 }),
++      ).toThrow(fails('CONFLICT_STILL_HAS_ENGINEERS', 409));
++    });
++
++    it('any role change is rejected while acknowledgedBy an unresolved incident', () => {
++      for (const [target, role] of [
++        [engineer, 'TEAM_LEAD'],
++        [teamLead, 'ENGINEER'],
++      ] as const) {
++        expect(() =>
++          planUserUpdate(target, { role }, { ...noFacts, assignedToUnresolvedIncident: true }),
++        ).toThrow(fails('USER_ASSIGNED_CURRENTLY', 409));
++      }
++    });
++  });
++
++  describe('status', () => {
++    it('deactivates and reactivates, revoking sessions', () => {
++      expect(planUserUpdate(engineer, { status: 'DEACTIVATED' }, noFacts)).toEqual({
++        data: { status: 'DEACTIVATED' },
++        revokeSessions: true,
++      });
++      const inactive = { ...engineer, status: 'DEACTIVATED' as const };
++      expect(planUserUpdate(inactive, { status: 'ACTIVE' }, noFacts).data).toEqual({
++        status: 'ACTIVE',
++      });
++    });
++
++    it('rejects deactivating a user acknowledgedBy an unresolved incident', () => {
++      expect(() =>
++        planUserUpdate(
++          engineer,
++          { status: 'DEACTIVATED' },
++          { ...noFacts, assignedToUnresolvedIncident: true },
++        ),
++      ).toThrow(fails('USER_ASSIGNED_CURRENTLY', 409));
++    });
++
++    it('reactivating an assigned user is allowed', () => {
++      const inactive = { ...engineer, status: 'DEACTIVATED' as const };
++      expect(() =>
++        planUserUpdate(
++          inactive,
++          { status: 'ACTIVE' },
++          { ...noFacts, assignedToUnresolvedIncident: true },
++        ),
++      ).not.toThrow();
++    });
++
++    it('rejects deactivating a Team Lead who still has engineers', () => {
++      expect(() =>
++        planUserUpdate(teamLead, { status: 'DEACTIVATED' }, { ...noFacts, reportingUsers: 3 }),
++      ).toThrow(fails('CONFLICT_STILL_HAS_ENGINEERS', 409));
++    });
++  });
++
++  describe('precedence', () => {
++    it('USER_ASSIGNED_CURRENTLY wins when both 409s apply', () => {
++      expect(() =>
++        planUserUpdate(
++          teamLead,
++          { status: 'DEACTIVATED' },
++          { ...noFacts, assignedToUnresolvedIncident: true, reportingUsers: 2 },
++        ),
++      ).toThrow(fails('USER_ASSIGNED_CURRENTLY', 409));
++    });
++
++    it('403 INVALID_ACTION is reported before any 409', () => {
++      expect(() =>
++        planUserUpdate(
++          teamLead,
++          { teamId: TEAM_B },
++          { ...noFacts, newTeam: null, assignedToUnresolvedIncident: true, reportingUsers: 2 },
++        ),
++      ).toThrow(fails('INVALID_ACTION', 403));
++    });
++  });
++});
+diff --git a/backend/src/modules/identity/users/user-update.rules.ts b/backend/src/modules/identity/users/user-update.rules.ts
+new file mode 100644
+index 0000000..0ca30b8
+--- /dev/null
++++ b/backend/src/modules/identity/users/user-update.rules.ts
+@@ -0,0 +1,107 @@
++import { ConflictError } from '../../../shared/errors/AppError.js';
++import { invalidAction } from '../identity.common.js';
++import type { UpdateUserBody } from './user.schema.js';
++
++type Role = 'ENGINEER' | 'TEAM_LEAD' | 'ADMIN';
++type Status = 'ACTIVE' | 'DEACTIVATED';
++
++export type UpdateTarget = {
++  id: string;
++  role: Role;
++  status: Status;
++  teamId: string | null;
++  leadId: string | null;
++};
++
++/** State read under lock that the rules need. `null` means "referenced row does not exist". */
++export type UpdateFacts = {
++  newTeam: { status: Status } | null;
++  lead: { role: Role; status: Status; teamId: string | null } | null;
++  assignedToUnresolvedIncident: boolean;
++  reportingUsers: number;
++};
++
++export type UserUpdatePlan = {
++  data: {
++    name?: string;
++    role?: 'ENGINEER' | 'TEAM_LEAD';
++    status?: Status;
++    teamId?: string;
++    leadId?: string | null;
++  };
++  revokeSessions: boolean;
++};
++
++const assignedCurrently = () =>
++  new ConflictError('User is assigned to an unresolved incident', 'USER_ASSIGNED_CURRENTLY');
++const stillHasEngineers = () =>
++  new ConflictError('Team Lead still has engineers', 'CONFLICT_STILL_HAS_ENGINEERS');
++
++/**
++ * Applies the U4 rules to the locked target and returns what to write. Throws `403 INVALID_ACTION`
++ * for invalid references first, then the `409`s (`USER_ASSIGNED_CURRENTLY` wins over
++ * `CONFLICT_STILL_HAS_ENGINEERS`).
++ */
++export function planUserUpdate(
++  target: UpdateTarget,
++  body: UpdateUserBody,
++  facts: UpdateFacts,
++): UserUpdatePlan {
++  if (target.role === 'ADMIN' && body.role !== undefined) {
++    throw invalidAction('The role of an Admin cannot be changed');
++  }
++
++  const teamProvided = body.teamId !== undefined;
++  if (teamProvided && (!facts.newTeam || facts.newTeam.status !== 'ACTIVE')) {
++    throw invalidAction('teamId must reference an active team');
++  }
++  const teamChanged = teamProvided && body.teamId !== target.teamId;
++  const resultingTeamId = teamChanged ? (body.teamId ?? null) : target.teamId;
++  const roleChanged = body.role !== undefined && body.role !== target.role;
++  const resultingRole: Role = body.role ?? target.role;
++  const statusChanged = body.status !== undefined && body.status !== target.status;
++
++  let leadId = target.leadId;
++  if (teamChanged || (roleChanged && resultingRole === 'TEAM_LEAD')) leadId = null;
++
++  if (body.leadId !== undefined) {
++    if (resultingRole !== 'ENGINEER') throw invalidAction('Only engineers can have a lead');
++    if (resultingTeamId === null) throw invalidAction('leadId requires the user to have a team');
++    const lead = facts.lead;
++    const validLead =
++      body.leadId !== target.id &&
++      lead !== null &&
++      lead.status === 'ACTIVE' &&
++      lead.role === 'TEAM_LEAD' &&
++      lead.teamId === resultingTeamId;
++    if (!validLead)
++      throw invalidAction('leadId must reference an active Team Lead of the same team');
++    leadId = body.leadId;
++  }
++
++  const movingOutOfTeam = teamChanged && target.teamId !== null;
++  const deactivating = statusChanged && body.status === 'DEACTIVATED';
++
++  if (facts.assignedToUnresolvedIncident && (movingOutOfTeam || roleChanged || deactivating)) {
++    throw assignedCurrently();
++  }
++  if (
++    target.role === 'TEAM_LEAD' &&
++    facts.reportingUsers > 0 &&
++    ((roleChanged && resultingRole === 'ENGINEER') || deactivating || movingOutOfTeam)
++  ) {
++    throw stillHasEngineers();
++  }
++
++  const data: UserUpdatePlan['data'] = {};
++  if (body.name !== undefined) data.name = body.name;
++  if (roleChanged && body.role !== undefined) data.role = body.role;
++  if (statusChanged && body.status !== undefined) data.status = body.status;
++  if (teamChanged && body.teamId !== undefined) data.teamId = body.teamId;
++  if (leadId !== target.leadId) data.leadId = leadId;
++
++  return {
++    data,
++    revokeSessions: body.password !== undefined || roleChanged || teamChanged || statusChanged,
++  };
++}
+diff --git a/backend/src/modules/identity/users/user.controller.ts b/backend/src/modules/identity/users/user.controller.ts
+new file mode 100644
+index 0000000..c4e39b4
+--- /dev/null
++++ b/backend/src/modules/identity/users/user.controller.ts
+@@ -0,0 +1,34 @@
++import type { RequestHandler } from 'express';
++import { parseOrThrow } from '../../../shared/errors/zod.js';
++import { getAuth } from '../auth/guard.js';
++import { pageResponse } from '../identity.common.js';
++import * as userService from './user.service.js';
++import {
++  createUserBodySchema,
++  listUsersQuerySchema,
++  teamUsersParamsSchema,
++  updateUserBodySchema,
++  userParamsSchema,
++} from './user.schema.js';
++
++export const createUserHandler: RequestHandler = async (req, res) => {
++  const body = parseOrThrow(createUserBodySchema, req.body);
++  res.status(201).json({ data: await userService.createUser(body) });
++};
++
++export const listTeamUsersHandler: RequestHandler = async (req, res) => {
++  const { teamId } = parseOrThrow(teamUsersParamsSchema, req.params);
++  const query = parseOrThrow(listUsersQuerySchema, req.query);
++  res.status(200).json(pageResponse(await userService.listTeamUsers(getAuth(req), teamId, query)));
++};
++
++export const getUserHandler: RequestHandler = async (req, res) => {
++  const { userId } = parseOrThrow(userParamsSchema, req.params);
++  res.status(200).json({ data: await userService.getUser(getAuth(req), userId) });
++};
++
++export const updateUserHandler: RequestHandler = async (req, res) => {
++  const { userId } = parseOrThrow(userParamsSchema, req.params);
++  const body = parseOrThrow(updateUserBodySchema, req.body);
++  res.status(200).json({ data: await userService.updateUser(userId, body) });
++};
+diff --git a/backend/src/modules/identity/users/user.mapper.ts b/backend/src/modules/identity/users/user.mapper.ts
+new file mode 100644
+index 0000000..9b219eb
+--- /dev/null
++++ b/backend/src/modules/identity/users/user.mapper.ts
+@@ -0,0 +1,28 @@
++import type { User } from '../../../generated/prisma/client.js';
++
++export type UserResponse = {
++  id: string;
++  name: string;
++  email: string;
++  role: 'ENGINEER' | 'TEAM_LEAD' | 'ADMIN';
++  status: 'ACTIVE' | 'DEACTIVATED';
++  teamId: string | null;
++  leadId: string | null;
++  createdAt: Date;
++  updatedAt: Date;
++};
++
++/** Explicit field list: `passwordHash` can never leak into a response. */
++export function toUserResponse(user: User): UserResponse {
++  return {
++    id: user.id,
++    name: user.name,
++    email: user.email,
++    role: user.role,
++    status: user.status,
++    teamId: user.teamId,
++    leadId: user.leadId,
++    createdAt: user.createdAt,
++    updatedAt: user.updatedAt,
++  };
++}
+diff --git a/backend/src/modules/identity/users/user.repository.ts b/backend/src/modules/identity/users/user.repository.ts
+new file mode 100644
+index 0000000..3471527
+--- /dev/null
++++ b/backend/src/modules/identity/users/user.repository.ts
+@@ -0,0 +1,61 @@
++import type { Role, currentStatus } from '../../../generated/prisma/client.js';
++import type { Db } from '../transaction.js';
++import { UNRESOLVED_INCIDENT_STATUSES } from '../teams/team.repository.js';
++import type { ListUsersQuery } from './user.schema.js';
++
++export function createUser(
++  db: Db,
++  data: {
++    name: string;
++    email: string;
++    passwordHash: string;
++    role: Role;
++    teamId: string | null;
++    leadId: string | null;
++  },
++) {
++  return db.user.create({ data });
++}
++
++export function findUserById(db: Db, id: string) {
++  return db.user.findUnique({ where: { id } });
++}
++
++/** Fetches `limit + 1` rows so the caller can compute `hasMore`. */
++export function listUsersOfTeam(db: Db, teamId: string, query: ListUsersQuery) {
++  return db.user.findMany({
++    where: { teamId, role: query.role, status: query.status },
++    orderBy: [{ [query.orderBy]: query.sort }, { id: query.sort }],
++    skip: query.offset,
++    take: query.limit + 1,
++  });
++}
++
++export function updateUser(
++  db: Db,
++  id: string,
++  data: {
++    name?: string;
++    passwordHash?: string;
++    role?: Role;
++    status?: currentStatus;
++    teamId?: string;
++    leadId?: string | null;
++  },
++) {
++  return db.user.update({ where: { id }, data: { ...data, updatedAt: new Date() } });
++}
++
++/** Read-only: whether the user is `acknowledgedBy` on an unresolved incident. */
++export async function isAssignedToUnresolvedIncident(db: Db, userId: string): Promise<boolean> {
++  const found = await db.incident.findFirst({
++    where: { acknowledgedById: userId, status: { in: [...UNRESOLVED_INCIDENT_STATUSES] } },
++    select: { id: true },
++  });
++  return found !== null;
++}
++
++/** Users (any status) whose `leadId` is this user. */
++export function countReportingUsers(db: Db, leadId: string): Promise<number> {
++  return db.user.count({ where: { leadId } });
++}
+diff --git a/backend/src/modules/identity/users/user.schema.ts b/backend/src/modules/identity/users/user.schema.ts
+new file mode 100644
+index 0000000..3232e92
+--- /dev/null
++++ b/backend/src/modules/identity/users/user.schema.ts
+@@ -0,0 +1,50 @@
++import { z } from 'zod';
++import { emailSchema, passwordSchema } from '../auth/auth.schema.js';
++import { limitSchema, offsetSchema, sortSchema, uuidSchema } from '../identity.common.js';
++
++const name = z.string().min(1).max(50);
++const assignableRole = z.enum(['ENGINEER', 'TEAM_LEAD']);
++const status = z.enum(['ACTIVE', 'DEACTIVATED']);
++
++export const createUserBodySchema = z
++  .object({
++    name,
++    email: emailSchema,
++    password: passwordSchema,
++    role: assignableRole.default('ENGINEER'),
++    teamId: uuidSchema.optional(),
++    leadId: uuidSchema.optional(),
++  })
++  .strict();
++
++export const updateUserBodySchema = z
++  .object({
++    name: name.optional(),
++    password: passwordSchema.optional(),
++    role: assignableRole.optional(),
++    status: status.optional(),
++    teamId: uuidSchema.optional(),
++    leadId: uuidSchema.optional(),
++  })
++  .strict()
++  .refine((body) => Object.values(body).some((value) => value !== undefined), {
++    message: 'At least one field is required',
++  });
++
++export const userParamsSchema = z.object({ userId: uuidSchema }).strict();
++export const teamUsersParamsSchema = z.object({ teamId: uuidSchema }).strict();
++
++export const listUsersQuerySchema = z
++  .object({
++    limit: limitSchema,
++    offset: offsetSchema,
++    role: assignableRole.optional(),
++    status: status.optional(),
++    orderBy: z.enum(['name', 'createdAt']).default('name'),
++    sort: sortSchema,
++  })
++  .strict();
++
++export type CreateUserBody = z.output<typeof createUserBodySchema>;
++export type UpdateUserBody = z.output<typeof updateUserBodySchema>;
++export type ListUsersQuery = z.output<typeof listUsersQuerySchema>;
+diff --git a/backend/src/modules/identity/users/user.service.ts b/backend/src/modules/identity/users/user.service.ts
+new file mode 100644
+index 0000000..dcd4880
+--- /dev/null
++++ b/backend/src/modules/identity/users/user.service.ts
+@@ -0,0 +1,131 @@
++import { isUniqueViolation } from '../../../infra/db/errors.js';
++import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
++import { ConflictError } from '../../../shared/errors/AppError.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import { assertSameTeam, requireTeam } from '../auth/guard.js';
++import { hashPassword } from '../auth/password.js';
++import { revokeSessionsForUsers } from '../auth/session.repository.js';
++import { invalidAction, notFound, toPage, type Page } from '../identity.common.js';
++import { findTeamById } from '../teams/team.repository.js';
++import { concurrencyConflict, runIdentityTransaction, type Db } from '../transaction.js';
++import { planUserUpdate } from './user-update.rules.js';
++import { toUserResponse, type UserResponse } from './user.mapper.js';
++import {
++  countReportingUsers,
++  createUser as insertUser,
++  findUserById,
++  isAssignedToUnresolvedIncident,
++  listUsersOfTeam,
++  updateUser as writeUser,
++} from './user.repository.js';
++import type { CreateUserBody, ListUsersQuery, UpdateUserBody } from './user.schema.js';
++
++const userNotFound = () => notFound('user', 'USER_NOT_FOUND');
++const teamNotFound = () => notFound('team', 'TEAM_NOT_FOUND');
++
++export async function createUser(body: CreateUserBody): Promise<UserResponse> {
++  const passwordHash = await hashPassword(body.password);
++  try {
++    return await runIdentityTransaction(async (tx) => {
++      if (body.leadId !== undefined) {
++        if (body.teamId === undefined) throw invalidAction('leadId requires teamId');
++        if (body.role !== 'ENGINEER') throw invalidAction('Only engineers can have a lead');
++      }
++
++      if (body.teamId !== undefined) {
++        await lockRowForUpdate(tx, 'Team', body.teamId);
++        const team = await findTeamById(tx, body.teamId);
++        if (!team || team.status !== 'ACTIVE') {
++          throw invalidAction('teamId must reference an active team');
++        }
++      }
++
++      if (body.leadId !== undefined) {
++        await lockRowForUpdate(tx, 'User', body.leadId);
++        const lead = await findUserById(tx, body.leadId);
++        if (
++          !lead ||
++          lead.status !== 'ACTIVE' ||
++          lead.role !== 'TEAM_LEAD' ||
++          lead.teamId !== body.teamId
++        ) {
++          throw invalidAction('leadId must reference an active Team Lead of the same team');
++        }
++      }
++
++      const user = await insertUser(tx, {
++        name: body.name,
++        email: body.email,
++        passwordHash,
++        role: body.role,
++        teamId: body.teamId ?? null,
++        leadId: body.leadId ?? null,
++      });
++      return toUserResponse(user);
++    });
++  } catch (error) {
++    if (isUniqueViolation(error)) {
++      throw new ConflictError('Email already exists', 'EMAIL_ALREADY_EXISTS');
++    }
++    throw error;
++  }
++}
++
++export async function listTeamUsers(
++  auth: AuthContext,
++  teamId: string,
++  query: ListUsersQuery,
++): Promise<Page<UserResponse>> {
++  if (auth.role !== 'ADMIN') {
++    requireTeam(auth);
++    assertSameTeam(auth, teamId);
++  }
++  const db = getPrisma();
++  if (!(await findTeamById(db, teamId))) throw teamNotFound();
++  const rows = await listUsersOfTeam(db, teamId, query);
++  return toPage(rows.map(toUserResponse), query.limit, query.offset);
++}
++
++export async function getUser(auth: AuthContext, userId: string): Promise<UserResponse> {
++  if (auth.role !== 'ADMIN') requireTeam(auth);
++  const user = await findUserById(getPrisma(), userId);
++  if (!user) throw userNotFound();
++  if (auth.role !== 'ADMIN') assertSameTeam(auth, user.teamId);
++  return toUserResponse(user);
++}
++
++/** Locks rows in a fixed order (teams, then users by id) so concurrent writers cannot deadlock. */
++async function lockInOrder(tx: Db, teamIds: string[], userIds: string[]): Promise<void> {
++  for (const id of [...new Set(teamIds)].sort()) await lockRowForUpdate(tx, 'Team', id);
++  for (const id of [...new Set(userIds)].sort()) await lockRowForUpdate(tx, 'User', id);
++}
++
++export async function updateUser(userId: string, body: UpdateUserBody): Promise<UserResponse> {
++  const passwordHash = body.password === undefined ? undefined : await hashPassword(body.password);
++  return runIdentityTransaction(async (tx) => {
++    const preRead = await findUserById(tx, userId);
++    if (!preRead) throw userNotFound();
++
++    const teamIds = [preRead.teamId, body.teamId].filter((id): id is string => id != null);
++    const userIds = [userId, ...(body.leadId !== undefined ? [body.leadId] : [])];
++    await lockInOrder(tx, teamIds, userIds);
++
++    const target = await findUserById(tx, userId);
++    if (!target) throw userNotFound();
++    if (target.teamId !== preRead.teamId) throw concurrencyConflict();
++
++    const plan = planUserUpdate(target, body, {
++      newTeam: body.teamId === undefined ? null : await findTeamById(tx, body.teamId),
++      lead: body.leadId === undefined ? null : await findUserById(tx, body.leadId),
++      assignedToUnresolvedIncident: await isAssignedToUnresolvedIncident(tx, userId),
++      reportingUsers: target.role === 'TEAM_LEAD' ? await countReportingUsers(tx, userId) : 0,
++    });
++
++    const updated = await writeUser(tx, userId, {
++      ...plan.data,
++      ...(passwordHash === undefined ? {} : { passwordHash }),
++    });
++    if (plan.revokeSessions) await revokeSessionsForUsers(tx, [userId]);
++    return toUserResponse(updated);
++  });
++}
+diff --git a/backend/src/scripts/seed-admin.ts b/backend/src/scripts/seed-admin.ts
+new file mode 100644
+index 0000000..5634d13
+--- /dev/null
++++ b/backend/src/scripts/seed-admin.ts
+@@ -0,0 +1,34 @@
++import { z } from 'zod';
++import { getConfig } from '../config/env.js';
++import { disconnectPrisma } from '../infra/db/prisma.js';
++import { seedAdminUser } from '../modules/identity/index.js';
++import { logger } from '../shared/observability/logger.js';
++
++const seedEnvSchema = z.object({
++  SEED_ADMIN_NAME: z.string().min(1).max(50),
++  SEED_ADMIN_EMAIL: z.email().max(72),
++  SEED_ADMIN_PASSWORD: z.string().min(8).max(24),
++});
++
++async function main(): Promise<void> {
++  getConfig(); // loads `.env` and validates the application configuration
++  const parsed = seedEnvSchema.safeParse(process.env);
++  if (!parsed.success) {
++    const names = [...new Set(parsed.error.issues.map((issue) => String(issue.path[0])))];
++    throw new Error(`Invalid seed configuration: ${names.join(', ')}`);
++  }
++
++  const created = await seedAdminUser({
++    name: parsed.data.SEED_ADMIN_NAME,
++    email: parsed.data.SEED_ADMIN_EMAIL,
++    password: parsed.data.SEED_ADMIN_PASSWORD,
++  });
++  logger.info({ created }, created ? 'Admin user created' : 'Admin user already exists');
++}
++
++main()
++  .catch((err: unknown) => {
++    logger.fatal({ err }, 'Admin seed failed');
++    process.exitCode = 1;
++  })
++  .finally(disconnectPrisma);
+diff --git a/backend/src/shared/middleware/json-body.spec.ts b/backend/src/shared/middleware/json-body.spec.ts
+new file mode 100644
+index 0000000..f2a7904
+--- /dev/null
++++ b/backend/src/shared/middleware/json-body.spec.ts
+@@ -0,0 +1,35 @@
++import express from 'express';
++import request from 'supertest';
++import { errorMappingMiddleware } from './error-mapping.js';
++import { requireJsonBody } from './json-body.js';
++
++function buildApp() {
++  const app = express();
++  app.use(express.json());
++  app.post('/echo', requireJsonBody, (req, res) => {
++    res.json({ body: req.body ?? null });
++  });
++  app.use(errorMappingMiddleware);
++  return app;
++}
++
++describe('requireJsonBody', () => {
++  it('accepts a JSON body', async () => {
++    const res = await request(buildApp()).post('/echo').send({ a: 1 });
++    expect(res.status).toBe(200);
++  });
++
++  it('accepts a request without a body', async () => {
++    const res = await request(buildApp()).post('/echo');
++    expect(res.status).toBe(200);
++  });
++
++  it('rejects a non-JSON body with 400 BAD_REQUEST', async () => {
++    const res = await request(buildApp())
++      .post('/echo')
++      .set('Content-Type', 'text/plain')
++      .send('hi');
++    expect(res.status).toBe(400);
++    expect(res.body.error.code).toBe('BAD_REQUEST');
++  });
++});
+diff --git a/backend/src/shared/middleware/json-body.ts b/backend/src/shared/middleware/json-body.ts
+new file mode 100644
+index 0000000..59a2eaa
+--- /dev/null
++++ b/backend/src/shared/middleware/json-body.ts
+@@ -0,0 +1,12 @@
++import type { RequestHandler } from 'express';
++import { BadRequestError } from '../errors/AppError.js';
++
++/** Rejects a request body that is not JSON (`400 BAD_REQUEST`). Requests without a body pass. */
++export const requireJsonBody: RequestHandler = (req, _res, next) => {
++  const hasBody =
++    req.headers['transfer-encoding'] !== undefined || Number(req.headers['content-length']) > 0;
++  if (hasBody && !req.is('application/json')) {
++    throw new BadRequestError('Content-Type must be application/json');
++  }
++  next();
++};
+diff --git a/backend/test/helpers/app.ts b/backend/test/helpers/app.ts
+index 92d4829..9eeb61d 100644
+--- a/backend/test/helpers/app.ts
++++ b/backend/test/helpers/app.ts
+@@ -1,9 +1,10 @@
+ import type { Express } from 'express';
++import { createApiRouter } from '../../src/api-router';
+ import { createApp } from '../../src/app';
+ import { buildReadinessChecks } from '../../src/infra/readiness';
+ import type { ReadinessCheck } from '../../src/shared/http/health';
+ 
+ /** The real application wired to the real PostgreSQL and Redis from the test environment. */
+ export function buildTestApp(readinessChecks: ReadinessCheck[] = buildReadinessChecks()): Express {
+-  return createApp({ readinessChecks });
++  return createApp({ readinessChecks, apiRouter: createApiRouter() });
+ }
+diff --git a/backend/test/helpers/identity.ts b/backend/test/helpers/identity.ts
+new file mode 100644
+index 0000000..9ecc39d
+--- /dev/null
++++ b/backend/test/helpers/identity.ts
+@@ -0,0 +1,125 @@
++import { randomUUID } from 'node:crypto';
++import type { Express } from 'express';
++import request from 'supertest';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { getRedis } from '../../src/infra/redis/redis';
++import { hashPassword } from '../../src/modules/identity/auth/password';
++import { resetDatabase } from './db';
++
++export const PASSWORD = 'Passw0rd!';
++
++let passwordHash: Promise<string> | undefined;
++
++/** Empties PostgreSQL and the test Redis database. */
++export async function resetState(): Promise<void> {
++  await resetDatabase();
++  await getRedis().flushdb();
++}
++
++type Role = 'ENGINEER' | 'TEAM_LEAD' | 'ADMIN';
++
++export async function createTeam(name = `team-${randomUUID().slice(0, 8)}`, status = 'ACTIVE') {
++  return getPrisma().team.create({ data: { name, status: status as 'ACTIVE' | 'DEACTIVATED' } });
++}
++
++export async function createUser(
++  overrides: {
++    email?: string;
++    name?: string;
++    role?: Role;
++    status?: 'ACTIVE' | 'DEACTIVATED';
++    teamId?: string | null;
++    leadId?: string | null;
++  } = {},
++) {
++  passwordHash ??= hashPassword(PASSWORD);
++  return getPrisma().user.create({
++    data: {
++      name: overrides.name ?? 'Test User',
++      email: overrides.email ?? `u-${randomUUID().slice(0, 8)}@example.com`,
++      passwordHash: await passwordHash,
++      role: overrides.role ?? 'ENGINEER',
++      status: overrides.status ?? 'ACTIVE',
++      teamId: overrides.teamId ?? null,
++      leadId: overrides.leadId ?? null,
++    },
++  });
++}
++
++export function cookieValue(setCookie: string | string[] | undefined): string {
++  const header = Array.isArray(setCookie) ? setCookie[0] : (setCookie ?? '');
++  return header.split(';')[0].split('=').slice(1).join('=');
++}
++
++export async function login(app: Express, email: string, password = PASSWORD) {
++  const res = await request(app).post('/api/v1/auth/login').send({ email, password });
++  if (res.status !== 200)
++    throw new Error(`login failed: ${res.status} ${JSON.stringify(res.body)}`);
++  const token = (res.headers['authorization'] as string).replace('Bearer ', '');
++  return { token, refresh: cookieValue(res.headers['set-cookie']), res };
++}
++
++export const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
++
++/** An Admin of a fresh team, already logged in. */
++export async function adminSession(app: Express, teamId: string | null = null) {
++  const admin = await createUser({ role: 'ADMIN', teamId });
++  return { admin, ...(await login(app, admin.email)) };
++}
++
++export async function sessionFor(
++  app: Express,
++  role: Role,
++  teamId: string | null,
++  extra: { leadId?: string | null } = {},
++) {
++  const user = await createUser({ role, teamId, ...extra });
++  return { user, ...(await login(app, user.email)) };
++}
++
++/** A service (with its escalation policy) owned by `teamId`. */
++export async function createService(teamId: string, adminForPolicy: string) {
++  const db = getPrisma();
++  const policy = await db.escalationPolicy.create({
++    data: {
++      level1Id: adminForPolicy,
++      level2Id: adminForPolicy,
++      level3Id: adminForPolicy,
++      fallbackAdminId: adminForPolicy,
++    },
++  });
++  return db.appService.create({
++    data: {
++      name: `svc-${randomUUID().slice(0, 8)}`,
++      teamId,
++      escalationPolicyId: policy.id,
++      P0ResponseSlaMinutes: 5,
++      P0ResolutionSlaMinutes: 30,
++      P1ResponseSlaMinutes: 10,
++      P1ResolutionSlaMinutes: 60,
++      P2ResponseSlaMinutes: 30,
++      P2ResolutionSlaMinutes: 120,
++      P3ResponseSlaMinutes: 60,
++      P3ResolutionSlaMinutes: 240,
++    },
++  });
++}
++
++export async function createIncident(
++  teamId: string,
++  serviceId: string,
++  status: 'OPEN' | 'ACKNOWLEDGED' | 'MITIGATING' | 'RESOLVED' | 'CLOSED',
++  acknowledgedById: string | null = null,
++) {
++  return getPrisma().incident.create({
++    data: {
++      title: 'incident',
++      description: 'incident',
++      severity: 'P1',
++      status,
++      teamId,
++      affectedServiceId: serviceId,
++      acknowledgedById,
++    },
++  });
++}
+diff --git a/backend/test/integration/auth.int-spec.ts b/backend/test/integration/auth.int-spec.ts
+new file mode 100644
+index 0000000..ccf0dd3
+--- /dev/null
++++ b/backend/test/integration/auth.int-spec.ts
+@@ -0,0 +1,416 @@
++import request from 'supertest';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { getRedis } from '../../src/infra/redis/redis';
++import { buildTestApp } from '../helpers/app';
++import {
++  PASSWORD,
++  bearer,
++  cookieValue,
++  createTeam,
++  createUser,
++  login,
++  resetState,
++} from '../helpers/identity';
++
++const app = buildTestApp();
++const refreshWith = (cookie: string) =>
++  request(app).post('/api/v1/auth/refresh').set('Cookie', `ims_refresh_cookie=${cookie}`);
++const attempt = (email: string, password: string) =>
++  request(app).post('/api/v1/auth/login').send({ email, password });
++
++/** Ends every active rate-limit block, as if the block window had passed. */
++async function expireBlocks(): Promise<void> {
++  const redis = getRedis();
++  const keys = await redis.keys('rl:block:*');
++  if (keys.length > 0) await redis.del(...keys);
++}
++
++beforeEach(resetState);
++afterAll(async () => {
++  await getPrisma().$disconnect();
++  getRedis().disconnect();
++});
++
++describe('A1 POST /auth/login', () => {
++  it('returns the token in the header, the refresh token only in the cookie, and no token in the body', async () => {
++    const team = await createTeam();
++    const user = await createUser({ teamId: team.id, role: 'TEAM_LEAD' });
++    const res = await attempt(user.email, PASSWORD);
++
++    expect(res.status).toBe(200);
++    expect(res.body).toEqual({ data: { tokenType: 'Bearer', expiresIn: 900 } });
++    expect(res.headers['authorization']).toMatch(/^Bearer [\w-]+\.[\w-]+\.[\w-]+$/);
++    expect(res.headers['set-cookie'][0]).toMatch(
++      /^ims_refresh_cookie=[^;]+; Max-Age=604800; Path=\/api\/v1\/auth; HttpOnly; Secure; SameSite=Lax$/,
++    );
++    expect(JSON.stringify(res.body)).not.toContain(cookieValue(res.headers['set-cookie']));
++
++    const claims = JSON.parse(
++      Buffer.from(res.headers['authorization'].split('.')[1], 'base64url').toString(),
++    );
++    expect(claims).toMatchObject({
++      userId: user.id,
++      email: user.email,
++      role: 'TEAM_LEAD',
++      teamId: team.id,
++    });
++    expect(claims.exp - claims.iat).toBe(900);
++  });
++
++  it('puts teamId null in the claims for a user without a team', async () => {
++    const user = await createUser();
++    const { token } = await login(app, user.email);
++    const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
++    expect(claims.teamId).toBeNull();
++  });
++
++  it('stores only a hash of the refresh secret and an Argon2 password hash', async () => {
++    const user = await createUser();
++    const { refresh } = await login(app, user.email);
++    const secret = refresh.split('.')[2];
++
++    const session = await getPrisma().userSession.findFirstOrThrow({ where: { userId: user.id } });
++    expect(session.refreshTokenHash).toMatch(/^[0-9a-f]{64}$/);
++    expect(session.refreshTokenHash).not.toBe(secret);
++    expect(JSON.stringify(session)).not.toContain(secret);
++    expect(session).toMatchObject({ revoked: false, lastRefreshHash: null });
++    expect(session.expiresIn.getTime()).toBeGreaterThan(Date.now() + 6 * 86400_000);
++
++    const stored = await getPrisma().user.findUniqueOrThrow({ where: { id: user.id } });
++    expect(stored.passwordHash).toMatch(/^\$argon2id\$/);
++    expect(stored.passwordHash).not.toContain(PASSWORD);
++  });
++
++  it('is case-insensitive on the email', async () => {
++    const user = await createUser({ email: 'mixed@example.com' });
++    const res = await attempt('MiXeD@Example.com', PASSWORD);
++    expect(res.status).toBe(200);
++    expect(user.email).toBe('mixed@example.com');
++  });
++
++  it('answers a wrong password and an unknown email identically', async () => {
++    const user = await createUser();
++    const wrong = await attempt(user.email, 'wrong-password');
++    const unknown = await attempt('nobody@example.com', 'wrong-password');
++    expect(wrong.status).toBe(401);
++    expect(unknown.status).toBe(401);
++    const strip = ({
++      error,
++    }: {
++      error: { code: string; message: string; details: unknown[] };
++    }) => ({
++      code: error.code,
++      message: error.message,
++      details: error.details,
++    });
++    expect(strip(wrong.body)).toEqual(strip(unknown.body));
++    expect(wrong.body.error.code).toBe('INVALID_CREDENTIALS');
++  });
++
++  it('returns 403 ACCOUNT_DEACTIVATED only when the password is correct', async () => {
++    const user = await createUser({ status: 'DEACTIVATED' });
++    const ok = await attempt(user.email, PASSWORD);
++    expect(ok.status).toBe(403);
++    expect(ok.body.error.code).toBe('ACCOUNT_DEACTIVATED');
++    expect((await attempt(user.email, 'wrong-password')).body.error.code).toBe(
++      'INVALID_CREDENTIALS',
++    );
++    expect(await getPrisma().userSession.count()).toBe(0);
++  });
++
++  it.each([
++    ['short password', { email: 'a@example.com', password: 'short' }],
++    ['long password', { email: 'a@example.com', password: 'x'.repeat(25) }],
++    ['invalid email', { email: 'nope', password: PASSWORD }],
++    ['email over 72 chars', { email: `${'a'.repeat(64)}@example.com`, password: PASSWORD }],
++    ['missing password', { email: 'a@example.com' }],
++  ])('rejects %s with 422 VALIDATION_FAILED', async (_name, body) => {
++    const res = await request(app).post('/api/v1/auth/login').send(body);
++    expect(res.status).toBe(422);
++    expect(res.body.error.code).toBe('VALIDATION_FAILED');
++    expect(res.body.error.details.length).toBeGreaterThan(0);
++  });
++
++  it('rejects unknown fields, malformed JSON and a non-JSON body with 400 BAD_REQUEST', async () => {
++    const unknownField = await request(app)
++      .post('/api/v1/auth/login')
++      .send({ email: 'a@example.com', password: PASSWORD, extra: 1 });
++    expect(unknownField.status).toBe(400);
++    const malformed = await request(app)
++      .post('/api/v1/auth/login')
++      .set('Content-Type', 'application/json')
++      .send('{"email":');
++    expect(malformed.status).toBe(400);
++    const wrongType = await request(app)
++      .post('/api/v1/auth/login')
++      .set('Content-Type', 'text/plain')
++      .send('email=a');
++    expect(wrongType.status).toBe(400);
++    expect(wrongType.body.error.code).toBe('BAD_REQUEST');
++  });
++
++  it('creates one session per login', async () => {
++    const user = await createUser();
++    await login(app, user.email);
++    await login(app, user.email);
++    expect(await getPrisma().userSession.count({ where: { userId: user.id } })).toBe(2);
++  });
++});
++
++describe('rate limiting', () => {
++  it('blocks the 11th attempt with 429 and Retry-After, escalating 10 min → 20 → 60 → 4 h → IP', async () => {
++    const user = await createUser();
++    const retryAfter: string[] = [];
++
++    for (let violation = 1; violation <= 4; violation++) {
++      for (let i = 0; i < 10; i++) {
++        expect((await attempt(user.email, 'wrong-password')).status).toBe(401);
++      }
++      const blocked = await attempt(user.email, 'wrong-password');
++      expect(blocked.status).toBe(429);
++      expect(blocked.body.error.code).toBe('RATE_LIMITED');
++      retryAfter.push(blocked.headers['retry-after']);
++
++      // Still blocked, even with the right password.
++      expect((await attempt(user.email, PASSWORD)).status).toBe(429);
++      await expireBlocks();
++    }
++    expect(retryAfter).toEqual(['600', '1200', '3600', '14400']);
++
++    for (let i = 0; i < 10; i++) await attempt(user.email, 'wrong-password');
++    const ipBlocked = await attempt(user.email, 'wrong-password');
++    expect(ipBlocked.status).toBe(429);
++    expect(ipBlocked.headers['retry-after']).toBe('86400');
++
++    // The IP block covers other identities and the refresh endpoint.
++    await expireBlocks();
++    const other = await createUser();
++    expect((await attempt(other.email, PASSWORD)).status).toBe(429);
++    expect((await refreshWith('anything')).status).toBe(429);
++  });
++
++  it('counts per email, so another account is not blocked by the first', async () => {
++    const a = await createUser();
++    const b = await createUser();
++    for (let i = 0; i < 11; i++) await attempt(a.email, 'wrong-password');
++    expect((await attempt(a.email, PASSWORD)).status).toBe(429);
++    expect((await attempt(b.email, PASSWORD)).status).toBe(200);
++  });
++
++  it('resets the counter after a successful login', async () => {
++    const user = await createUser();
++    for (let i = 0; i < 9; i++) await attempt(user.email, 'wrong-password');
++    expect((await attempt(user.email, PASSWORD)).status).toBe(200);
++    for (let i = 0; i < 10; i++) {
++      expect((await attempt(user.email, 'wrong-password')).status).toBe(401);
++    }
++    expect((await attempt(user.email, 'wrong-password')).status).toBe(429);
++  });
++
++  it('keys refresh on IP + email + session id and resets after a success', async () => {
++    const user = await createUser();
++    const { refresh } = await login(app, user.email);
++    const otherUser = await createUser();
++    const other = await login(app, otherUser.email);
++
++    const bad = `${refresh.split('.').slice(0, 2).join('.')}.wrong-secret`;
++    for (let i = 0; i < 10; i++) expect((await refreshWith(bad)).status).toBe(401);
++    const blocked = await refreshWith(bad);
++    expect(blocked.status).toBe(429);
++    expect(blocked.headers['retry-after']).toBe('600');
++
++    // A different session (and email) from the same IP is unaffected.
++    expect((await refreshWith(other.refresh)).status).toBe(200);
++  });
++
++  it('fails closed with 503 and Retry-After when Redis is unavailable', async () => {
++    const user = await createUser();
++    const spy = jest.spyOn(getRedis(), 'eval').mockRejectedValue(new Error('redis down'));
++    try {
++      const login503 = await attempt(user.email, PASSWORD);
++      expect(login503.status).toBe(503);
++      expect(login503.body.error.code).toBe('DEPENDENCY_UNAVAILABLE');
++      expect(login503.headers['retry-after']).toBe('5');
++      const refresh503 = await refreshWith('00000000-0000-4000-8000-000000000000.YQ.s');
++      expect(refresh503.status).toBe(503);
++    } finally {
++      spy.mockRestore();
++    }
++    expect(await getPrisma().userSession.count()).toBe(0);
++  });
++});
++
++describe('A2 POST /auth/refresh', () => {
++  it('rotates the refresh token and issues a new access token', async () => {
++    const user = await createUser();
++    const first = await login(app, user.email);
++    const before = await getPrisma().userSession.findFirstOrThrow({ where: { userId: user.id } });
++
++    const res = await refreshWith(first.refresh);
++    expect(res.status).toBe(200);
++    expect(res.body).toEqual({ data: { tokenType: 'Bearer', expiresIn: 900 } });
++    expect(res.headers['authorization']).toMatch(/^Bearer /);
++    const next = cookieValue(res.headers['set-cookie']);
++    expect(next).not.toBe(first.refresh);
++    expect(res.headers['set-cookie'][0]).toContain('Max-Age=604800');
++
++    const after = await getPrisma().userSession.findUniqueOrThrow({ where: { id: before.id } });
++    expect(after.lastRefreshHash).toBe(before.refreshTokenHash);
++    expect(after.refreshTokenHash).not.toBe(before.refreshTokenHash);
++    expect(after.lastSeen).not.toBeNull();
++    expect(after.revoked).toBe(false);
++
++    expect((await refreshWith(next)).status).toBe(200);
++  });
++
++  it('reads the new claims from the database', async () => {
++    const team = await createTeam();
++    const user = await createUser();
++    const first = await login(app, user.email);
++    await getPrisma().user.update({
++      where: { id: user.id },
++      data: { role: 'TEAM_LEAD', teamId: team.id },
++    });
++
++    const res = await refreshWith(first.refresh);
++    const claims = JSON.parse(
++      Buffer.from(res.headers['authorization'].split('.')[1], 'base64url').toString(),
++    );
++    expect(claims).toMatchObject({ role: 'TEAM_LEAD', teamId: team.id });
++  });
++
++  it('treats reuse of a rotated token as theft: 401 and every session of the user is revoked', async () => {
++    const user = await createUser();
++    const other = await createUser();
++    const first = await login(app, user.email);
++    const second = await login(app, user.email);
++    const bystander = await login(app, other.email);
++
++    const rotated = await refreshWith(first.refresh);
++    expect(rotated.status).toBe(200);
++
++    const reuse = await refreshWith(first.refresh);
++    expect(reuse.status).toBe(401);
++    expect(reuse.body.error.code).toBe('INVALID_REFRESH_TOKEN');
++
++    expect(
++      await getPrisma().userSession.count({ where: { userId: user.id, revoked: false } }),
++    ).toBe(0);
++    expect((await refreshWith(cookieValue(rotated.headers['set-cookie']))).status).toBe(401);
++    expect((await refreshWith(second.refresh)).status).toBe(401);
++    expect((await refreshWith(bystander.refresh)).status).toBe(200);
++  });
++
++  it('lets exactly one of two concurrent refreshes with the same token win', async () => {
++    const user = await createUser();
++    const { refresh } = await login(app, user.email);
++
++    const results = await Promise.all([refreshWith(refresh), refreshWith(refresh)]);
++    const statuses = results.map((r) => r.status).sort();
++    expect(statuses).toEqual([200, 401]);
++    expect(results.find((r) => r.status === 401)?.body.error.code).toBe('INVALID_REFRESH_TOKEN');
++    expect(
++      await getPrisma().userSession.count({ where: { userId: user.id, revoked: false } }),
++    ).toBe(0);
++  });
++
++  it('returns 401 INVALID_REQUEST when the cookie is absent', async () => {
++    const res = await request(app).post('/api/v1/auth/refresh').send({ ignored: true });
++    expect(res.status).toBe(401);
++    expect(res.body.error.code).toBe('INVALID_REQUEST');
++  });
++
++  it('returns 401 INVALID_REFRESH_TOKEN for garbage, a wrong secret, an unknown session, an expired and a revoked session', async () => {
++    const user = await createUser();
++    const { refresh } = await login(app, user.email);
++    const [sessionId, email] = refresh.split('.');
++    const forged = [
++      'garbage',
++      `${sessionId}.${email}.wrong-secret`,
++      `00000000-0000-4000-8000-000000000000.${email}.${refresh.split('.')[2]}`,
++    ];
++    for (const value of forged) {
++      const res = await refreshWith(value);
++      expect(res.status).toBe(401);
++      expect(res.body.error.code).toBe('INVALID_REFRESH_TOKEN');
++    }
++    // A forged secret is not reuse: the real session is untouched.
++    expect((await refreshWith(refresh)).status).toBe(200);
++
++    const live = await login(app, user.email);
++    await getPrisma().userSession.updateMany({
++      where: { id: live.refresh.split('.')[0] },
++      data: { expiresIn: new Date(Date.now() - 1000) },
++    });
++    expect((await refreshWith(live.refresh)).body.error.code).toBe('INVALID_REFRESH_TOKEN');
++
++    const toRevoke = await login(app, user.email);
++    await getPrisma().userSession.updateMany({
++      where: { id: toRevoke.refresh.split('.')[0] },
++      data: { revoked: true },
++    });
++    expect((await refreshWith(toRevoke.refresh)).body.error.code).toBe('INVALID_REFRESH_TOKEN');
++  });
++
++  it('returns 403 ACCOUNT_DEACTIVATED for a deactivated user', async () => {
++    const user = await createUser();
++    const { refresh } = await login(app, user.email);
++    await getPrisma().user.update({ where: { id: user.id }, data: { status: 'DEACTIVATED' } });
++    const res = await refreshWith(refresh);
++    expect(res.status).toBe(403);
++    expect(res.body.error.code).toBe('ACCOUNT_DEACTIVATED');
++  });
++});
++
++describe('A3 / A4 logout', () => {
++  it('revokes the session, clears the cookie, and answers the same on a repeat', async () => {
++    const user = await createUser();
++    const { token, refresh } = await login(app, user.email);
++
++    const res = await request(app).post('/api/v1/auth/logout').set(bearer(token));
++    expect(res.status).toBe(200);
++    expect(res.body).toEqual({ data: { message: 'Logged out successfully' } });
++    expect(res.headers['set-cookie'][0]).toBe(
++      'ims_refresh_cookie=; Max-Age=0; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Lax',
++    );
++    expect(await getPrisma().userSession.count({ where: { revoked: true } })).toBe(1);
++
++    expect((await refreshWith(refresh)).status).toBe(401);
++    // The access token stays valid until it expires.
++    expect((await request(app).post('/api/v1/auth/logout').set(bearer(token))).status).toBe(200);
++  });
++
++  it('logout only touches the session in the token', async () => {
++    const user = await createUser();
++    const a = await login(app, user.email);
++    const b = await login(app, user.email);
++    await request(app).post('/api/v1/auth/logout').set(bearer(a.token));
++    expect((await refreshWith(b.refresh)).status).toBe(200);
++  });
++
++  it('logout-all revokes every session of the caller and nobody else', async () => {
++    const user = await createUser();
++    const other = await createUser();
++    const a = await login(app, user.email);
++    const b = await login(app, user.email);
++    const bystander = await login(app, other.email);
++
++    const res = await request(app).post('/api/v1/auth/logout-all').set(bearer(a.token));
++    expect(res.status).toBe(200);
++    expect(res.body.data.message).toBe('Logged out successfully');
++    expect(res.headers['set-cookie'][0]).toContain('Max-Age=0');
++    expect((await refreshWith(a.refresh)).status).toBe(401);
++    expect((await refreshWith(b.refresh)).status).toBe(401);
++    expect((await refreshWith(bystander.refresh)).status).toBe(200);
++  });
++
++  it.each(['/api/v1/auth/logout', '/api/v1/auth/logout-all'])(
++    '%s requires a valid access token',
++    async (path) => {
++      const missing = await request(app).post(path);
++      expect(missing.status).toBe(401);
++      expect(missing.body.error.code).toBe('UNAUTHENTICATED');
++      expect((await request(app).post(path).set(bearer('bad.token.value'))).status).toBe(401);
++    },
++  );
++});
+diff --git a/backend/test/integration/seed.int-spec.ts b/backend/test/integration/seed.int-spec.ts
+new file mode 100644
+index 0000000..afb8400
+--- /dev/null
++++ b/backend/test/integration/seed.int-spec.ts
+@@ -0,0 +1,41 @@
++import { getPrisma } from '../../src/infra/db/prisma';
++import { getRedis } from '../../src/infra/redis/redis';
++import { seedAdminUser } from '../../src/modules/identity';
++import { PASSWORD, login, resetState } from '../helpers/identity';
++import { buildTestApp } from '../helpers/app';
++
++beforeEach(resetState);
++afterAll(async () => {
++  await getPrisma().$disconnect();
++  getRedis().disconnect();
++});
++
++describe('seedAdminUser', () => {
++  it('creates an ADMIN with an Argon2 hash who can log in', async () => {
++    const created = await seedAdminUser({
++      name: 'Root',
++      email: 'Root@Example.com',
++      password: PASSWORD,
++    });
++    expect(created).toBe(true);
++
++    const admin = await getPrisma().user.findUniqueOrThrow({
++      where: { email: 'root@example.com' },
++    });
++    expect(admin).toMatchObject({ role: 'ADMIN', status: 'ACTIVE', teamId: null, leadId: null });
++    expect(admin.passwordHash).toMatch(/^\$argon2id\$/);
++    expect((await login(buildTestApp(), 'root@example.com')).res.status).toBe(200);
++  });
++
++  it('is idempotent by email, also when run concurrently', async () => {
++    const input = { name: 'Root', email: 'root@example.com', password: PASSWORD };
++    const results = await Promise.all([
++      seedAdminUser(input),
++      seedAdminUser(input),
++      seedAdminUser(input),
++    ]);
++    expect(results.filter(Boolean)).toHaveLength(1);
++    expect(await seedAdminUser({ ...input, password: 'DifferentPass1' })).toBe(false);
++    expect(await getPrisma().user.count()).toBe(1);
++  });
++});
+diff --git a/backend/test/integration/teams.int-spec.ts b/backend/test/integration/teams.int-spec.ts
+new file mode 100644
+index 0000000..5ac156d
+--- /dev/null
++++ b/backend/test/integration/teams.int-spec.ts
+@@ -0,0 +1,387 @@
++import request from 'supertest';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { getRedis } from '../../src/infra/redis/redis';
++import * as sessions from '../../src/modules/identity/auth/session.repository';
++import { buildTestApp } from '../helpers/app';
++import {
++  adminSession,
++  bearer,
++  createIncident,
++  createService,
++  createTeam,
++  createUser,
++  login,
++  resetState,
++  sessionFor,
++} from '../helpers/identity';
++
++const app = buildTestApp();
++const api = '/api/v1/identity/teams';
++
++beforeEach(resetState);
++afterEach(() => jest.restoreAllMocks());
++afterAll(async () => {
++  await getPrisma().$disconnect();
++  getRedis().disconnect();
++});
++
++const TEAM_KEYS = ['createdAt', 'id', 'name', 'status', 'updatedAt'];
++
++describe('T1 POST /identity/teams', () => {
++  it('creates an ACTIVE team (201)', async () => {
++    const { token } = await adminSession(app);
++    const res = await request(app).post(api).set(bearer(token)).send({ name: 'Platform' });
++    expect(res.status).toBe(201);
++    expect(Object.keys(res.body.data).sort()).toEqual(TEAM_KEYS);
++    expect(res.body.data).toMatchObject({ name: 'Platform', status: 'ACTIVE' });
++  });
++
++  it('requires authentication and the ADMIN role', async () => {
++    const team = await createTeam();
++    expect((await request(app).post(api).send({ name: 'x' })).status).toBe(401);
++    for (const role of ['ENGINEER', 'TEAM_LEAD'] as const) {
++      const { token } = await sessionFor(app, role, team.id);
++      const res = await request(app).post(api).set(bearer(token)).send({ name: 'x' });
++      expect(res.status).toBe(403);
++      expect(res.body.error.code).toBe('FORBIDDEN_ROLE');
++    }
++  });
++
++  it.each([
++    ['empty name', { name: '' }],
++    ['name over 50 chars', { name: 'x'.repeat(51) }],
++    ['missing name', {}],
++    ['non-string name', { name: 5 }],
++  ])('rejects %s with 422', async (_n, body) => {
++    const { token } = await adminSession(app);
++    const res = await request(app).post(api).set(bearer(token)).send(body);
++    expect(res.status).toBe(422);
++    expect(res.body.error.code).toBe('VALIDATION_FAILED');
++  });
++
++  it('rejects unknown fields with 400', async () => {
++    const { token } = await adminSession(app);
++    const res = await request(app)
++      .post(api)
++      .set(bearer(token))
++      .send({ name: 'x', status: 'ACTIVE' });
++    expect(res.status).toBe(400);
++    expect(res.body.error.code).toBe('BAD_REQUEST');
++  });
++
++  it('rejects a duplicate name with 409 DUPLICATE_TEAM, also under concurrency', async () => {
++    const { token } = await adminSession(app);
++    await request(app).post(api).set(bearer(token)).send({ name: 'Dup' });
++    const again = await request(app).post(api).set(bearer(token)).send({ name: 'Dup' });
++    expect(again.status).toBe(409);
++    expect(again.body.error.code).toBe('DUPLICATE_TEAM');
++
++    const race = await Promise.all(
++      [1, 2, 3, 4].map(() => request(app).post(api).set(bearer(token)).send({ name: 'Race' })),
++    );
++    expect(race.map((r) => r.status).sort()).toEqual([201, 409, 409, 409]);
++    expect(await getPrisma().team.count({ where: { name: 'Race' } })).toBe(1);
++  });
++});
++
++describe('T2 GET /identity/teams', () => {
++  it('returns an empty list as []', async () => {
++    const { token } = await adminSession(app);
++    const res = await request(app).get(api).set(bearer(token));
++    expect(res.status).toBe(200);
++    expect(res.body).toEqual({ data: [], pagination: { limit: 10, offset: 0, hasMore: false } });
++  });
++
++  it('paginates, orders and reports hasMore', async () => {
++    const { token } = await adminSession(app);
++    for (const name of ['d', 'b', 'a', 'c', 'e']) await createTeam(name);
++
++    const first = await request(app).get(`${api}?limit=2`).set(bearer(token));
++    expect(first.body.data.map((t: { name: string }) => t.name)).toEqual(['a', 'b']);
++    expect(first.body.pagination).toEqual({ limit: 2, offset: 0, hasMore: true });
++
++    const last = await request(app).get(`${api}?limit=2&offset=4`).set(bearer(token));
++    expect(last.body.data.map((t: { name: string }) => t.name)).toEqual(['e']);
++    expect(last.body.pagination.hasMore).toBe(false);
++
++    const desc = await request(app).get(`${api}?sort=desc&limit=2`).set(bearer(token));
++    expect(desc.body.data.map((t: { name: string }) => t.name)).toEqual(['e', 'd']);
++
++    const byDate = await request(app).get(`${api}?orderBy=createdAt&sort=desc`).set(bearer(token));
++    expect(byDate.body.data[0].name).toBe('e');
++  });
++
++  it.each(['limit=51', 'limit=0', 'offset=-1', 'orderBy=status', 'sort=up', 'limit=abc'])(
++    'rejects %s with 422',
++    async (query) => {
++      const { token } = await adminSession(app);
++      const res = await request(app).get(`${api}?${query}`).set(bearer(token));
++      expect(res.status).toBe(422);
++    },
++  );
++
++  it('is ADMIN only', async () => {
++    const team = await createTeam();
++    expect((await request(app).get(api)).status).toBe(401);
++    for (const role of ['ENGINEER', 'TEAM_LEAD'] as const) {
++      const { token } = await sessionFor(app, role, team.id);
++      const res = await request(app).get(api).set(bearer(token));
++      expect(res.status).toBe(403);
++      expect(res.body.error.code).toBe('FORBIDDEN_ROLE');
++    }
++  });
++});
++
++describe('T3 GET /identity/teams/:teamId', () => {
++  it('lets an Admin read any team and members read their own', async () => {
++    const own = await createTeam('own');
++    const other = await createTeam('other');
++    const { token: adminToken } = await adminSession(app);
++    const adminRes = await request(app).get(`${api}/${other.id}`).set(bearer(adminToken));
++    expect(adminRes.status).toBe(200);
++    expect(Object.keys(adminRes.body.data).sort()).toEqual(TEAM_KEYS);
++
++    for (const role of ['ENGINEER', 'TEAM_LEAD'] as const) {
++      const { token } = await sessionFor(app, role, own.id);
++      const res = await request(app).get(`${api}/${own.id}`).set(bearer(token));
++      expect(res.status).toBe(200);
++      expect(res.body.data.id).toBe(own.id);
++    }
++  });
++
++  it('denies another team with 403 TEAM_ACCESS_DENIED (even if it does not exist)', async () => {
++    const own = await createTeam('own');
++    const other = await createTeam('other');
++    const { token } = await sessionFor(app, 'TEAM_LEAD', own.id);
++    const res = await request(app).get(`${api}/${other.id}`).set(bearer(token));
++    expect(res.status).toBe(403);
++    expect(res.body.error.code).toBe('TEAM_ACCESS_DENIED');
++    const ghost = await request(app)
++      .get(`${api}/00000000-0000-4000-8000-000000000000`)
++      .set(bearer(token));
++    expect(ghost.body.error.code).toBe('TEAM_ACCESS_DENIED');
++  });
++
++  it('rejects a non-Admin without a team with 403 INVALID_ACTION', async () => {
++    const team = await createTeam();
++    for (const role of ['ENGINEER', 'TEAM_LEAD'] as const) {
++      const { token } = await sessionFor(app, role, null);
++      const res = await request(app).get(`${api}/${team.id}`).set(bearer(token));
++      expect(res.status).toBe(403);
++      expect(res.body.error.code).toBe('INVALID_ACTION');
++    }
++  });
++
++  it('returns 404 TEAM_NOT_FOUND for an Admin and 422 for a malformed id', async () => {
++    const { token } = await adminSession(app);
++    const missing = await request(app)
++      .get(`${api}/00000000-0000-4000-8000-000000000000`)
++      .set(bearer(token));
++    expect(missing.status).toBe(404);
++    expect(missing.body.error).toMatchObject({
++      code: 'TEAM_NOT_FOUND',
++      details: [{ resource: 'team' }],
++    });
++    expect((await request(app).get(`${api}/not-a-uuid`).set(bearer(token))).status).toBe(422);
++  });
++});
++
++describe('T4 PATCH /identity/teams/:teamId', () => {
++  it('renames a team and updates updatedAt', async () => {
++    const team = await createTeam('old');
++    const { token } = await adminSession(app);
++    const res = await request(app)
++      .patch(`${api}/${team.id}`)
++      .set(bearer(token))
++      .send({ name: 'new' });
++    expect(res.status).toBe(200);
++    expect(res.body.data.name).toBe('new');
++    expect(new Date(res.body.data.updatedAt).getTime()).toBeGreaterThanOrEqual(
++      team.updatedAt.getTime(),
++    );
++  });
++
++  it('validates the body and the role', async () => {
++    const team = await createTeam();
++    const { token } = await adminSession(app);
++    const patch = (body: unknown) =>
++      request(app)
++        .patch(`${api}/${team.id}`)
++        .set(bearer(token))
++        .send(body as object);
++    expect((await patch({})).status).toBe(422);
++    expect((await patch({ name: '' })).status).toBe(422);
++    expect((await patch({ status: 'GONE' })).status).toBe(422);
++    expect((await patch({ name: 'x', extra: 1 })).status).toBe(400);
++    expect(
++      (await request(app).patch(`${api}/nope`).set(bearer(token)).send({ name: 'x' })).status,
++    ).toBe(422);
++    expect((await request(app).patch(`${api}/${team.id}`).send({ name: 'x' })).status).toBe(401);
++
++    const { token: lead } = await sessionFor(app, 'TEAM_LEAD', team.id);
++    const forbidden = await request(app)
++      .patch(`${api}/${team.id}`)
++      .set(bearer(lead))
++      .send({ name: 'x' });
++    expect(forbidden.status).toBe(403);
++    expect(forbidden.body.error.code).toBe('FORBIDDEN_ROLE');
++  });
++
++  it('returns 404 and 409 DUPLICATE_TEAM', async () => {
++    const a = await createTeam('a');
++    await createTeam('b');
++    const { token } = await adminSession(app);
++    const dup = await request(app).patch(`${api}/${a.id}`).set(bearer(token)).send({ name: 'b' });
++    expect(dup.status).toBe(409);
++    expect(dup.body.error.code).toBe('DUPLICATE_TEAM');
++    const missing = await request(app)
++      .patch(`${api}/00000000-0000-4000-8000-000000000000`)
++      .set(bearer(token))
++      .send({ name: 'z' });
++    expect(missing.status).toBe(404);
++    expect(missing.body.error.code).toBe('TEAM_NOT_FOUND');
++  });
++
++  describe('deactivation', () => {
++    it('detaches every user, clears leads and revokes all their sessions atomically', async () => {
++      const team = await createTeam();
++      const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++      const engineer = await createUser({ teamId: team.id, leadId: lead.id });
++      const teamAdmin = await createUser({ role: 'ADMIN', teamId: team.id });
++      const outsider = await createUser({ teamId: (await createTeam()).id });
++      const engineerSession = await login(app, engineer.email);
++      const adminLogin = await login(app, teamAdmin.email);
++      const outsiderSession = await login(app, outsider.email);
++
++      const res = await request(app)
++        .patch(`${api}/${team.id}`)
++        .set(bearer(adminLogin.token))
++        .send({ status: 'DEACTIVATED' });
++      expect(res.status).toBe(200);
++      expect(res.body.data.status).toBe('DEACTIVATED');
++
++      const members = await getPrisma().user.findMany({
++        where: { id: { in: [lead.id, engineer.id, teamAdmin.id] } },
++      });
++      for (const member of members) {
++        expect(member.teamId).toBeNull();
++        expect(member.leadId).toBeNull();
++      }
++      expect(
++        await getPrisma().userSession.count({
++          where: { userId: { in: [lead.id, engineer.id, teamAdmin.id] }, revoked: false },
++        }),
++      ).toBe(0);
++      expect(
++        (
++          await request(app)
++            .post('/api/v1/auth/refresh')
++            .set('Cookie', `ims_refresh_cookie=${engineerSession.refresh}`)
++        ).status,
++      ).toBe(401);
++
++      const untouched = await getPrisma().user.findUniqueOrThrow({ where: { id: outsider.id } });
++      expect(untouched.teamId).toBe(outsider.teamId);
++      expect(
++        (
++          await request(app)
++            .post('/api/v1/auth/refresh')
++            .set('Cookie', `ims_refresh_cookie=${outsiderSession.refresh}`)
++        ).status,
++      ).toBe(200);
++    });
++
++    it('does not restore users on reactivation', async () => {
++      const team = await createTeam();
++      const user = await createUser({ teamId: team.id });
++      const { token } = await adminSession(app);
++      await request(app)
++        .patch(`${api}/${team.id}`)
++        .set(bearer(token))
++        .send({ status: 'DEACTIVATED' });
++      const res = await request(app)
++        .patch(`${api}/${team.id}`)
++        .set(bearer(token))
++        .send({ status: 'ACTIVE' });
++      expect(res.status).toBe(200);
++      expect(res.body.data.status).toBe('ACTIVE');
++      expect(
++        (await getPrisma().user.findUniqueOrThrow({ where: { id: user.id } })).teamId,
++      ).toBeNull();
++    });
++
++    it.each(['OPEN', 'ACKNOWLEDGED', 'MITIGATING'] as const)(
++      'is blocked by a %s incident with 409 TEAM_WITH_OPEN_INCIDENT',
++      async (status) => {
++        const team = await createTeam();
++        const { admin, token } = await adminSession(app);
++        const service = await createService(team.id, admin.id);
++        await createIncident(team.id, service.id, status);
++        const res = await request(app)
++          .patch(`${api}/${team.id}`)
++          .set(bearer(token))
++          .send({ status: 'DEACTIVATED' });
++        expect(res.status).toBe(409);
++        expect(res.body.error.code).toBe('TEAM_WITH_OPEN_INCIDENT');
++        expect((await getPrisma().team.findUniqueOrThrow({ where: { id: team.id } })).status).toBe(
++          'ACTIVE',
++        );
++      },
++    );
++
++    it('is blocked by attached services with 403 INVALID_ACTION, and resolved incidents do not block', async () => {
++      const team = await createTeam();
++      const { admin, token } = await adminSession(app);
++      const service = await createService(team.id, admin.id);
++      await createIncident(team.id, service.id, 'RESOLVED');
++      await createIncident(team.id, service.id, 'CLOSED');
++      const res = await request(app)
++        .patch(`${api}/${team.id}`)
++        .set(bearer(token))
++        .send({ status: 'DEACTIVATED' });
++      expect(res.status).toBe(403);
++      expect(res.body.error.code).toBe('INVALID_ACTION');
++    });
++
++    it('reports TEAM_WITH_OPEN_INCIDENT when both blockers apply', async () => {
++      const team = await createTeam();
++      const { admin, token } = await adminSession(app);
++      const service = await createService(team.id, admin.id);
++      await createIncident(team.id, service.id, 'OPEN');
++      const res = await request(app)
++        .patch(`${api}/${team.id}`)
++        .set(bearer(token))
++        .send({ status: 'DEACTIVATED' });
++      expect(res.status).toBe(409);
++      expect(res.body.error.code).toBe('TEAM_WITH_OPEN_INCIDENT');
++    });
++
++    it('rolls back everything when a step fails mid-transaction', async () => {
++      const team = await createTeam();
++      const user = await createUser({ teamId: team.id });
++      const { token } = await adminSession(app);
++      const { refresh } = await login(app, user.email);
++      jest.spyOn(sessions, 'revokeSessionsForUsers').mockRejectedValueOnce(new Error('boom'));
++
++      const res = await request(app)
++        .patch(`${api}/${team.id}`)
++        .set(bearer(token))
++        .send({ name: 'renamed', status: 'DEACTIVATED' });
++      expect(res.status).toBe(500);
++      expect(res.body.error.code).toBe('INTERNAL_ERROR');
++
++      const after = await getPrisma().team.findUniqueOrThrow({ where: { id: team.id } });
++      expect(after).toMatchObject({ status: 'ACTIVE', name: team.name });
++      expect((await getPrisma().user.findUniqueOrThrow({ where: { id: user.id } })).teamId).toBe(
++        team.id,
++      );
++      expect(
++        (
++          await request(app)
++            .post('/api/v1/auth/refresh')
++            .set('Cookie', `ims_refresh_cookie=${refresh}`)
++        ).status,
++      ).toBe(200);
++    });
++  });
++});
+diff --git a/backend/test/integration/users.int-spec.ts b/backend/test/integration/users.int-spec.ts
+new file mode 100644
+index 0000000..9a16605
+--- /dev/null
++++ b/backend/test/integration/users.int-spec.ts
+@@ -0,0 +1,558 @@
++import request from 'supertest';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { getRedis } from '../../src/infra/redis/redis';
++import * as sessions from '../../src/modules/identity/auth/session.repository';
++import { buildTestApp } from '../helpers/app';
++import {
++  PASSWORD,
++  adminSession,
++  bearer,
++  createIncident,
++  createService,
++  createTeam,
++  createUser,
++  login,
++  resetState,
++  sessionFor,
++} from '../helpers/identity';
++
++const app = buildTestApp();
++const users = '/api/v1/identity/users';
++const teamUsers = (teamId: string) => `/api/v1/identity/teams/${teamId}/users`;
++const ZERO = '00000000-0000-4000-8000-000000000000';
++const USER_KEYS = [
++  'createdAt',
++  'email',
++  'id',
++  'leadId',
++  'name',
++  'role',
++  'status',
++  'teamId',
++  'updatedAt',
++];
++
++beforeEach(resetState);
++afterEach(() => jest.restoreAllMocks());
++afterAll(async () => {
++  await getPrisma().$disconnect();
++  getRedis().disconnect();
++});
++
++const body = (overrides: Record<string, unknown> = {}) => ({
++  name: 'New Person',
++  email: `new-${Math.random().toString(36).slice(2, 8)}@example.com`,
++  password: PASSWORD,
++  ...overrides,
++});
++const create = (token: string, payload: object) =>
++  request(app).post(users).set(bearer(token)).send(payload);
++const patch = (token: string, userId: string, payload: object) =>
++  request(app).patch(`${users}/${userId}`).set(bearer(token)).send(payload);
++const activeSessions = (userId: string) =>
++  getPrisma().userSession.count({ where: { userId, revoked: false } });
++
++describe('U1 POST /identity/users', () => {
++  it('creates an ACTIVE engineer with a lower-cased email and an Argon2 hash (201)', async () => {
++    const { token } = await adminSession(app);
++    const res = await create(token, body({ email: 'Person@Example.COM' }));
++    expect(res.status).toBe(201);
++    expect(Object.keys(res.body.data).sort()).toEqual(USER_KEYS);
++    expect(res.body.data).toMatchObject({
++      email: 'person@example.com',
++      role: 'ENGINEER',
++      status: 'ACTIVE',
++      teamId: null,
++      leadId: null,
++    });
++    expect(JSON.stringify(res.body)).not.toMatch(/passwordHash|argon2/i);
++
++    const stored = await getPrisma().user.findUniqueOrThrow({ where: { id: res.body.data.id } });
++    expect(stored.passwordHash).toMatch(/^\$argon2id\$/);
++    expect((await login(app, 'person@example.com')).res.status).toBe(200);
++  });
++
++  it('creates a team lead, and an engineer in a team under that lead', async () => {
++    const team = await createTeam();
++    const { token } = await adminSession(app);
++    const lead = await create(token, body({ role: 'TEAM_LEAD', teamId: team.id }));
++    expect(lead.status).toBe(201);
++    expect(lead.body.data).toMatchObject({ role: 'TEAM_LEAD', teamId: team.id });
++
++    const engineer = await create(token, body({ teamId: team.id, leadId: lead.body.data.id }));
++    expect(engineer.status).toBe(201);
++    expect(engineer.body.data).toMatchObject({ teamId: team.id, leadId: lead.body.data.id });
++  });
++
++  it('requires authentication and the ADMIN role', async () => {
++    const team = await createTeam();
++    expect((await request(app).post(users).send(body())).status).toBe(401);
++    for (const role of ['ENGINEER', 'TEAM_LEAD'] as const) {
++      const { token } = await sessionFor(app, role, team.id);
++      const res = await create(token, body());
++      expect(res.status).toBe(403);
++      expect(res.body.error.code).toBe('FORBIDDEN_ROLE');
++    }
++  });
++
++  it.each([
++    ['ADMIN role', { role: 'ADMIN' }],
++    ['short password', { password: 'short' }],
++    ['long password', { password: 'x'.repeat(25) }],
++    ['invalid email', { email: 'nope' }],
++    ['long name', { name: 'x'.repeat(51) }],
++    ['empty name', { name: '' }],
++    ['malformed teamId', { teamId: 'nope' }],
++    ['malformed leadId', { leadId: 'nope' }],
++  ])('rejects %s with 422', async (_n, override) => {
++    const { token } = await adminSession(app);
++    const res = await create(token, body(override));
++    expect(res.status).toBe(422);
++    expect(res.body.error.code).toBe('VALIDATION_FAILED');
++  });
++
++  it('rejects unknown fields (such as status) with 400', async () => {
++    const { token } = await adminSession(app);
++    expect((await create(token, body({ status: 'ACTIVE' }))).status).toBe(400);
++  });
++
++  it('rejects invalid team and lead references with 403 INVALID_ACTION', async () => {
++    const team = await createTeam();
++    const otherTeam = await createTeam();
++    const dead = await createTeam('dead', 'DEACTIVATED');
++    const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++    const inactiveLead = await createUser({
++      role: 'TEAM_LEAD',
++      teamId: team.id,
++      status: 'DEACTIVATED',
++    });
++    const engineer = await createUser({ teamId: team.id });
++    const { token } = await adminSession(app);
++
++    const cases: Record<string, unknown>[] = [
++      { teamId: ZERO },
++      { teamId: dead.id },
++      { leadId: lead.id },
++      { teamId: otherTeam.id, leadId: lead.id },
++      { teamId: team.id, leadId: inactiveLead.id },
++      { teamId: team.id, leadId: engineer.id },
++      { teamId: team.id, leadId: ZERO },
++      { role: 'TEAM_LEAD', teamId: team.id, leadId: lead.id },
++    ];
++    for (const override of cases) {
++      const res = await create(token, body(override));
++      expect(res.status).toBe(403);
++      expect(res.body.error.code).toBe('INVALID_ACTION');
++    }
++    expect(await getPrisma().user.count({ where: { name: 'New Person' } })).toBe(0);
++  });
++
++  it('rejects a duplicate email (any case) with 409, also under concurrency', async () => {
++    const { token } = await adminSession(app);
++    await createUser({ email: 'taken@example.com' });
++    const dup = await create(token, body({ email: 'TAKEN@example.com' }));
++    expect(dup.status).toBe(409);
++    expect(dup.body.error.code).toBe('EMAIL_ALREADY_EXISTS');
++
++    const race = await Promise.all(
++      [1, 2, 3, 4].map(() => create(token, body({ email: 'race@example.com' }))),
++    );
++    expect(race.map((r) => r.status).sort()).toEqual([201, 409, 409, 409]);
++    expect(await getPrisma().user.count({ where: { email: 'race@example.com' } })).toBe(1);
++  });
++});
++
++describe('U2 GET /identity/teams/:teamId/users', () => {
++  it('lets an Admin list any team and a Team Lead their own, without passwordHash', async () => {
++    const team = await createTeam();
++    const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id, name: 'b-lead' });
++    await createUser({ teamId: team.id, leadId: lead.id, name: 'a-eng' });
++    const { token: adminToken } = await adminSession(app);
++    const { token: leadToken } = await login(app, lead.email);
++
++    for (const token of [adminToken, leadToken]) {
++      const res = await request(app).get(teamUsers(team.id)).set(bearer(token));
++      expect(res.status).toBe(200);
++      expect(res.body.data.map((u: { name: string }) => u.name)).toEqual(['a-eng', 'b-lead']);
++      expect(Object.keys(res.body.data[0]).sort()).toEqual(USER_KEYS);
++      expect(res.body.pagination).toEqual({ limit: 10, offset: 0, hasMore: false });
++    }
++  });
++
++  it('filters, orders and paginates', async () => {
++    const team = await createTeam();
++    const { token } = await adminSession(app);
++    await createUser({ teamId: team.id, name: 'a', role: 'TEAM_LEAD' });
++    await createUser({ teamId: team.id, name: 'b' });
++    await createUser({ teamId: team.id, name: 'c', status: 'DEACTIVATED' });
++    const get = (q: string) =>
++      request(app)
++        .get(`${teamUsers(team.id)}?${q}`)
++        .set(bearer(token));
++    const names = (r: { body: { data: { name: string }[] } }) => r.body.data.map((u) => u.name);
++
++    expect(names(await get('role=TEAM_LEAD'))).toEqual(['a']);
++    expect(names(await get('status=DEACTIVATED'))).toEqual(['c']);
++    expect(names(await get('sort=desc'))).toEqual(['c', 'b', 'a']);
++    const page = await get('limit=2');
++    expect(names(page)).toEqual(['a', 'b']);
++    expect(page.body.pagination).toEqual({ limit: 2, offset: 0, hasMore: true });
++    expect(names(await get('limit=2&offset=2'))).toEqual(['c']);
++    expect((await get('role=ADMIN')).status).toBe(422);
++    expect((await get('limit=51')).status).toBe(422);
++  });
++
++  it('enforces role and team gates', async () => {
++    const team = await createTeam();
++    const other = await createTeam();
++    const get = (token: string, id: string) => request(app).get(teamUsers(id)).set(bearer(token));
++
++    expect((await request(app).get(teamUsers(team.id))).status).toBe(401);
++
++    const engineer = await sessionFor(app, 'ENGINEER', team.id);
++    const forbidden = await get(engineer.token, team.id);
++    expect(forbidden.status).toBe(403);
++    expect(forbidden.body.error.code).toBe('FORBIDDEN_ROLE');
++
++    const lead = await sessionFor(app, 'TEAM_LEAD', team.id);
++    const denied = await get(lead.token, other.id);
++    expect(denied.status).toBe(403);
++    expect(denied.body.error.code).toBe('TEAM_ACCESS_DENIED');
++
++    const teamless = await sessionFor(app, 'TEAM_LEAD', null);
++    const nullTeam = await get(teamless.token, team.id);
++    expect(nullTeam.status).toBe(403);
++    expect(nullTeam.body.error.code).toBe('INVALID_ACTION');
++  });
++
++  it('returns 404 TEAM_NOT_FOUND for an Admin and 422 for a malformed id', async () => {
++    const { token } = await adminSession(app);
++    const missing = await request(app).get(teamUsers(ZERO)).set(bearer(token));
++    expect(missing.status).toBe(404);
++    expect(missing.body.error.code).toBe('TEAM_NOT_FOUND');
++    expect((await request(app).get(teamUsers('nope')).set(bearer(token))).status).toBe(422);
++  });
++});
++
++describe('U3 GET /identity/users/:userId', () => {
++  it('lets an Admin read any user and a Team Lead users of their own team', async () => {
++    const team = await createTeam();
++    const other = await createTeam();
++    const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++    const mate = await createUser({ teamId: team.id });
++    const stranger = await createUser({ teamId: other.id });
++    const { token: adminToken } = await adminSession(app);
++    const { token: leadToken } = await login(app, lead.email);
++
++    const own = await request(app).get(`${users}/${mate.id}`).set(bearer(leadToken));
++    expect(own.status).toBe(200);
++    expect(Object.keys(own.body.data).sort()).toEqual(USER_KEYS);
++    expect(JSON.stringify(own.body)).not.toMatch(/passwordHash/);
++    expect((await request(app).get(`${users}/${stranger.id}`).set(bearer(adminToken))).status).toBe(
++      200,
++    );
++
++    const denied = await request(app).get(`${users}/${stranger.id}`).set(bearer(leadToken));
++    expect(denied.status).toBe(403);
++    expect(denied.body.error.code).toBe('TEAM_ACCESS_DENIED');
++  });
++
++  it('enforces authentication, role, null-team, 404 and 422', async () => {
++    const team = await createTeam();
++    const user = await createUser({ teamId: team.id });
++    expect((await request(app).get(`${users}/${user.id}`)).status).toBe(401);
++
++    const engineer = await sessionFor(app, 'ENGINEER', team.id);
++    const byEngineer = await request(app).get(`${users}/${user.id}`).set(bearer(engineer.token));
++    expect(byEngineer.status).toBe(403);
++    expect(byEngineer.body.error.code).toBe('FORBIDDEN_ROLE');
++
++    const teamless = await sessionFor(app, 'TEAM_LEAD', null);
++    const nullTeam = await request(app).get(`${users}/${user.id}`).set(bearer(teamless.token));
++    expect(nullTeam.body.error.code).toBe('INVALID_ACTION');
++
++    const { token } = await adminSession(app);
++    const missing = await request(app).get(`${users}/${ZERO}`).set(bearer(token));
++    expect(missing.status).toBe(404);
++    expect(missing.body.error).toMatchObject({
++      code: 'USER_NOT_FOUND',
++      details: [{ resource: 'user' }],
++    });
++    expect((await request(app).get(`${users}/nope`).set(bearer(token))).status).toBe(422);
++  });
++});
++
++describe('U4 PATCH /identity/users/:userId', () => {
++  it('updates the name without revoking sessions and never returns passwordHash', async () => {
++    const user = await createUser();
++    const { token } = await adminSession(app);
++    await login(app, user.email);
++    const res = await patch(token, user.id, { name: 'Renamed' });
++    expect(res.status).toBe(200);
++    expect(res.body.data.name).toBe('Renamed');
++    expect(Object.keys(res.body.data).sort()).toEqual(USER_KEYS);
++    expect(await activeSessions(user.id)).toBe(1);
++  });
++
++  it('validates the request and the caller', async () => {
++    const team = await createTeam();
++    const user = await createUser({ teamId: team.id });
++    const { token } = await adminSession(app);
++
++    expect((await patch(token, user.id, {})).status).toBe(422);
++    expect((await patch(token, user.id, { password: 'short' })).status).toBe(422);
++    expect((await patch(token, user.id, { role: 'ADMIN' })).status).toBe(422);
++    expect((await patch(token, user.id, { teamId: 'nope' })).status).toBe(422);
++    expect((await patch(token, 'nope', { name: 'x' })).status).toBe(422);
++    const immutable = await patch(token, user.id, { email: 'other@example.com' });
++    expect(immutable.status).toBe(400);
++    expect(immutable.body.error.code).toBe('BAD_REQUEST');
++
++    expect((await request(app).patch(`${users}/${user.id}`).send({ name: 'x' })).status).toBe(401);
++    const lead = await sessionFor(app, 'TEAM_LEAD', team.id);
++    const forbidden = await patch(lead.token, user.id, { name: 'x' });
++    expect(forbidden.status).toBe(403);
++    expect(forbidden.body.error.code).toBe('FORBIDDEN_ROLE');
++
++    const missing = await patch(token, ZERO, { name: 'x' });
++    expect(missing.status).toBe(404);
++    expect(missing.body.error.code).toBe('USER_NOT_FOUND');
++  });
++
++  describe.each([
++    ['password', () => ({ password: 'Another1pass' })],
++    ['role', () => ({ role: 'TEAM_LEAD' })],
++    ['status', () => ({ status: 'DEACTIVATED' })],
++  ])('revokes all sessions on a %s change', (_field, change) => {
++    it('revokes every session of the user and nobody else', async () => {
++      const team = await createTeam();
++      const user = await createUser({ teamId: team.id });
++      const bystander = await createUser({ teamId: team.id });
++      const { token } = await adminSession(app);
++      const first = await login(app, user.email);
++      await login(app, user.email);
++      await login(app, bystander.email);
++
++      expect((await patch(token, user.id, change())).status).toBe(200);
++      expect(await activeSessions(user.id)).toBe(0);
++      expect(await activeSessions(bystander.id)).toBe(1);
++      expect(
++        (
++          await request(app)
++            .post('/api/v1/auth/refresh')
++            .set('Cookie', `ims_refresh_cookie=${first.refresh}`)
++        ).status,
++      ).toBe(401);
++    });
++  });
++
++  it('revokes sessions on a teamId change and clears the lead', async () => {
++    const from = await createTeam();
++    const to = await createTeam();
++    const lead = await createUser({ role: 'TEAM_LEAD', teamId: from.id });
++    const user = await createUser({ teamId: from.id, leadId: lead.id });
++    const { token } = await adminSession(app);
++    await login(app, user.email);
++
++    const res = await patch(token, user.id, { teamId: to.id });
++    expect(res.status).toBe(200);
++    expect(res.body.data).toMatchObject({ teamId: to.id, leadId: null });
++    expect(await activeSessions(user.id)).toBe(0);
++  });
++
++  it('changes the password for real: the new one logs in, the old one does not', async () => {
++    const user = await createUser();
++    const { token } = await adminSession(app);
++    await patch(token, user.id, { password: 'Another1pass' });
++    const stored = await getPrisma().user.findUniqueOrThrow({ where: { id: user.id } });
++    expect(stored.passwordHash).toMatch(/^\$argon2id\$/);
++    expect((await login(app, user.email, 'Another1pass')).res.status).toBe(200);
++    await expect(login(app, user.email, PASSWORD)).rejects.toThrow('401');
++  });
++
++  it('deactivates a user so that login returns ACCOUNT_DEACTIVATED, and reactivates', async () => {
++    const user = await createUser();
++    const { token } = await adminSession(app);
++    await patch(token, user.id, { status: 'DEACTIVATED' });
++    const blocked = await request(app)
++      .post('/api/v1/auth/login')
++      .send({ email: user.email, password: PASSWORD });
++    expect(blocked.body.error.code).toBe('ACCOUNT_DEACTIVATED');
++    await patch(token, user.id, { status: 'ACTIVE' });
++    expect((await login(app, user.email)).res.status).toBe(200);
++  });
++
++  it('assigns a lead without revoking sessions, and validates the lead', async () => {
++    const team = await createTeam();
++    const other = await createTeam();
++    const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++    const foreignLead = await createUser({ role: 'TEAM_LEAD', teamId: other.id });
++    const engineer = await createUser({ teamId: team.id });
++    const teamless = await createUser();
++    const { token } = await adminSession(app);
++    await login(app, engineer.email);
++
++    expect((await patch(token, engineer.id, { leadId: lead.id })).body.data.leadId).toBe(lead.id);
++    expect(await activeSessions(engineer.id)).toBe(1);
++
++    for (const [target, leadId] of [
++      [engineer.id, foreignLead.id],
++      [engineer.id, engineer.id],
++      [engineer.id, ZERO],
++      [teamless.id, lead.id],
++      [lead.id, lead.id],
++    ]) {
++      const res = await patch(token, target, { leadId });
++      expect(res.status).toBe(403);
++      expect(res.body.error.code).toBe('INVALID_ACTION');
++    }
++  });
++
++  it('never allows a leadId or a role change on an Admin, but allows other changes', async () => {
++    const team = await createTeam();
++    const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++    const otherAdmin = await createUser({ role: 'ADMIN' });
++    const { token } = await adminSession(app);
++
++    expect((await patch(token, otherAdmin.id, { leadId: lead.id })).body.error.code).toBe(
++      'INVALID_ACTION',
++    );
++    const role = await patch(token, otherAdmin.id, { role: 'ENGINEER' });
++    expect(role.status).toBe(403);
++    expect(role.body.error.code).toBe('INVALID_ACTION');
++
++    const ok = await patch(token, otherAdmin.id, { name: 'Root', teamId: team.id });
++    expect(ok.status).toBe(200);
++    expect(ok.body.data).toMatchObject({ name: 'Root', teamId: team.id, role: 'ADMIN' });
++  });
++
++  it('ENGINEER → TEAM_LEAD clears the lead; the reverse is blocked while engineers report', async () => {
++    const team = await createTeam();
++    const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++    const engineer = await createUser({ teamId: team.id, leadId: lead.id });
++    const { token } = await adminSession(app);
++
++    const promoted = await patch(token, engineer.id, { role: 'TEAM_LEAD' });
++    expect(promoted.body.data).toMatchObject({ role: 'TEAM_LEAD', leadId: null });
++
++    const lonely = await createUser({ teamId: team.id, leadId: lead.id });
++    const blocked = await patch(token, lead.id, { role: 'ENGINEER' });
++    expect(blocked.status).toBe(409);
++    expect(blocked.body.error.code).toBe('CONFLICT_STILL_HAS_ENGINEERS');
++    await getPrisma().user.update({ where: { id: lonely.id }, data: { leadId: null } });
++    expect((await patch(token, lead.id, { role: 'ENGINEER' })).status).toBe(200);
++  });
++
++  it('blocks deactivating or moving a Team Lead who still has engineers', async () => {
++    const team = await createTeam();
++    const other = await createTeam();
++    const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++    await createUser({ teamId: team.id, leadId: lead.id });
++    const { token } = await adminSession(app);
++
++    for (const change of [{ status: 'DEACTIVATED' }, { teamId: other.id }]) {
++      const res = await patch(token, lead.id, change);
++      expect(res.status).toBe(409);
++      expect(res.body.error.code).toBe('CONFLICT_STILL_HAS_ENGINEERS');
++    }
++  });
++
++  describe('user acknowledgedBy an unresolved incident', () => {
++    it.each(['OPEN', 'ACKNOWLEDGED', 'MITIGATING'] as const)(
++      'rejects role, team and status changes while a %s incident exists (409)',
++      async (incidentStatus) => {
++        const team = await createTeam();
++        const other = await createTeam();
++        const { admin, token } = await adminSession(app);
++        const user = await createUser({ teamId: team.id });
++        const service = await createService(team.id, admin.id);
++        await createIncident(team.id, service.id, incidentStatus, user.id);
++
++        for (const change of [
++          { role: 'TEAM_LEAD' },
++          { teamId: other.id },
++          { status: 'DEACTIVATED' },
++        ]) {
++          const res = await patch(token, user.id, change);
++          expect(res.status).toBe(409);
++          expect(res.body.error.code).toBe('USER_ASSIGNED_CURRENTLY');
++        }
++        expect(await patch(token, user.id, { name: 'still fine' })).toHaveProperty('status', 200);
++      },
++    );
++
++    it('does not block once the incident is resolved, and setting a first team is always allowed', async () => {
++      const team = await createTeam();
++      const other = await createTeam();
++      const { admin, token } = await adminSession(app);
++      const user = await createUser({ teamId: team.id });
++      const service = await createService(team.id, admin.id);
++      await createIncident(team.id, service.id, 'RESOLVED', user.id);
++      expect((await patch(token, user.id, { teamId: other.id })).status).toBe(200);
++
++      const teamless = await createUser();
++      const incident = await createIncident(team.id, service.id, 'OPEN', teamless.id);
++      expect(incident.status).toBe('OPEN');
++      expect((await patch(token, teamless.id, { teamId: team.id })).status).toBe(200);
++    });
++
++    it('USER_ASSIGNED_CURRENTLY wins when both 409s apply', async () => {
++      const team = await createTeam();
++      const { admin, token } = await adminSession(app);
++      const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++      await createUser({ teamId: team.id, leadId: lead.id });
++      const service = await createService(team.id, admin.id);
++      await createIncident(team.id, service.id, 'ACKNOWLEDGED', lead.id);
++
++      const res = await patch(token, lead.id, { status: 'DEACTIVATED' });
++      expect(res.status).toBe(409);
++      expect(res.body.error.code).toBe('USER_ASSIGNED_CURRENTLY');
++    });
++  });
++
++  it('rejects an unknown or deactivated team with 403 INVALID_ACTION', async () => {
++    const dead = await createTeam('dead', 'DEACTIVATED');
++    const user = await createUser();
++    const { token } = await adminSession(app);
++    for (const teamId of [ZERO, dead.id]) {
++      const res = await patch(token, user.id, { teamId });
++      expect(res.status).toBe(403);
++      expect(res.body.error.code).toBe('INVALID_ACTION');
++    }
++  });
++
++  it('rolls back the update when session revocation fails', async () => {
++    const user = await createUser();
++    const { token } = await adminSession(app);
++    await login(app, user.email);
++    jest.spyOn(sessions, 'revokeSessionsForUsers').mockRejectedValueOnce(new Error('boom'));
++
++    const res = await patch(token, user.id, { name: 'Changed', status: 'DEACTIVATED' });
++    expect(res.status).toBe(500);
++    const stored = await getPrisma().user.findUniqueOrThrow({ where: { id: user.id } });
++    expect(stored).toMatchObject({ name: user.name, status: 'ACTIVE' });
++    expect(await activeSessions(user.id)).toBe(1);
++  });
++
++  it('keeps the lead invariant when a lead is demoted while an engineer is created under them', async () => {
++    for (let round = 0; round < 3; round++) {
++      await resetState();
++      const team = await createTeam();
++      const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++      const { token } = await adminSession(app);
++
++      const [demote, hire] = await Promise.all([
++        patch(token, lead.id, { role: 'ENGINEER' }),
++        create(token, body({ teamId: team.id, leadId: lead.id })),
++      ]);
++      expect([demote.status, hire.status].sort()).toEqual(
++        demote.status === 200 ? [200, 403] : [201, 409],
++      );
++
++      const violations = await getPrisma().$queryRaw<{ n: bigint }[]>`
++        SELECT count(*) AS n FROM "User" e JOIN "User" l ON l."id" = e."leadId"
++        WHERE l."role" <> 'TEAM_LEAD'`;
++      expect(Number(violations[0].n)).toBe(0);
++    }
++  });
++});

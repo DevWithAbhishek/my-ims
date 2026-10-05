@@ -26,7 +26,8 @@
 ```sql
     CREATE TABLE Team (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-        name text NOT NULL,
+        name text NOT NULL UNIQUE,
+        status text DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DEACTIVATED')),
 
         createdAt timestamptz NOT NULL DEFAULT now(),
         updatedAt timestamptz NOT NULL DEFAULT now()
@@ -38,10 +39,10 @@
         email text NOT NULL UNIQUE,
         passwordHash text NOT NULL,
 
-        role text NOT NULL DEFAULT 'ENGINEER' CHECK (role IN ('ENGINEER', 'TEAM_LEAD', 'ADMIN')),
-        status text NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DEACTIVATED')),
+        role text DEFAULT 'ENGINEER' CHECK (role IN ('ENGINEER', 'TEAM_LEAD', 'ADMIN')),
+        status text DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DEACTIVATED')),
 
-        teamId uuid NOT NULL REFERENCES Team(id),
+        teamId uuid REFERENCES Team(id),
         leadId uuid REFERENCES User(id),
 
         createdAt timestamptz NOT NULL DEFAULT now(),
@@ -65,8 +66,9 @@
 
     CREATE TABLE AppService (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-        name text NOT NULL,
+        name text NOT NULL UNIQUE,
         defaultSeverity text NOT NULL DEFAULT 'P1' CHECK (defaultSeverity IN ('P0', 'P1', 'P2', 'P3')),
+        status text DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','DEACTIVATED')),
 
         P0ResponseSlaMinutes int NOT NULL,
         P0ResolutionSlaMinutes int NOT NULL,
@@ -95,7 +97,7 @@
         name text NOT NULL,
         sourceType text NOT NULL,
         configuration jsonb NOT NULL,
-        status text NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DEACTIVATED')),
+        status text DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DEACTIVATED')),
 
         createdAt timestamptz NOT NULL DEFAULT now(),
         updatedAt timestamptz NOT NULL DEFAULT now()
@@ -198,7 +200,7 @@
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
         metadata jsonb,
 
-        eventType text NOT NULL CHECK (eventType in ('ALERT_RECEIVED', 'ALERT_DUPLICATE', 'AI_TRIAGE_COMPLETED', 'ASSIGNED', 'INCIDENT_CREATED', 'ACKNOWLEDGED', 'SEVERITY_CONFIRMED', 'COMMENT_ADDED', 'SLA_WARNING', 'ESCALATED_L1',  'ESCALATED_L2',  'ESCALATED_L3',  'ESCALATED_L4', 'SOURCE_ALERT_RESOLVED',  'RESOLVED', 'NOTIFIED', 'POSTMORTEM_GENERATED', 'POSTMORTEM_REVIEWED','AI_INVESTIGATION_COMPLETED', 'CLOSED')),
+        eventType text NOT NULL CHECK (eventType in ('ALERT_RECEIVED', 'ALERT_DUPLICATE', 'AI_TRIAGE_COMPLETED', 'ASSIGNED', 'INCIDENT_CREATED', 'ACKNOWLEDGED', 'SEVERITY_CONFIRMED', 'COMMENT_ADDED', 'SLA_WARNING', 'ESCALATED_L1',  'ESCALATED_L2',  'ESCALATED_L3',  'ESCALATED_L4', 'SOURCE_ALERT_RESOLVED',  'RESOLVED', 'NOTIFIED', 'POSTMORTEM_GENERATED', 'POSTMORTEM_REVIEWED','AI_INVESTIGATION_COMPLETED', 'CLOSED', 'REASSIGNED', 'OPEN')),
 
         actor uuid,
         incidentId uuid REFERENCES Incident(id),
@@ -225,7 +227,7 @@
         modelVersion text,
         prompt text,
         inputData text,
-        reviewStatus text NOT NULL DEFAULT 'PENDING' CHECK (reviewStatus IN ('PENDING', 'REJECTED', 'REVIEWED')),
+        reviewStatus text NOT NULL DEFAULT 'PENDING' CHECK (reviewStatus IN ('GENERATING', 'DRAFT', 'REVIEWED')),
         reviewedAt timestamptz,
 
         reviewedBy uuid REFERENCES User(id),
@@ -243,7 +245,7 @@
         attemptCount int,
         lastAttemptTimestamp timestamptz,
         providerResponse jsonb,
-        idempotencyKey text UNIQUE,
+        idempotencyKey text NOT NULL UNIQUE,
 
         recipients uuid[],
         incidentId uuid REFERENCES Incident(id),
@@ -259,7 +261,7 @@
         model text,
         modelVersion text,
         input jsonb NOT NULL,
-        idempotencyKey text UNIQUE,
+        idempotencyKey text NOT NULL UNIQUE,
 
         requestedBy uuid NOT NULL REFERENCES User(id),
         incidentId uuid NOT NULL REFERENCES Incident(id),
@@ -276,11 +278,10 @@
         relevanceInfo text,
         evidenceType text NOT NULL CHECK (evidenceType IN ('FACT','INFERENCE','UNKNOWN')),
 
-        incidentId uuid NOT NULL REFERENCES Incident(id),
+        investigationId uuid NOT NULL REFERENCES Investigation(id),
 
         createdAt timestamptz NOT NULL DEFAULT now()
     );
-    CREATE INDEX idx_evidence_incident_type ON Evidence(incidentId, sourceType);
 
     CREATE TABLE Evaluation (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -289,10 +290,7 @@
         constraints text NOT NULL,
         result jsonb NOT NULL,
 
-        incidentId uuid NOT NULL REFERENCES Incident(id),
-
         createdAt timestamptz NOT NULL DEFAULT now()
     );
-    CREATE INDEX idx_evaluation_incident ON Evaluation(incidentId);
 
 ```

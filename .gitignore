@@ -1,0 +1,10 @@
+coverage
+node_modules
+.env
+.env.*
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+# Prisma client is generated (npm run prisma:generate / npm run build)
+src/generated/

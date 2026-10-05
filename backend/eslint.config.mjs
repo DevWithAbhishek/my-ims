@@ -60,6 +60,12 @@ export default tseslint.config(
               allow: [['module', { moduleName: '{{from.moduleName}}' }]],
             },
 
+            // Every module can use identity (auth guard and authorization helpers)
+            {
+              from: 'module',
+              allow: [['module', { moduleName: 'identity' }]],
+            },
+
             // alerts -> incidents, appService
             {
               from: [['module', { moduleName: 'alerts' }]],

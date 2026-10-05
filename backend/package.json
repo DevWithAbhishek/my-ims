@@ -8,6 +8,7 @@
     "prisma:generate": "prisma generate",
     "start": "node dist/main.js",
     "start:worker": "node dist/worker.js",
+    "seed:admin": "tsx src/scripts/seed-admin.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "jest --config jest.config.js",
     "test:int": "jest --config jest.int.config.js",

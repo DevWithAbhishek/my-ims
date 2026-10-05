@@ -80,7 +80,7 @@ Each write endpoint is a single transaction (including session revocation). Uniq
 None. (Rate-limit counters and blocks live in Redis.) No audit events are written by this slice.
 
 ## 10. Failure & Recovery
-The error catalogue lists `503 DEPENDENCY_UNAVAILABLE` (with `Retry-After`) when a required dependency such as Redis is down. The design does not define whether the A1/A2 rate limiter fails open or closed during a Redis outage; do not invent that behavior (stop per `AGENTS.md` §13 if it must be decided). Database failure rolls back the whole operation, including session revocation. Expired/invalid access token → `401 UNAUTHENTICATED`; client refreshes via A2.
+The error catalogue lists `503 DEPENDENCY_UNAVAILABLE` (with `Retry-After`) when a required dependency such as Redis is down. The design is the A1/A2 rate limiter fails-closed during a Redis outage. Database failure rolls back the whole operation, including session revocation. Expired/invalid access token → `401 UNAUTHENTICATED`; client refreshes via A2.
 
 ## 11. Implementation Surface
 Application: auth and identity (users/teams) modules — controllers, services, repositories, Zod DTOs, Argon2 password hashing (default configuration), JWT/cookie helpers, rate-limit helper (Redis), guard/authorization helpers exported via `index.ts`. Database: no schema change expected (models exist). Tests: unit (token/cookie, rate-limit ladder, role/team helpers), integration (all endpoints against PostgreSQL + Redis). Tooling: seed script and its `package.json` script.
