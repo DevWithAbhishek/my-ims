@@ -28,8 +28,8 @@ async function main(): Promise<void> {
 
   onShutdownSignal(async () => {
     await new Promise<void>((resolve, reject) => {
-      server.close((err) => (err ? reject(err) : resolve()));
-      server.closeIdleConnections();
+      server.close((err) => (err ? reject(err) : resolve())); // stops the HTTP server from accepting new connections and waits for existing connections to finish before its callback completes.
+      server.closeIdleConnections(); // This closes idle HTTP connections, including keep-alive connections that aren't currently processing a request.
     });
     await disconnectPrisma();
     await closeRedis();

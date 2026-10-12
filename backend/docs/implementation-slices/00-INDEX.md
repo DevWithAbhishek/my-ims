@@ -604,7 +604,18 @@ What is the canonical outbox event catalog, including:
 - whether the event is mandatory or optional?
 
 **Answer:**
-<COME BACK AGAIN>
+
+Defined in AGENTS.md already. Mentioning it again:
+
+**Outbox event catalog** (repo-wide contract; one module exports these constants, payloads carry ids and the minimum facts only, plus the originating `requestId` for log correlation — never secrets, prompts, or payload bodies). Queue names: `ai-triage`, `sla-escalation`, `notifications`, `postmortem`, `investigation`.
+
+| Event type                        | Written (in the producer's transaction) by                                                         | Consumer queue   | Payload                                                               |
+| --------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------- | --------------------------------------------------------------------- |
+| `ALERT_TRIAGE_REQUESTED`          | alert ingestion (incident created)                                                                 | `ai-triage`      | `{ alertId, incidentId }`                                             |
+| `SLA_EVALUATION_REQUESTED`        | ingestion; severity/ack/unassign changes, when the SLA scheduling mechanism needs it               | `sla-escalation` | `{ incidentId }`                                                      |
+| `NOTIFICATION_REQUESTED`          | lifecycle actions, SLA/escalation, postmortem generation failure/closure, admin rate-limit notices | `notifications`  | `{ kind, incidentId?, actorId?, … ids needed to resolve recipients }` |
+| `POSTMORTEM_GENERATION_REQUESTED` | resolve (I8), retry (P4)                                                                           | `postmortem`     | `{ postmortemId, incidentId }`                                        |
+| `INVESTIGATION_REQUESTED`         | investigation request (N1)                                                                         | `investigation`  | `{ investigationId, incidentId }`                                     |
 
 >
 
@@ -665,6 +676,45 @@ If Redis/BullMQ becomes unavailable or is wiped:
 - whether any Redis-only state is intentionally ephemeral.
 
 **Answer:**
+
+Redis is never the source of truth for business state. Workers run as a separate process (dist/worker.js).
+
+- what work is recoverable from PostgreSQL/outbox?
+  The unpublished events marked as PENDING in the OutboxEvent table. But we need to add something more - to re-publish the events that were not successfully executed by workers at time of Redis / BullMQ unavailability.
+  Selected solution:
+  Expand the lifecycle to distinguish at least: PENDING → PUBLISHED → PROCESSING → SUCCESS, with FAILED for a defined failure state.
+  Add sufficient metadata to identify stale work, such as publishedAt, a processing lease or heartbeat, and error details.
+  A stale PROCESSING state must also be recoverable if the worker crashes. A lease or timeout is necessary; otherwise, the event can remain stuck indefinitely.
+  _Limitation: The outbox now also acts as an execution ledger. The publisher and workers must coordinate state transitions carefully. A PUBLISHED event cannot simply be ignored forever: a recovery process must detect when it has not progressed and safely republish it._
+
+- what work is lost?
+  No critical work exists only in Redis.
+  Current aim is to persist task intent and required business state in PostgreSQL; treat BullMQ jobs as re-buildable execution messages.
+  Required pending work is republished. Redis-specific execution metadata may be lost.
+
+- If Redis loses delayed SLA jobs, how should they be recreated?
+  Persist deadlines in PostgreSQL + Periodic SLA reconciliation.
+  Store or derive the applicable warning and breach deadlines from incident creation time, current severity, and SLA policy. Recreate missing jobs from these deadlines.
+  Run a recurring worker that queries PostgreSQL for incidents nearing warning/breach deadlines and processes due actions. BullMQ delayed jobs may be an optimization, not the sole timer.
+  BullMQ delayed jobs can provide timely execution, while reconciliation protects against lost timers.
+
+- how notifications/AI/postmortem/investigation jobs are recovered?
+  Transactional outbox per work request.
+  outbox per work request Each required task is represented by a durable outbox event, published to the corresponding BullMQ queue.
+  Unpublished events are republished after Redis recovers. Consumers must be idempotent.
+
+- whether any Redis-only state is intentionally ephemeral?
+
+| Category                                      | Treatment                                                                                                      |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Cache entries                                 | Ephemeral: Expire and rebuild on demand                                                                        |
+| Rate-limit counters                           | Ephemeral: Reset after loss or expiry                                                                          |
+| BullMQ job execution metadata                 | Re-constructable: Recreate jobs from the outbox and task state                                                 |
+| Delayed SLA timers                            | Re-constructable: Reconstruct from durable deadlines and reconciliation                                        |
+| Worker locks and temporary coordination state | Re-constructable: Recover through lease expiry and retry mechanisms, with safe lease and concurrency handling. |
+| Temporary AI response or computation cache    | Ephemeral: Discard on loss, persist final results that the product needs to retain.                            |
+| Notification delivery status                  | Durable: Persist delivery attempts and outcomes in PostgreSQL                                                  |
+| Audit and business events                     | Durable: Persist in PostgreSQL                                                                                 |
 
 >
 

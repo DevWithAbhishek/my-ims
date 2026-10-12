@@ -12,7 +12,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres -d ims']
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d ims'] # Check Postgres: `docker compose exec postgres pg_isready -U postgres -d ims`
       interval: 5s
       timeout: 3s
       retries: 10
@@ -20,13 +20,15 @@ services:
   redis:
     image: redis:7-alpine
     # BullMQ requires noeviction; AOF keeps queued jobs across restarts (ADR-005).
+    # --appendonly yes: Enables Redis AOF persistence, recording write operations for recovery after restart.
+    # --maxmemory-policy noeviction: Prevents Redis from evicting existing keys when the configured memory limit is reached; writes that need additional memory can fail instead.
     command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
     ports:
       - '6379:6379'
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      test: ['CMD', 'redis-cli', 'ping'] # Check Redis: `docker compose exec redis redis-cli ping`
       interval: 5s
       timeout: 3s
       retries: 10

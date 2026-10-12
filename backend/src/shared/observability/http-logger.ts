@@ -10,9 +10,9 @@ export const httpLogger = pinoHttp({
   logger,
   genReqId: (_req, res) => (res as Response).locals.requestId as string,
   customProps: (req) => ({ requestId: (req as Request).res?.locals.requestId as string }),
-  autoLogging: { ignore: (req) => req.url === '/health' },
+  autoLogging: { ignore: (req) => req.url === '/health' }, // Suppresses automatic request-completion logging for requests whose URL is exactly /health.
   serializers: {
     req: (req: Request) => ({ id: req.id, method: req.method, url: req.url.split('?')[0] }),
-    res: (res: Response) => ({ statusCode: res.statusCode }),
+    res: (res: Response) => ({ statusCode: res.statusCode }), // Restricts the serialized response object to its HTTP status code.
   },
 });
