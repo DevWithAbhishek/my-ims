@@ -24,6 +24,11 @@ export const getPolicyHandler: RequestHandler = async (req, res) => {
 export const updatePolicyHandler: RequestHandler = async (req, res) => {
   const { serviceId, escalationPolicyId } = parseOrThrow(policyParamsSchema, req.params);
   const body = parseOrThrow(updatePolicyBodySchema, req.body);
-  const policy = await policyService.updatePolicyUsers(serviceId, escalationPolicyId, body);
+  const policy = await policyService.updatePolicyUsers(
+    serviceId,
+    escalationPolicyId,
+    body,
+    getAuth(req).userId,
+  );
   res.status(200).json({ data: policy });
 };

@@ -1,3 +1,4 @@
+import { appendAuditEvent } from '../../../infra/audit/append-audit-event.js';
 import { isUniqueViolation } from '../../../infra/db/errors.js';
 import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
 import { ConflictError } from '../../../shared/errors/AppError.js';
@@ -100,7 +101,11 @@ async function lockInOrder(tx: Db, teamIds: string[], userIds: string[]): Promis
   for (const id of [...new Set(userIds)].sort()) await lockRowForUpdate(tx, 'User', id);
 }
 
-export async function updateUser(userId: string, body: UpdateUserBody): Promise<UserResponse> {
+export async function updateUser(
+  userId: string,
+  body: UpdateUserBody,
+  actorId: string,
+): Promise<UserResponse> {
   const passwordHash = body.password === undefined ? undefined : await hashPassword(body.password);
   return runIdentityTransaction(async (tx) => {
     const preRead = await findUserById(tx, userId);
@@ -125,6 +130,20 @@ export async function updateUser(userId: string, body: UpdateUserBody): Promise<
       ...plan.data,
       ...(passwordHash === undefined ? {} : { passwordHash }),
     });
+    // Field names only, never values; a password change shows just the name `password`.
+    const changedFields = [
+      // A re-sent, identical name is not a change (the plan keeps it, the audit trail must not).
+      ...Object.keys(plan.data).filter((key) => key !== 'name' || plan.data.name !== target.name),
+      ...(body.password === undefined ? [] : ['password']),
+    ];
+    if (changedFields.length > 0) {
+      await appendAuditEvent(tx, {
+        incidentId: null,
+        eventType: plan.data.status === 'DEACTIVATED' ? 'USER_DEACTIVATED' : 'USER_UPDATED',
+        actorId,
+        metadata: { userId, changedFields },
+      });
+    }
     if (plan.revokeSessions) await revokeSessionsForUsers(tx, [userId]);
     return toUserResponse(updated);
   });

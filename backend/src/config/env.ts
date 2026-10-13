@@ -43,20 +43,22 @@ export class ConfigError extends Error {
   }
 }
 
+function toConfigError(env: NodeJS.ProcessEnv, issues: z.ZodError['issues']): ConfigError {
+  const problems = new Map<string, string>();
+  for (const issue of issues) {
+    const name = String(issue.path[0] ?? 'environment');
+    const missing = env[name] === undefined || env[name] === '';
+    problems.set(name, missing ? 'is required' : issue.message);
+  }
+  const variables = [...problems.keys()];
+  const detail = [...problems].map(([name, problem]) => `${name} ${problem}`).join('; ');
+  return new ConfigError(variables, `Invalid configuration: ${detail}`);
+}
+
 export function parseConfig(env: NodeJS.ProcessEnv): Config {
   const result = envSchema.safeParse(env);
 
-  if (!result.success) {
-    const problems = new Map<string, string>();
-    for (const issue of result.error.issues) {
-      const name = String(issue.path[0] ?? 'environment');
-      const missing = env[name] === undefined || env[name] === '';
-      problems.set(name, missing ? 'is required' : issue.message);
-    }
-    const variables = [...problems.keys()];
-    const detail = [...problems].map(([name, problem]) => `${name} ${problem}`).join('; ');
-    throw new ConfigError(variables, `Invalid configuration: ${detail}`);
-  }
+  if (!result.success) throw toConfigError(env, result.error.issues);
 
   const values = result.data;
   return {
@@ -80,4 +82,120 @@ export function getConfig(): Config {
     cached = parseConfig(process.env);
   }
   return cached;
+}
+
+/** Names of the queues that have their own worker rate limit (see `src/infra/jobs/events.ts`). */
+export const RATE_LIMITED_QUEUES = [
+  'ai-triage',
+  'sla-escalation',
+  'notifications',
+  'postmortem',
+  'investigation',
+] as const;
+
+export type RateLimitedQueue = (typeof RATE_LIMITED_QUEUES)[number];
+
+/** Outbox, relay and worker reliability settings (SLICE-08). Every value must be configured. */
+export interface JobsConfig {
+  relayPollIntervalMs: number;
+  relayBatchSize: number;
+  claimLeaseMs: number;
+  processingWindowMs: number;
+  publishTimeoutMs: number;
+  publishBackoffBaseMs: number;
+  publishBackoffCapMs: number;
+  executionBackoffBaseMs: number;
+  executionBackoffCapMs: number;
+  executionAttempts: number;
+  staleRecoveryIntervalMs: number;
+  retentionWindowMs: number;
+  retentionIntervalMs: number;
+  workerConcurrency: number;
+  queueRateLimits: Record<RateLimitedQueue, { max: number; durationMs: number }>;
+}
+
+const positiveInt = z.coerce.number().int().min(1);
+
+const rateLimitShape = Object.fromEntries(
+  RATE_LIMITED_QUEUES.flatMap((queue) => {
+    const prefix = `JOBS_RATE_${queue.toUpperCase().replace(/-/g, '_')}`;
+    return [
+      [`${prefix}_MAX`, positiveInt],
+      [`${prefix}_DURATION_MS`, positiveInt],
+    ];
+  }),
+) as Record<string, typeof positiveInt>;
+
+const jobsEnvSchema = z
+  .object({
+    OUTBOX_RELAY_POLL_INTERVAL_MS: positiveInt,
+    OUTBOX_RELAY_BATCH_SIZE: positiveInt,
+    OUTBOX_CLAIM_LEASE_MS: positiveInt,
+    OUTBOX_PROCESSING_WINDOW_MS: positiveInt,
+    OUTBOX_PUBLISH_TIMEOUT_MS: positiveInt,
+    OUTBOX_PUBLISH_BACKOFF_BASE_MS: positiveInt,
+    OUTBOX_PUBLISH_BACKOFF_CAP_MS: positiveInt,
+    JOBS_EXECUTION_BACKOFF_BASE_MS: positiveInt,
+    JOBS_EXECUTION_BACKOFF_CAP_MS: positiveInt,
+    JOBS_EXECUTION_ATTEMPTS: positiveInt,
+    OUTBOX_STALE_RECOVERY_INTERVAL_MS: positiveInt,
+    OUTBOX_RETENTION_WINDOW_MS: positiveInt,
+    OUTBOX_RETENTION_INTERVAL_MS: positiveInt,
+    WORKER_CONCURRENCY: positiveInt,
+    ...rateLimitShape,
+  })
+  .superRefine((values, ctx) => {
+    const ordered: [string, string][] = [
+      ['OUTBOX_PUBLISH_BACKOFF_CAP_MS', 'OUTBOX_PUBLISH_BACKOFF_BASE_MS'],
+      ['JOBS_EXECUTION_BACKOFF_CAP_MS', 'JOBS_EXECUTION_BACKOFF_BASE_MS'],
+      ['OUTBOX_RETENTION_WINDOW_MS', 'OUTBOX_PROCESSING_WINDOW_MS'],
+    ];
+    const record = values as Record<string, number>;
+    for (const [larger, smaller] of ordered) {
+      if (record[larger] < record[smaller]) {
+        ctx.addIssue({ code: 'custom', path: [larger], message: `must not be below ${smaller}` });
+      }
+    }
+  });
+
+export function parseJobsConfig(env: NodeJS.ProcessEnv): JobsConfig {
+  const result = jobsEnvSchema.safeParse(env);
+  if (!result.success) throw toConfigError(env, result.error.issues);
+
+  const values = result.data as Record<string, number>;
+  const queueRateLimits = Object.fromEntries(
+    RATE_LIMITED_QUEUES.map((queue) => {
+      const prefix = `JOBS_RATE_${queue.toUpperCase().replace(/-/g, '_')}`;
+      return [queue, { max: values[`${prefix}_MAX`], durationMs: values[`${prefix}_DURATION_MS`] }];
+    }),
+  ) as JobsConfig['queueRateLimits'];
+
+  return {
+    relayPollIntervalMs: values.OUTBOX_RELAY_POLL_INTERVAL_MS,
+    relayBatchSize: values.OUTBOX_RELAY_BATCH_SIZE,
+    claimLeaseMs: values.OUTBOX_CLAIM_LEASE_MS,
+    processingWindowMs: values.OUTBOX_PROCESSING_WINDOW_MS,
+    publishTimeoutMs: values.OUTBOX_PUBLISH_TIMEOUT_MS,
+    publishBackoffBaseMs: values.OUTBOX_PUBLISH_BACKOFF_BASE_MS,
+    publishBackoffCapMs: values.OUTBOX_PUBLISH_BACKOFF_CAP_MS,
+    executionBackoffBaseMs: values.JOBS_EXECUTION_BACKOFF_BASE_MS,
+    executionBackoffCapMs: values.JOBS_EXECUTION_BACKOFF_CAP_MS,
+    executionAttempts: values.JOBS_EXECUTION_ATTEMPTS,
+    staleRecoveryIntervalMs: values.OUTBOX_STALE_RECOVERY_INTERVAL_MS,
+    retentionWindowMs: values.OUTBOX_RETENTION_WINDOW_MS,
+    retentionIntervalMs: values.OUTBOX_RETENTION_INTERVAL_MS,
+    workerConcurrency: values.WORKER_CONCURRENCY,
+    queueRateLimits,
+  };
+}
+
+let cachedJobs: JobsConfig | undefined;
+
+/** Validated outbox/worker settings, parsed once. Startup of the worker fails when any is missing. */
+export function getJobsConfig(): JobsConfig {
+  if (!cachedJobs) {
+    dotenv.config({ quiet: true });
+    cachedJobs = parseJobsConfig(process.env);
+  }
+  return cachedJobs;
 }

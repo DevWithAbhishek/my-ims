@@ -1,3 +1,4 @@
+import { appendAuditEvent } from '../../../infra/audit/append-audit-event.js';
 import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
 import { ConflictError } from '../../../shared/errors/AppError.js';
 import type { AuthContext } from '../../../shared/types/auth-context.js';
@@ -40,6 +41,7 @@ export async function updatePolicyUsers(
   serviceId: string,
   policyId: string,
   body: UpdatePolicyBody,
+  actorId: string,
 ): Promise<EscalationPolicyResponse> {
   return runServiceTransaction(async (tx) => {
     // Same lock as the service update, so the incident check cannot race incident creation.
@@ -72,7 +74,24 @@ export async function updatePolicyUsers(
     if (await hasUnresolvedIncidents(tx, serviceId)) {
       throw new ConflictError('Service has unresolved incidents', 'POLICY_IN_USE');
     }
-    return toPolicyResponse(await updatePolicy(tx, policyId, changes));
+    const updated = await updatePolicy(tx, policyId, changes);
+    const changedFields = (
+      [
+        ['level1', changes.level1Id],
+        ['level2', changes.level2Id],
+        ['level3', changes.level3Id],
+        ['fallbackAdmin', changes.fallbackAdminId],
+      ] as const
+    )
+      .filter(([, value]) => value !== undefined)
+      .map(([name]) => name);
+    await appendAuditEvent(tx, {
+      incidentId: null,
+      eventType: 'ESCALATION_POLICY_UPDATED',
+      actorId,
+      metadata: { escalationPolicyId: policyId, changedFields },
+    });
+    return toPolicyResponse(updated);
   });
 }
 

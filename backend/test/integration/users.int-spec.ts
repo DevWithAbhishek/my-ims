@@ -1,4 +1,5 @@
 import request from 'supertest';
+import * as audit from '../../src/infra/audit/append-audit-event';
 import { getPrisma } from '../../src/infra/db/prisma';
 import { getRedis } from '../../src/infra/redis/redis';
 import * as sessions from '../../src/modules/identity/auth/session.repository';
@@ -554,5 +555,71 @@ describe('U4 PATCH /identity/users/:userId', () => {
         WHERE l."role" <> 'TEAM_LEAD'`;
       expect(Number(violations[0].n)).toBe(0);
     }
+  });
+});
+
+/** Runs the real append, then fails: the transaction must leave neither the change nor the event. */
+function failAfterAudit() {
+  const original = audit.appendAuditEvent;
+  return jest.spyOn(audit, 'appendAuditEvent').mockImplementation(async (tx, input) => {
+    await original(tx, input);
+    throw new Error('injected fault after the audit write');
+  });
+}
+const auditRows = () => getPrisma().auditEvent.findMany({ orderBy: { createdAt: 'asc' } });
+
+describe('U4 audit events', () => {
+  it('records USER_UPDATED with field names only; a password change shows just its name', async () => {
+    const user = await createUser({ name: 'Before' });
+    const { token, admin } = await adminSession(app);
+    const res = await patch(token, user.id, { name: 'After', password: 'N3wPassw0rd!' });
+    expect(res.status).toBe(200);
+
+    const rows = await auditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      eventType: 'USER_UPDATED',
+      actor: admin.id,
+      incidentId: null,
+    });
+    const metadata = rows[0].metadata as { userId: string; changedFields: string[] };
+    expect(metadata.userId).toBe(user.id);
+    expect(metadata.changedFields.sort()).toEqual(['name', 'password']);
+    expect(JSON.stringify(rows[0].metadata)).not.toMatch(/N3wPassw0rd|After|Before/);
+  });
+
+  it('records only USER_DEACTIVATED when a deactivation also changes other fields', async () => {
+    const user = await createUser({ name: 'Leaving' });
+    const { token } = await adminSession(app);
+    expect((await patch(token, user.id, { name: 'Gone', status: 'DEACTIVATED' })).status).toBe(200);
+    const rows = await auditRows();
+    expect(rows.map((r) => r.eventType)).toEqual(['USER_DEACTIVATED']);
+    expect((rows[0].metadata as { changedFields: string[] }).changedFields.sort()).toEqual([
+      'name',
+      'status',
+    ]);
+  });
+
+  it('writes nothing for creates, no-op updates or failed requests', async () => {
+    const team = await createTeam();
+    const user = await createUser({ name: 'Same', teamId: team.id });
+    const { token } = await adminSession(app);
+    expect((await create(token, body({ teamId: team.id }))).status).toBe(201);
+    expect((await patch(token, user.id, { name: 'Same' })).status).toBe(200);
+    expect((await patch(token, user.id, { password: 'short' })).status).toBe(422);
+    expect(await auditRows()).toHaveLength(0);
+  });
+
+  it('a fault after the audit write leaves neither the change nor the event', async () => {
+    const user = await createUser({ name: 'Stays' });
+    const { token } = await adminSession(app);
+    const spy = failAfterAudit();
+    expect((await patch(token, user.id, { name: 'Lost' })).status).toBe(500);
+    expect(spy).toHaveBeenCalled();
+    jest.restoreAllMocks();
+    expect((await getPrisma().user.findUniqueOrThrow({ where: { id: user.id } })).name).toBe(
+      'Stays',
+    );
+    expect(await auditRows()).toHaveLength(0);
   });
 });

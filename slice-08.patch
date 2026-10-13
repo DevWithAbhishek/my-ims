@@ -1,0 +1,3706 @@
+diff --git a/.gitignore b/.gitignore
+index e88b28b..9933d53 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,6 +2,7 @@ coverage
+ node_modules
+ .env
+ .env.*
++!.env.example
+ node_modules/
+ dist/
+ coverage/
+diff --git a/backend/.env.example b/backend/.env.example
+new file mode 100644
+index 0000000..99313bb
+--- /dev/null
++++ b/backend/.env.example
+@@ -0,0 +1,59 @@
++# Copy to .env and adjust. Nothing here is a production value.
++
++# --- Application (SLICE-00) ---------------------------------------------------
++NODE_ENV=development
++PORT=3000
++DATABASE_URL=postgresql://postgres:postgres@localhost:5431/ims
++DIRECT_URL=postgresql://postgres:postgres@localhost:5431/ims
++REDIS_URL=redis://localhost:6379
++JWT_SECRET=change-me-development-only
++# ACCESS_TOKEN_EXPIRY=15m
++# REFRESH_TOKEN_EXPIRY=7d
++
++# --- First Admin (npm run seed:admin, SLICE-01) --------------------------------
++SEED_ADMIN_NAME=Admin
++SEED_ADMIN_EMAIL=admin@example.com
++SEED_ADMIN_PASSWORD=ChangeMe123!
++
++# --- Outbox, relay and workers (SLICE-08) --------------------------------------
++# DEVELOPMENT EXAMPLE VALUES ONLY. The application has no built-in defaults: the worker and
++# `npm run redrive:outbox` refuse to start when any variable below is missing or invalid, and the
++# project owner decides the real values per environment. All durations are in milliseconds.
++
++# Relay: how often it looks for PENDING rows, and how many it claims per pass.
++OUTBOX_RELAY_POLL_INTERVAL_MS=1000
++OUTBOX_RELAY_BATCH_SIZE=50
++# How long a relay's claim is valid before another relay may take the row over.
++OUTBOX_CLAIM_LEASE_MS=30000
++# After publishing, how long a row may stay PROCESSING before recovery republishes it.
++OUTBOX_PROCESSING_WINDOW_MS=300000
++# Give up waiting for Redis on a single publish after this long (the publish is then retried).
++OUTBOX_PUBLISH_TIMEOUT_MS=5000
++# Publication retry backoff (no maximum number of attempts): base doubles per attempt up to the cap.
++OUTBOX_PUBLISH_BACKOFF_BASE_MS=1000
++OUTBOX_PUBLISH_BACKOFF_CAP_MS=60000
++
++# Job execution: total attempts per job (the design says 5) and the retry backoff.
++JOBS_EXECUTION_ATTEMPTS=5
++JOBS_EXECUTION_BACKOFF_BASE_MS=2000
++JOBS_EXECUTION_BACKOFF_CAP_MS=60000
++
++# Housekeeping: stale-PROCESSING recovery pass and SUCCESS-row retention.
++OUTBOX_STALE_RECOVERY_INTERVAL_MS=30000
++# Must not be below OUTBOX_PROCESSING_WINDOW_MS.
++OUTBOX_RETENTION_WINDOW_MS=604800000
++OUTBOX_RETENTION_INTERVAL_MS=3600000
++
++# Worker: jobs processed in parallel per queue, and per-queue rate limits
++# (at most *_MAX jobs per *_DURATION_MS).
++WORKER_CONCURRENCY=5
++JOBS_RATE_AI_TRIAGE_MAX=10
++JOBS_RATE_AI_TRIAGE_DURATION_MS=1000
++JOBS_RATE_SLA_ESCALATION_MAX=50
++JOBS_RATE_SLA_ESCALATION_DURATION_MS=1000
++JOBS_RATE_NOTIFICATIONS_MAX=20
++JOBS_RATE_NOTIFICATIONS_DURATION_MS=1000
++JOBS_RATE_POSTMORTEM_MAX=5
++JOBS_RATE_POSTMORTEM_DURATION_MS=1000
++JOBS_RATE_INVESTIGATION_MAX=5
++JOBS_RATE_INVESTIGATION_DURATION_MS=1000
+diff --git a/backend/docs/implementation-slices/PROJECT_STATUS.md b/backend/docs/implementation-slices/PROJECT_STATUS.md
+index 3f56825..53fdbf5 100644
+--- a/backend/docs/implementation-slices/PROJECT_STATUS.md
++++ b/backend/docs/implementation-slices/PROJECT_STATUS.md
+@@ -1,15 +1,15 @@
+ # PROJECT_STATUS.md
+ 
+-Snapshot of the repository (`DevWithAbhishek/my-ims`, base `45c9468 "feat: establish config, infra, error handling, and runtime entrypoints"` plus the SLICE-01 patch and the SLICE-02 patch) and the supplied design documents. Checks marked **Verified** were actually run on 2026-10-05 (Node 22 sandbox, local PostgreSQL 16 on port 5431 + Redis 7 installed via apt); anything else is **Not verified**. Update this file at the end of every slice.
++Snapshot of the repository (`DevWithAbhishek/my-ims`, base `45c9468 "feat: establish config, infra, error handling, and runtime entrypoints"` plus the SLICE-01, SLICE-02 and SLICE-08 patches) and the supplied design documents. Checks marked **Verified** were actually run on 2026-10-13 (Node 22 sandbox, local PostgreSQL 16 + Redis 7 installed via apt); anything else is **Not verified**. Update this file at the end of every slice.
+ 
+ ## 1. Project
+ 
+ | Item | Value |
+ |---|---|
+ | Name | IMS — Incident Management System (backend) |
+-| Phase | Implementation: foundation, identity and service catalog implemented |
+-| Current slice | SLICE-02 (Service Catalog, SLA Config & Escalation Policy) — IMPLEMENTED (`slice-02.patch`); SLICE-00 still pending the unverified items in §4 |
+-| Overall progress | 2 of 12 feature slices implemented (SLICE-01, SLICE-02) plus the foundation |
++| Phase | Implementation: foundation, identity, service catalog and outbox/queue/worker reliability implemented |
++| Current slice | SLICE-08 (Outbox, Queue & Worker Reliability) — IMPLEMENTED (`slice-08.patch`); SLICE-00 still pending the unverified items in §4 |
++| Overall progress | 3 of 12 feature slices implemented (SLICE-01, SLICE-02, SLICE-08) plus the foundation |
+ 
+ ## 2. Design Status
+ 
+@@ -36,7 +36,7 @@ Repo copies of `backend/docs/API.md`, `docs/PRD.md`, `docs/Domain_Model.md`, `ba
+ | SLICE-05 Incident Lifecycle & Assignment | NOT STARTED | |
+ | SLICE-06 Visibility, Comments & Timeline | NOT STARTED | |
+ | SLICE-07 SLA Monitoring & Escalation | NOT STARTED | Blocked on two undefined inputs (see slice) |
+-| SLICE-08 Outbox, Queue & Worker Reliability | NOT STARTED | Redis in compose and `createRedisConnection('bullmq')` exist; worker entrypoint is a shell with no workers |
++| SLICE-08 Outbox, Queue & Worker Reliability | IMPLEMENTED (patch `slice-08.patch`) | `src/infra/jobs` (enqueue contract, relay, BullMQ gateway/workers, retry classification, dead letter, stale recovery, retention, re-drive), `src/infra/audit`, audit retrofit of T4/U4/S4/S7, two migrations, `npm run redrive:outbox`. No consumers yet: later slices register processors |
+ | SLICE-09 Notifications | NOT STARTED | |
+ | SLICE-10 AI Alert Triage | NOT STARTED | Blocked on LLM data allow-list |
+ | SLICE-11 Postmortem, Review & Closure | NOT STARTED | Blocked on LLM data allow-list (generation part) |
+@@ -49,11 +49,11 @@ Repo copies of `backend/docs/API.md`, `docs/PRD.md`, `docs/Domain_Model.md`, `ba
+ | `npm run typecheck` | Verified: passes |
+ | `npm run lint` | Verified: exit 0 (same boundaries v7 deprecation warnings as before) |
+ | `npm run format:check` | Verified: passes |
+-| `npm test` | Verified: 13 suites, 159 tests pass |
+-| `npm run test:int` | Verified: 7 suites, 173 tests pass against local PostgreSQL 16 + Redis 7 (test DB `ims_test`, Redis db 15) |
+-| `npm run build` | Verified: `prisma generate` + `tsc` produce `dist/main.js`, `dist/worker.js`, `dist/scripts/seed-admin.js` and `dist/modules/appService/`; no spec files in `dist` |
++| `npm test` | Verified: 17 suites, 203 tests pass |
++| `npm run test:int` | Verified: 9 suites, 232 tests pass against local PostgreSQL 16 + Redis 7 (test DB `ims_test`, Redis db 15), including real BullMQ workers and an unreachable-Redis publish |
++| `npm run build` | Verified: `prisma generate` + `tsc` produce `dist/main.js`, `dist/worker.js`, `dist/scripts/seed-admin.js`, `dist/scripts/redrive-outbox.js`, `dist/infra/jobs/` and `dist/modules/appService/`; no spec files in `dist` |
+ | Runtime | Verified (SLICE-00; re-checked for SLICE-01 with the built server; **not re-run for SLICE-02** (HTTP behavior covered by the integration suite on the real app wiring): login, team create/list, seed script run twice): built API boots; `/health` 200; `/ready` 200, 503 + `Retry-After: 5` with Redis stopped, recovers; `SIGTERM` exits 0; startup exits 1 on invalid config, unreachable DB, unreachable Redis, port in use; worker stays up, logs ready, exits 0 on `SIGTERM` |
+-| Migration | Verified: init migration SQL applies to an empty PostgreSQL database (integration test, via `pg`). **Not verified:** `prisma migrate deploy` / `prisma validate` (Prisma engine download returned 403; `prisma generate` was run with a sandbox-only stand-in `PRISMA_SCHEMA_ENGINE_BINARY`) |
++| Migration | Verified: all three migrations apply to an empty PostgreSQL database and the two SLICE-08 migrations also apply over existing outbox rows (integration test, via `pg`; also applied with `psql`). **Not verified:** `prisma migrate deploy` / `prisma validate` / `prisma migrate diff` (so that the hand-written SLICE-08 SQL matches `schema.prisma` without drift is checked by review and tests only; Prisma engine download is blocked; `prisma generate` was run with a sandbox-only stand-in `PRISMA_SCHEMA_ENGINE_BINARY`) |
+ | Docker | Not verified: `docker build` and `docker compose up` (no Docker in the sandbox) |
+ | Fresh clone | `src/generated` is git-ignored: run `npm run prisma:generate` (or `build`) before `typecheck` / `test:int` |
+ 
+@@ -77,7 +77,12 @@ Repo copies of `backend/docs/API.md`, `docs/PRD.md`, `docs/Domain_Model.md`, `ba
+ - `src/modules/appService/` (`services/`, `escalation-policies/`): controller → service → repository per area, mounted in `src/api-router.ts` via `createAppServiceRouter()`. Public interface (`index.ts`): `createAppServiceRouter`, `getServiceConfig(serviceId)` → `{ id, name, status, teamId, defaultSeverity, escalationPolicyId, sla: { P0..P3: { responseMinutes, resolutionMinutes } } }` or `null`, `getEscalationPolicyByService(serviceId)` → `{ level1, level2, level3, fallbackAdmin }` or `null`. Pure rules with unit tests: `sla.rules.ts` (ordering on merged values), `policy-users.rules.ts` (role/team/status per level).
+ - Concurrency: S4/S7 lock the `AppService` row `FOR UPDATE` and re-check incidents under it (an in-flight incident insert holds a key-share lock on that row, so the check waits for it; proven by tests that hold an uncommitted incident insert on a second connection). S1 and S4 team changes take `FOR SHARE` on the `Team` row (closes the race with T4's attached-services check); S1/S7 read policy users `FOR SHARE`; S4 policy reassignment locks the policy row so two services cannot claim one orphaned policy.
+ 
+-Not present: any module other than `identity` and `appService`, `src/workers`, outbox/queues/BullMQ workers, audit.
++- **SLICE-08.** `src/infra/jobs/`: `enqueueOutbox(tx, …)` (validates event type + ids-only payload from `events.ts`, writes one `PENDING` row, never commits or touches Redis); raw-SQL `outbox.repository.ts` (claim with `FOR UPDATE SKIP LOCKED`, every transition conditional on status and, for relay updates, on the claim's lease); `relay.ts` (claim in a short transaction, publish outside it with a timeout, publication retried without a maximum with capped exponential backoff, unsupported type / invalid payload → `DEAD_LETTER`); `processor.ts` (common worker wrapper: success → `SUCCESS`, retryable → counted and rethrown, non-retryable or 5th failure → `DEAD_LETTER` first, then a `dead-letter` job); `errors.ts` (`RetryableJobError`, `NonRetryableJobError`, `classifyError`, `sanitizeError`); `gateway.ts` (BullMQ producer, `jobId` = outbox id, finished jobs removed, custom backoff); `maintenance.ts` (stale-`PROCESSING` recovery, `SUCCESS` retention); `redrive.ts` + `npm run redrive:outbox -- <id> [--operator <name>]`; `registry.ts` (`registerProcessor(queue, handler)`); `runtime.ts` started from `src/workers/index.ts` by `src/worker.ts`. Producer-facing exports: `src/infra/jobs/index.ts`.
++- **Configuration.** `getJobsConfig()` in `src/config/env.ts`: every tunable is a required variable with no default (see `.env.example`, which now exists and is un-ignored via `!.env.example` in the root `.gitignore`); the worker and the CLI fail startup when any is missing or invalid; the API does not read them.
++- **Schema.** `OutboxStatus` enum (`PENDING/PROCESSING/SUCCESS/DEAD_LETTER`, replaces `LifecycleStates` on `OutboxEvent` only), `publishAttemptCount`, `executionAttemptCount`, `publishedAt`, `leaseExpiresAt`, `errorClass`, `lastError`, indexes `idx_outbox_claim` / `idx_outbox_retention`; eight new `AuditEventType` values. Migrations `20261012120000_add_admin_audit_event_types` and `20261012120100_outbox_lifecycle` are hand-written (existing rows converted: `FAILED` → `DEAD_LETTER`, old `attemptCount` → `executionAttemptCount`).
++- **Audit retrofit.** `src/infra/audit/append-audit-event.ts`; T4/U4/S4/S7 take the acting Admin id from the controller and write one event inside their existing transaction (`*_DEACTIVATED` when deactivating, else `*_UPDATED`/`ESCALATION_POLICY_UPDATED`), `incidentId = null`, metadata = entity id + changed field names.
++
++Not present: any module other than `identity` and `appService`, any consumer registered on a queue, alert-source audit events (`ALERT_SOURCE_UPDATED` exists but nothing writes it yet).
+ 
+ ## 6. Known Issues
+ 
+@@ -95,12 +100,16 @@ Not present: any module other than `identity` and `appService`, `src/workers`, o
+ 12. Read-contract shape (`sla` map, `null` for a missing service, no transaction parameter) is a SLICE-02 choice; SLICE-04 may need an optional transaction client if it reads the configuration inside its own transaction.
+ 13. Deactivating a user does not touch escalation policies (per slice); a policy pointing at a deactivated user is a runtime failure in SLICE-07. U4/T4 do not check policy membership.
+ 
++14. SLICE-08 interpretation choices where the slice is silent or inconsistent: (a) U4 `changedFields` is "keys of `plan.data`" in the table but "fields that actually changed" and "no event for a no-op" in the rules; an unchanged re-sent `name` is therefore excluded (U4 still writes it as before). (b) `DEAD_LETTER` rows do not set `processedAt` (only `SUCCESS` does); failure time is in the log. (c) Added one tunable not listed in §4.9, `OUTBOX_PUBLISH_TIMEOUT_MS`, because BullMQ's `queue.add` can wait indefinitely when Redis is down. (d) Per-queue rate limits are flat variables `JOBS_RATE_<QUEUE>_MAX` / `_DURATION_MS`; `WORKER_CONCURRENCY` is shared by all queues. (e) `lastError` keeps the message only for errors thrown as `RetryableJobError`/`NonRetryableJobError` (redacted, 500 chars); any other error is reduced to its name and code. (f) A worker starts only for queues with a registered processor; the relay still publishes every queue, so events for a queue without a consumer stay `PROCESSING` and are republished after the processing window. (g) The re-drive CLI operator defaults to the OS user name. (h) A successful publish clears `errorClass`/`lastError` from earlier failed publish attempts.
++15. A worker that finishes a job before the relay has recorded `PROCESSING` cannot mark `SUCCESS` (the update requires `PROCESSING`); the row is recovered after the processing window and the idempotent consumer re-marks it. Rare and harmless, but it costs one extra delivery.
++16. The runtime check of the built worker (valid config: ready, relay publishes a row, `SIGTERM` exit 0; missing variable: exit 1) and of the re-drive CLI was done against a local database; Docker was not available.
++
+ ## 7. Blockers
+ 
+ Design inputs not defined in the supplied design (details in the affected slices): delay between escalation levels and the SLA scheduling mechanism (SLICE-07); LLM data allow-list/redaction (SLICE-10, 11, 12); investigation knowledge-source set and "no relevant evidence" representation (SLICE-12); notification recipient resolution when there is no assignee (SLICE-09); alert-source configuration JSON shape (SLICE-03/04). None blocks SLICE-01, 02, 05, 06 or 08.
+ 
+ ## 8. Next Step
+ 
+-- Implement SLICE-08 next (suggested order 00 → 01 → 02 → 08 → 06 → 03 → 04 → 05 → 09 → 07 → 10 → 11 → 12).
++- Implement SLICE-06 next (suggested order 00 → 01 → 02 → 08 → 06 → 03 → 04 → 05 → 09 → 07 → 10 → 11 → 12). Producers of outbox events call `enqueueOutbox(tx, …)` inside their own transaction; consumers register with `registerProcessor` from `src/workers/index.ts`.
+ 
+-<!-- Locally: apply the patch, run `npm ci && npm run build`, `npx prisma validate`, `npx prisma migrate deploy` against the compose database, `docker build`, then close SLICE-00. Then implement SLICE-08. See `SLICE_IMPLEMENTATION_GUIDE.md` §Suggested order. -->
++<!-- Locally: apply the patch, run `npm ci && npm run build`, `npx prisma validate`, `npx prisma migrate deploy` against the compose database, `docker build`, then close SLICE-00. Then continue with SLICE-06. See `SLICE_IMPLEMENTATION_GUIDE.md` §Suggested order. -->
+diff --git a/backend/package.json b/backend/package.json
+index c62d799..42a70f7 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -9,6 +9,7 @@
+     "start": "node dist/main.js",
+     "start:worker": "node dist/worker.js",
+     "seed:admin": "tsx src/scripts/seed-admin.ts",
++    "redrive:outbox": "tsx src/scripts/redrive-outbox.ts",
+     "typecheck": "tsc -p tsconfig.json --noEmit",
+     "test": "jest --config jest.config.js",
+     "test:int": "jest --config jest.int.config.js",
+diff --git a/backend/prisma/migrations/20261012120000_add_admin_audit_event_types/migration.sql b/backend/prisma/migrations/20261012120000_add_admin_audit_event_types/migration.sql
+new file mode 100644
+index 0000000..e57b522
+--- /dev/null
++++ b/backend/prisma/migrations/20261012120000_add_admin_audit_event_types/migration.sql
+@@ -0,0 +1,11 @@
++-- AlterEnum
++-- PostgreSQL does not allow a newly added enum value to be used in the transaction that adds it,
++-- so this migration only adds the values; nothing in it (or in the same transaction) uses them.
++ALTER TYPE "AuditEventType" ADD VALUE 'USER_UPDATED';
++ALTER TYPE "AuditEventType" ADD VALUE 'USER_DEACTIVATED';
++ALTER TYPE "AuditEventType" ADD VALUE 'TEAM_UPDATED';
++ALTER TYPE "AuditEventType" ADD VALUE 'TEAM_DEACTIVATED';
++ALTER TYPE "AuditEventType" ADD VALUE 'SERVICE_UPDATED';
++ALTER TYPE "AuditEventType" ADD VALUE 'SERVICE_DEACTIVATED';
++ALTER TYPE "AuditEventType" ADD VALUE 'ESCALATION_POLICY_UPDATED';
++ALTER TYPE "AuditEventType" ADD VALUE 'ALERT_SOURCE_UPDATED';
+diff --git a/backend/prisma/migrations/20261012120100_outbox_lifecycle/migration.sql b/backend/prisma/migrations/20261012120100_outbox_lifecycle/migration.sql
+new file mode 100644
+index 0000000..1c73c4b
+--- /dev/null
++++ b/backend/prisma/migrations/20261012120100_outbox_lifecycle/migration.sql
+@@ -0,0 +1,28 @@
++-- Outbox lifecycle (SLICE-08). Hand-written so existing rows are converted, not dropped.
++-- The shared "LifecycleStates" enum is deliberately left untouched (AITriage and Notification use it).
++
++-- CreateEnum
++CREATE TYPE "OutboxStatus" AS ENUM ('PENDING', 'PROCESSING', 'SUCCESS', 'DEAD_LETTER');
++
++-- Move OutboxEvent.status to the dedicated enum: PENDING->PENDING, SUCCESS->SUCCESS, FAILED->DEAD_LETTER.
++ALTER TABLE "OutboxEvent" ALTER COLUMN "status" DROP DEFAULT;
++ALTER TABLE "OutboxEvent"
++  ALTER COLUMN "status" TYPE "OutboxStatus"
++  USING (CASE "status"::text WHEN 'FAILED' THEN 'DEAD_LETTER' ELSE "status"::text END)::"OutboxStatus";
++ALTER TABLE "OutboxEvent" ALTER COLUMN "status" SET DEFAULT 'PENDING';
++
++-- Replace the single attempt counter with the two stage counters. Existing attempts were attempts
++-- to process an event, so they carry over as execution attempts.
++ALTER TABLE "OutboxEvent"
++  ADD COLUMN "publishAttemptCount" INTEGER NOT NULL DEFAULT 0,
++  ADD COLUMN "executionAttemptCount" INTEGER NOT NULL DEFAULT 0,
++  ADD COLUMN "publishedAt" TIMESTAMP(3),
++  ADD COLUMN "leaseExpiresAt" TIMESTAMP(3),
++  ADD COLUMN "errorClass" TEXT,
++  ADD COLUMN "lastError" TEXT;
++UPDATE "OutboxEvent" SET "executionAttemptCount" = "attemptCount";
++ALTER TABLE "OutboxEvent" DROP COLUMN "attemptCount";
++
++-- CreateIndex: relay claim query and retention deletion
++CREATE INDEX "idx_outbox_claim" ON "OutboxEvent"("status", "availableAt", "leaseExpiresAt");
++CREATE INDEX "idx_outbox_retention" ON "OutboxEvent"("status", "processedAt");
+diff --git a/backend/prisma/schema.prisma b/backend/prisma/schema.prisma
+index 2e7df49..394c60d 100644
+--- a/backend/prisma/schema.prisma
++++ b/backend/prisma/schema.prisma
+@@ -62,6 +62,21 @@ enum AuditEventType {
+   CLOSED
+   REASSIGNED
+   OPEN
++  USER_UPDATED
++  USER_DEACTIVATED
++  TEAM_UPDATED
++  TEAM_DEACTIVATED
++  SERVICE_UPDATED
++  SERVICE_DEACTIVATED
++  ESCALATION_POLICY_UPDATED
++  ALERT_SOURCE_UPDATED
++}
++
++enum OutboxStatus {
++  PENDING
++  PROCESSING
++  SUCCESS
++  DEAD_LETTER
+ }
+ 
+ enum PostmortemReviewStatus {
+@@ -373,14 +388,25 @@ model OutboxEvent {
+ 
+   eventType     String
+   aggregateType String
+-  aggregateId   String          @db.Uuid
++  aggregateId   String       @db.Uuid
+   payload       Json
+-  status        LifecycleStates @default(PENDING)
+-  attemptCount  Int             @default(0)
+-  availableAt   DateTime        @default(now())
+-  processedAt   DateTime?
++  status        OutboxStatus @default(PENDING)
++
++  publishAttemptCount   Int @default(0)
++  executionAttemptCount Int @default(0)
++
++  availableAt    DateTime  @default(now())
++  publishedAt    DateTime?
++  processedAt    DateTime?
++  leaseExpiresAt DateTime?
++
++  errorClass String?
++  lastError  String?
+ 
+   createdAt DateTime @default(now())
++
++  @@index([status, availableAt, leaseExpiresAt], map: "idx_outbox_claim")
++  @@index([status, processedAt], map: "idx_outbox_retention")
+ }
+ 
+ model AuditEvent {
+diff --git a/backend/src/config/env.ts b/backend/src/config/env.ts
+index 9e8448a..54ec318 100644
+--- a/backend/src/config/env.ts
++++ b/backend/src/config/env.ts
+@@ -43,20 +43,22 @@ export class ConfigError extends Error {
+   }
+ }
+ 
++function toConfigError(env: NodeJS.ProcessEnv, issues: z.ZodError['issues']): ConfigError {
++  const problems = new Map<string, string>();
++  for (const issue of issues) {
++    const name = String(issue.path[0] ?? 'environment');
++    const missing = env[name] === undefined || env[name] === '';
++    problems.set(name, missing ? 'is required' : issue.message);
++  }
++  const variables = [...problems.keys()];
++  const detail = [...problems].map(([name, problem]) => `${name} ${problem}`).join('; ');
++  return new ConfigError(variables, `Invalid configuration: ${detail}`);
++}
++
+ export function parseConfig(env: NodeJS.ProcessEnv): Config {
+   const result = envSchema.safeParse(env);
+ 
+-  if (!result.success) {
+-    const problems = new Map<string, string>();
+-    for (const issue of result.error.issues) {
+-      const name = String(issue.path[0] ?? 'environment');
+-      const missing = env[name] === undefined || env[name] === '';
+-      problems.set(name, missing ? 'is required' : issue.message);
+-    }
+-    const variables = [...problems.keys()];
+-    const detail = [...problems].map(([name, problem]) => `${name} ${problem}`).join('; ');
+-    throw new ConfigError(variables, `Invalid configuration: ${detail}`);
+-  }
++  if (!result.success) throw toConfigError(env, result.error.issues);
+ 
+   const values = result.data;
+   return {
+@@ -81,3 +83,119 @@ export function getConfig(): Config {
+   }
+   return cached;
+ }
++
++/** Names of the queues that have their own worker rate limit (see `src/infra/jobs/events.ts`). */
++export const RATE_LIMITED_QUEUES = [
++  'ai-triage',
++  'sla-escalation',
++  'notifications',
++  'postmortem',
++  'investigation',
++] as const;
++
++export type RateLimitedQueue = (typeof RATE_LIMITED_QUEUES)[number];
++
++/** Outbox, relay and worker reliability settings (SLICE-08). Every value must be configured. */
++export interface JobsConfig {
++  relayPollIntervalMs: number;
++  relayBatchSize: number;
++  claimLeaseMs: number;
++  processingWindowMs: number;
++  publishTimeoutMs: number;
++  publishBackoffBaseMs: number;
++  publishBackoffCapMs: number;
++  executionBackoffBaseMs: number;
++  executionBackoffCapMs: number;
++  executionAttempts: number;
++  staleRecoveryIntervalMs: number;
++  retentionWindowMs: number;
++  retentionIntervalMs: number;
++  workerConcurrency: number;
++  queueRateLimits: Record<RateLimitedQueue, { max: number; durationMs: number }>;
++}
++
++const positiveInt = z.coerce.number().int().min(1);
++
++const rateLimitShape = Object.fromEntries(
++  RATE_LIMITED_QUEUES.flatMap((queue) => {
++    const prefix = `JOBS_RATE_${queue.toUpperCase().replace(/-/g, '_')}`;
++    return [
++      [`${prefix}_MAX`, positiveInt],
++      [`${prefix}_DURATION_MS`, positiveInt],
++    ];
++  }),
++) as Record<string, typeof positiveInt>;
++
++const jobsEnvSchema = z
++  .object({
++    OUTBOX_RELAY_POLL_INTERVAL_MS: positiveInt,
++    OUTBOX_RELAY_BATCH_SIZE: positiveInt,
++    OUTBOX_CLAIM_LEASE_MS: positiveInt,
++    OUTBOX_PROCESSING_WINDOW_MS: positiveInt,
++    OUTBOX_PUBLISH_TIMEOUT_MS: positiveInt,
++    OUTBOX_PUBLISH_BACKOFF_BASE_MS: positiveInt,
++    OUTBOX_PUBLISH_BACKOFF_CAP_MS: positiveInt,
++    JOBS_EXECUTION_BACKOFF_BASE_MS: positiveInt,
++    JOBS_EXECUTION_BACKOFF_CAP_MS: positiveInt,
++    JOBS_EXECUTION_ATTEMPTS: positiveInt,
++    OUTBOX_STALE_RECOVERY_INTERVAL_MS: positiveInt,
++    OUTBOX_RETENTION_WINDOW_MS: positiveInt,
++    OUTBOX_RETENTION_INTERVAL_MS: positiveInt,
++    WORKER_CONCURRENCY: positiveInt,
++    ...rateLimitShape,
++  })
++  .superRefine((values, ctx) => {
++    const ordered: [string, string][] = [
++      ['OUTBOX_PUBLISH_BACKOFF_CAP_MS', 'OUTBOX_PUBLISH_BACKOFF_BASE_MS'],
++      ['JOBS_EXECUTION_BACKOFF_CAP_MS', 'JOBS_EXECUTION_BACKOFF_BASE_MS'],
++      ['OUTBOX_RETENTION_WINDOW_MS', 'OUTBOX_PROCESSING_WINDOW_MS'],
++    ];
++    const record = values as Record<string, number>;
++    for (const [larger, smaller] of ordered) {
++      if (record[larger] < record[smaller]) {
++        ctx.addIssue({ code: 'custom', path: [larger], message: `must not be below ${smaller}` });
++      }
++    }
++  });
++
++export function parseJobsConfig(env: NodeJS.ProcessEnv): JobsConfig {
++  const result = jobsEnvSchema.safeParse(env);
++  if (!result.success) throw toConfigError(env, result.error.issues);
++
++  const values = result.data as Record<string, number>;
++  const queueRateLimits = Object.fromEntries(
++    RATE_LIMITED_QUEUES.map((queue) => {
++      const prefix = `JOBS_RATE_${queue.toUpperCase().replace(/-/g, '_')}`;
++      return [queue, { max: values[`${prefix}_MAX`], durationMs: values[`${prefix}_DURATION_MS`] }];
++    }),
++  ) as JobsConfig['queueRateLimits'];
++
++  return {
++    relayPollIntervalMs: values.OUTBOX_RELAY_POLL_INTERVAL_MS,
++    relayBatchSize: values.OUTBOX_RELAY_BATCH_SIZE,
++    claimLeaseMs: values.OUTBOX_CLAIM_LEASE_MS,
++    processingWindowMs: values.OUTBOX_PROCESSING_WINDOW_MS,
++    publishTimeoutMs: values.OUTBOX_PUBLISH_TIMEOUT_MS,
++    publishBackoffBaseMs: values.OUTBOX_PUBLISH_BACKOFF_BASE_MS,
++    publishBackoffCapMs: values.OUTBOX_PUBLISH_BACKOFF_CAP_MS,
++    executionBackoffBaseMs: values.JOBS_EXECUTION_BACKOFF_BASE_MS,
++    executionBackoffCapMs: values.JOBS_EXECUTION_BACKOFF_CAP_MS,
++    executionAttempts: values.JOBS_EXECUTION_ATTEMPTS,
++    staleRecoveryIntervalMs: values.OUTBOX_STALE_RECOVERY_INTERVAL_MS,
++    retentionWindowMs: values.OUTBOX_RETENTION_WINDOW_MS,
++    retentionIntervalMs: values.OUTBOX_RETENTION_INTERVAL_MS,
++    workerConcurrency: values.WORKER_CONCURRENCY,
++    queueRateLimits,
++  };
++}
++
++let cachedJobs: JobsConfig | undefined;
++
++/** Validated outbox/worker settings, parsed once. Startup of the worker fails when any is missing. */
++export function getJobsConfig(): JobsConfig {
++  if (!cachedJobs) {
++    dotenv.config({ quiet: true });
++    cachedJobs = parseJobsConfig(process.env);
++  }
++  return cachedJobs;
++}
+diff --git a/backend/src/config/jobs-config.spec.ts b/backend/src/config/jobs-config.spec.ts
+new file mode 100644
+index 0000000..80067f4
+--- /dev/null
++++ b/backend/src/config/jobs-config.spec.ts
+@@ -0,0 +1,69 @@
++import { parseJobsConfig } from './env';
++import { testJobsEnv } from '../../test/helpers/jobs';
++
++describe('parseJobsConfig', () => {
++  it('reads every setting from the environment', () => {
++    const config = parseJobsConfig(testJobsEnv());
++    expect(config).toMatchObject({
++      relayPollIntervalMs: 50,
++      relayBatchSize: 20,
++      executionAttempts: 5,
++      workerConcurrency: 2,
++    });
++    expect(config.queueRateLimits['ai-triage']).toEqual({ max: 1000, durationMs: 1000 });
++    expect(Object.keys(config.queueRateLimits).sort()).toEqual([
++      'ai-triage',
++      'investigation',
++      'notifications',
++      'postmortem',
++      'sla-escalation',
++    ]);
++  });
++
++  it('has no defaults: every missing variable is reported by name', () => {
++    expect.assertions(2);
++    try {
++      parseJobsConfig({});
++    } catch (error) {
++      const { variables, message } = error as { variables: string[]; message: string };
++      expect(variables).toEqual(
++        expect.arrayContaining([
++          'OUTBOX_RELAY_POLL_INTERVAL_MS',
++          'JOBS_EXECUTION_ATTEMPTS',
++          'WORKER_CONCURRENCY',
++          'JOBS_RATE_NOTIFICATIONS_MAX',
++        ]),
++      );
++      expect(message).toContain('OUTBOX_RELAY_BATCH_SIZE is required');
++    }
++  });
++
++  it.each([
++    ['OUTBOX_RELAY_BATCH_SIZE', '0'],
++    ['OUTBOX_CLAIM_LEASE_MS', '-5'],
++    ['WORKER_CONCURRENCY', 'many'],
++    ['JOBS_EXECUTION_ATTEMPTS', '2.5'],
++  ])('rejects %s=%s without echoing the value', (name, value) => {
++    expect.assertions(2);
++    try {
++      parseJobsConfig({ ...testJobsEnv(), [name]: value });
++    } catch (error) {
++      expect((error as { variables: string[] }).variables).toEqual([name]);
++      expect((error as Error).message).not.toContain(value);
++    }
++  });
++
++  it('rejects a cap below its base and a retention window not above the processing window', () => {
++    expect.assertions(2);
++    for (const override of [
++      { JOBS_EXECUTION_BACKOFF_CAP_MS: '5' },
++      { OUTBOX_RETENTION_WINDOW_MS: '1000' },
++    ]) {
++      try {
++        parseJobsConfig({ ...testJobsEnv(), ...override });
++      } catch (error) {
++        expect((error as Error).message).toContain('must not be below');
++      }
++    }
++  });
++});
+diff --git a/backend/src/infra/audit/append-audit-event.ts b/backend/src/infra/audit/append-audit-event.ts
+new file mode 100644
+index 0000000..ef30548
+--- /dev/null
++++ b/backend/src/infra/audit/append-audit-event.ts
+@@ -0,0 +1,25 @@
++import type { Prisma } from '../../generated/prisma/client.js';
++import type { AuditEventType } from '../../generated/prisma/enums.js';
++import type { TransactionClient } from '../db/prisma.js';
++
++export type AuditEventInput = {
++  incidentId: string | null;
++  eventType: AuditEventType;
++  actorId: string | null;
++  metadata: Prisma.InputJsonObject;
++};
++
++/**
++ * Appends one audit event on the caller's transaction, so it commits or rolls back with the change
++ * it describes. It never opens or commits a transaction and offers no update or delete path.
++ */
++export async function appendAuditEvent(tx: TransactionClient, input: AuditEventInput) {
++  await tx.auditEvent.create({
++    data: {
++      eventType: input.eventType,
++      actor: input.actorId,
++      incidentId: input.incidentId,
++      metadata: input.metadata,
++    },
++  });
++}
+diff --git a/backend/src/infra/jobs/backoff.spec.ts b/backend/src/infra/jobs/backoff.spec.ts
+new file mode 100644
+index 0000000..4e4fd9d
+--- /dev/null
++++ b/backend/src/infra/jobs/backoff.spec.ts
+@@ -0,0 +1,30 @@
++import { executionRetryDelayMs, exponentialBackoffMs } from './backoff';
++import { RetryableJobError } from './errors';
++
++describe('exponentialBackoffMs', () => {
++  it('doubles from the base and stops at the cap', () => {
++    const schedule = [1, 2, 3, 4, 5, 6].map((attempt) => exponentialBackoffMs(attempt, 1000, 8000));
++    expect(schedule).toEqual([1000, 2000, 4000, 8000, 8000, 8000]);
++  });
++
++  it('never overflows for very large attempt numbers', () => {
++    expect(exponentialBackoffMs(10_000, 1000, 60_000)).toBe(60_000);
++  });
++});
++
++describe('executionRetryDelayMs', () => {
++  const config = { executionBackoffBaseMs: 100, executionBackoffCapMs: 400 };
++
++  it('follows the capped exponential schedule for ordinary errors', () => {
++    expect([1, 2, 3, 4].map((n) => executionRetryDelayMs(n, new Error('x'), config))).toEqual([
++      100, 200, 400, 400,
++    ]);
++  });
++
++  it('honors a longer provider-supplied delay and never shortens the schedule', () => {
++    const slow = new RetryableJobError('RATE_LIMITED', 'slow down', 5000);
++    const quick = new RetryableJobError('RATE_LIMITED', 'slow down', 10);
++    expect(executionRetryDelayMs(1, slow, config)).toBe(5000);
++    expect(executionRetryDelayMs(3, quick, config)).toBe(400);
++  });
++});
+diff --git a/backend/src/infra/jobs/backoff.ts b/backend/src/infra/jobs/backoff.ts
+new file mode 100644
+index 0000000..aeb89db
+--- /dev/null
++++ b/backend/src/infra/jobs/backoff.ts
+@@ -0,0 +1,22 @@
++import { classifyError } from './errors.js';
++
++/** `base * 2^(attempt - 1)`, capped. `attempt` is 1-based (1 = the first failure). */
++export function exponentialBackoffMs(attempt: number, baseMs: number, capMs: number): number {
++  const exponent = Math.min(Math.max(attempt, 1) - 1, 30);
++  return Math.min(capMs, baseMs * 2 ** exponent);
++}
++
++/** Delay before execution retry number `attempt`; a provider-supplied delay is never shortened. */
++export function executionRetryDelayMs(
++  attempt: number,
++  error: unknown,
++  config: { executionBackoffBaseMs: number; executionBackoffCapMs: number },
++): number {
++  const scheduled = exponentialBackoffMs(
++    attempt,
++    config.executionBackoffBaseMs,
++    config.executionBackoffCapMs,
++  );
++  const providerDelay = classifyError(error).retryAfterMs;
++  return providerDelay === undefined ? scheduled : Math.max(scheduled, providerDelay);
++}
+diff --git a/backend/src/infra/jobs/dead-letter.ts b/backend/src/infra/jobs/dead-letter.ts
+new file mode 100644
+index 0000000..debe46b
+--- /dev/null
++++ b/backend/src/infra/jobs/dead-letter.ts
+@@ -0,0 +1,27 @@
++import { logger } from '../../shared/observability/logger.js';
++import type { QueueGateway } from './gateway.js';
++
++/**
++ * Adds the dead-letter job after the database record is written. A failure here is logged and
++ * swallowed: the `DEAD_LETTER` row in PostgreSQL is the durable record and is never lost.
++ */
++export async function announceDeadLetter(
++  gateway: QueueGateway,
++  info: {
++    outboxEventId: string;
++    eventType: string;
++    sourceQueue: string;
++    errorClass: string;
++    requestId?: string;
++  },
++): Promise<void> {
++  const { requestId, ...job } = info;
++  try {
++    await gateway.publishDeadLetter(job);
++  } catch (err) {
++    logger.error(
++      { err, ...job, requestId, outcome: 'dead_letter_publish_failed' },
++      'Dead-letter job could not be published; the outbox row remains DEAD_LETTER',
++    );
++  }
++}
+diff --git a/backend/src/infra/jobs/errors.spec.ts b/backend/src/infra/jobs/errors.spec.ts
+new file mode 100644
+index 0000000..bbd4eb8
+--- /dev/null
++++ b/backend/src/infra/jobs/errors.spec.ts
+@@ -0,0 +1,92 @@
++import { ZodError } from 'zod';
++import { classifyError, NonRetryableJobError, RetryableJobError, sanitizeError } from './errors';
++
++describe('classifyError', () => {
++  it.each([
++    'INVALID_PAYLOAD',
++    'UNSUPPORTED_EVENT_TYPE',
++    'BUSINESS_RULE_VIOLATION',
++    'AUTHENTICATION_OR_CONFIGURATION',
++    'RESOURCE_NOT_FOUND',
++    'AUTHORIZATION_FAILURE',
++  ] as const)('treats %s as non-retryable', (reason) => {
++    expect(classifyError(new NonRetryableJobError(reason, 'x'))).toEqual({
++      retryable: false,
++      errorClass: reason,
++    });
++  });
++
++  it('treats typed retryable errors as retryable and keeps the provider delay', () => {
++    expect(classifyError(new RetryableJobError('RATE_LIMITED', 'x', 1500))).toEqual({
++      retryable: true,
++      errorClass: 'RATE_LIMITED',
++      retryAfterMs: 1500,
++    });
++  });
++
++  it('treats schema failures as an invalid payload', () => {
++    const issue = new ZodError([{ code: 'custom', path: ['a'], message: 'bad' }]);
++    expect(classifyError(issue)).toEqual({ retryable: false, errorClass: 'INVALID_PAYLOAD' });
++  });
++
++  it.each([
++    [{ code: '40P01' }, 'TRANSIENT_DATABASE'],
++    [{ code: '55P03' }, 'TRANSIENT_DATABASE'],
++    [{ code: 'ECONNREFUSED' }, 'NETWORK'],
++    [{ code: 'ETIMEDOUT' }, 'NETWORK'],
++  ])('maps %j to a retryable %s failure', (shape, errorClass) => {
++    expect(classifyError(Object.assign(new Error('x'), shape))).toEqual({
++      retryable: true,
++      errorClass,
++    });
++  });
++
++  it('maps a Redis request-limit error to REDIS_UNAVAILABLE', () => {
++    const error = new Error('x');
++    error.name = 'MaxRetriesPerRequestError';
++    expect(classifyError(error)).toEqual({ retryable: true, errorClass: 'REDIS_UNAVAILABLE' });
++  });
++
++  it('maps ioredis connectivity and BullMQ stalled-job errors', () => {
++    expect(classifyError(new Error('Connection is closed.')).errorClass).toBe('REDIS_UNAVAILABLE');
++    expect(classifyError(new Error('job stalled more than allowable limit')).errorClass).toBe(
++      'WORKER_INTERRUPTED',
++    );
++  });
++
++  it('treats unknown errors as retryable (limited by the attempt count)', () => {
++    expect(classifyError(new Error('boom'))).toEqual({
++      retryable: true,
++      errorClass: 'UNKNOWN_INTERNAL',
++    });
++    expect(classifyError('a string')).toEqual({ retryable: true, errorClass: 'UNKNOWN_INTERNAL' });
++  });
++});
++
++describe('sanitizeError', () => {
++  it('redacts URLs and tokens from deliberate consumer messages', () => {
++    const text = sanitizeError(
++      new RetryableJobError(
++        'NETWORK',
++        'GET https://user:pw@mail.example/send failed with Bearer abc.def.ghi',
++      ),
++    );
++    expect(text).not.toMatch(/user:pw|abc\.def/);
++    expect(text).toContain('[redacted-url]');
++  });
++
++  it('truncates long messages', () => {
++    expect(
++      sanitizeError(new NonRetryableJobError('INVALID_PAYLOAD', 'x'.repeat(2000))),
++    ).toHaveLength(500);
++  });
++
++  it('reduces library errors to type and code, never message or stack', () => {
++    const error = Object.assign(new Error('INSERT ... VALUES (secret-token, "body")'), {
++      code: 'P2002',
++    });
++    const text = sanitizeError(error);
++    expect(text).toBe('Error (P2002)');
++    expect(text).not.toMatch(/secret|INSERT|\n\s+at /);
++  });
++});
+diff --git a/backend/src/infra/jobs/errors.ts b/backend/src/infra/jobs/errors.ts
+new file mode 100644
+index 0000000..790f7f9
+--- /dev/null
++++ b/backend/src/infra/jobs/errors.ts
+@@ -0,0 +1,128 @@
++import { ZodError } from 'zod';
++import { Prisma } from '../../generated/prisma/client.js';
++import { isConcurrencyFailure } from '../db/errors.js';
++
++export type RetryableReason =
++  | 'NETWORK'
++  | 'SERVICE_UNAVAILABLE'
++  | 'RATE_LIMITED'
++  | 'TRANSIENT_DATABASE'
++  | 'REDIS_UNAVAILABLE'
++  | 'WORKER_INTERRUPTED'
++  | 'UNKNOWN_INTERNAL';
++
++export type NonRetryableReason =
++  | 'INVALID_PAYLOAD'
++  | 'UNSUPPORTED_EVENT_TYPE'
++  | 'BUSINESS_RULE_VIOLATION'
++  | 'AUTHENTICATION_OR_CONFIGURATION'
++  | 'RESOURCE_NOT_FOUND'
++  | 'AUTHORIZATION_FAILURE';
++
++/** Thrown by consumers for a failure that is worth retrying (temporary network/service/provider). */
++export class RetryableJobError extends Error {
++  constructor(
++    readonly reason: RetryableReason,
++    message: string,
++    /** A delay supplied by the provider (for example on rate limiting); honored by the retry. */
++    readonly retryAfterMs?: number,
++  ) {
++    super(message);
++    this.name = 'RetryableJobError';
++  }
++}
++
++/** Thrown by consumers for a failure that retrying cannot fix: the job goes straight to dead letter. */
++export class NonRetryableJobError extends Error {
++  constructor(
++    readonly reason: NonRetryableReason,
++    message: string,
++  ) {
++    super(message);
++    this.name = 'NonRetryableJobError';
++  }
++}
++
++export type Classification = {
++  retryable: boolean;
++  errorClass: string;
++  retryAfterMs?: number;
++};
++
++const NETWORK_CODES = new Set([
++  'ECONNREFUSED',
++  'ECONNRESET',
++  'ETIMEDOUT',
++  'EPIPE',
++  'ENOTFOUND',
++  'EAI_AGAIN',
++  'EHOSTUNREACH',
++]);
++const PRISMA_TRANSIENT_CODES = new Set(['P1001', 'P1002', 'P1008', 'P1017', 'P2024', 'P2034']);
++
++function codeOf(error: unknown): string | undefined {
++  if (typeof error !== 'object' || error === null) return undefined;
++  const { code } = error as { code?: unknown };
++  return typeof code === 'string' ? code : undefined;
++}
++
++/** Maps any thrown value to a retry decision. Unknown errors are retryable (limited by attempts). */
++export function classifyError(error: unknown): Classification {
++  if (error instanceof NonRetryableJobError) {
++    return { retryable: false, errorClass: error.reason };
++  }
++  if (error instanceof RetryableJobError) {
++    return { retryable: true, errorClass: error.reason, retryAfterMs: error.retryAfterMs };
++  }
++  if (error instanceof ZodError) {
++    return { retryable: false, errorClass: 'INVALID_PAYLOAD' };
++  }
++  const code = codeOf(error);
++  if (isConcurrencyFailure(error)) {
++    return { retryable: true, errorClass: 'TRANSIENT_DATABASE' };
++  }
++  if (
++    (error instanceof Prisma.PrismaClientKnownRequestError ||
++      error instanceof Prisma.PrismaClientInitializationError) &&
++    code !== undefined &&
++    PRISMA_TRANSIENT_CODES.has(code)
++  ) {
++    return { retryable: true, errorClass: 'TRANSIENT_DATABASE' };
++  }
++  if (error instanceof Error && error.name === 'MaxRetriesPerRequestError') {
++    return { retryable: true, errorClass: 'REDIS_UNAVAILABLE' };
++  }
++  if (code !== undefined && NETWORK_CODES.has(code)) {
++    return { retryable: true, errorClass: 'NETWORK' };
++  }
++  if (error instanceof Error && /Connection is closed/i.test(error.message)) {
++    return { retryable: true, errorClass: 'REDIS_UNAVAILABLE' };
++  }
++  if (error instanceof Error && /stalled more than/i.test(error.message)) {
++    return { retryable: true, errorClass: 'WORKER_INTERRUPTED' };
++  }
++  return { retryable: true, errorClass: 'UNKNOWN_INTERNAL' };
++}
++
++const MAX_ERROR_LENGTH = 500;
++const REDACTIONS: [RegExp, string][] = [
++  [/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, '[redacted-url]'],
++  [/\bBearer\s+\S+/gi, 'Bearer [redacted]'],
++  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, '[redacted-token]'],
++];
++
++/**
++ * The text stored in `lastError`. Only errors thrown deliberately by consumers keep their message
++ * (redacted and truncated); anything else is reduced to its type and code, because messages from
++ * drivers and libraries can contain SQL, parameters or payload fragments. Never a stack trace.
++ */
++export function sanitizeError(error: unknown): string {
++  if (error instanceof RetryableJobError || error instanceof NonRetryableJobError) {
++    let text = error.message;
++    for (const [pattern, replacement] of REDACTIONS) text = text.replace(pattern, replacement);
++    return text.slice(0, MAX_ERROR_LENGTH);
++  }
++  const name = error instanceof Error ? error.name : typeof error;
++  const code = codeOf(error);
++  return (code === undefined ? name : `${name} (${code})`).slice(0, MAX_ERROR_LENGTH);
++}
+diff --git a/backend/src/infra/jobs/events.spec.ts b/backend/src/infra/jobs/events.spec.ts
+new file mode 100644
+index 0000000..e86ac45
+--- /dev/null
++++ b/backend/src/infra/jobs/events.spec.ts
+@@ -0,0 +1,70 @@
++import { randomUUID } from 'node:crypto';
++import { RATE_LIMITED_QUEUES } from '../../config/env';
++import {
++  DEAD_LETTER_QUEUE,
++  OUTBOX_EVENT_TYPES,
++  QUEUE_NAMES,
++  queueForEvent,
++  validatePayload,
++  type OutboxEventType,
++} from './events';
++
++describe('event catalog', () => {
++  it('maps every event type to its queue', () => {
++    expect(queueForEvent('ALERT_TRIAGE_REQUESTED')).toBe('ai-triage');
++    expect(queueForEvent('SLA_EVALUATION_REQUESTED')).toBe('sla-escalation');
++    expect(queueForEvent('NOTIFICATION_REQUESTED')).toBe('notifications');
++    expect(queueForEvent('POSTMORTEM_GENERATION_REQUESTED')).toBe('postmortem');
++    expect(queueForEvent('INVESTIGATION_REQUESTED')).toBe('investigation');
++    expect(queueForEvent('SOMETHING_ELSE')).toBeUndefined();
++    expect(queueForEvent('toString')).toBeUndefined();
++  });
++
++  it('keeps the five queues, the dead-letter queue and the configured rate limits in step', () => {
++    expect([...QUEUE_NAMES].sort()).toEqual([...RATE_LIMITED_QUEUES].sort());
++    expect(DEAD_LETTER_QUEUE).toBe('dead-letter');
++  });
++});
++
++describe('validatePayload', () => {
++  const id = () => randomUUID();
++  const valid: Record<OutboxEventType, unknown> = {
++    ALERT_TRIAGE_REQUESTED: { alertId: id(), incidentId: id(), requestId: 'req-1' },
++    SLA_EVALUATION_REQUESTED: { incidentId: id() },
++    NOTIFICATION_REQUESTED: { kind: 'INCIDENT_ASSIGNED', incidentId: id(), recipientIds: [id()] },
++    POSTMORTEM_GENERATION_REQUESTED: { postmortemId: id(), incidentId: id() },
++    INVESTIGATION_REQUESTED: { investigationId: id(), incidentId: id(), requestId: 'r_2' },
++  };
++
++  it.each(Object.keys(valid) as OutboxEventType[])('accepts a valid %s payload', (type) => {
++    expect(validatePayload(type, valid[type]).ok).toBe(true);
++  });
++
++  it.each(Object.keys(valid) as OutboxEventType[])('rejects an empty %s payload', (type) => {
++    expect(validatePayload(type, {}).ok).toBe(false);
++  });
++
++  it('rejects ids that are not UUIDs, unknown keys and bad request ids', () => {
++    expect(validatePayload('SLA_EVALUATION_REQUESTED', { incidentId: 'nope' }).ok).toBe(false);
++    expect(validatePayload('SLA_EVALUATION_REQUESTED', { incidentId: id(), body: 'x' }).ok).toBe(
++      false,
++    );
++    expect(
++      validatePayload('SLA_EVALUATION_REQUESTED', { incidentId: id(), requestId: 'bad id!' }).ok,
++    ).toBe(false);
++  });
++
++  it('keeps notification extras to short scalars or id lists (no bodies or objects)', () => {
++    const base = { kind: 'X', incidentId: id() };
++    expect(validatePayload('NOTIFICATION_REQUESTED', { ...base, body: { text: 'hi' } }).ok).toBe(
++      false,
++    );
++    expect(validatePayload('NOTIFICATION_REQUESTED', { ...base, text: 'x'.repeat(129) }).ok).toBe(
++      false,
++    );
++  });
++
++  it('exposes exactly the five catalog event types', () => {
++    expect(Object.values(OUTBOX_EVENT_TYPES).sort()).toEqual(Object.keys(valid).sort());
++  });
++});
+diff --git a/backend/src/infra/jobs/events.ts b/backend/src/infra/jobs/events.ts
+new file mode 100644
+index 0000000..cc4eeaf
+--- /dev/null
++++ b/backend/src/infra/jobs/events.ts
+@@ -0,0 +1,98 @@
++import { z } from 'zod';
++
++/** BullMQ queues fed by the outbox relay. */
++export const QUEUES = {
++  AI_TRIAGE: 'ai-triage',
++  SLA_ESCALATION: 'sla-escalation',
++  NOTIFICATIONS: 'notifications',
++  POSTMORTEM: 'postmortem',
++  INVESTIGATION: 'investigation',
++} as const;
++
++export type QueueName = (typeof QUEUES)[keyof typeof QUEUES];
++
++export const QUEUE_NAMES: readonly QueueName[] = Object.values(QUEUES);
++
++/** The single queue that receives a job describing every dead-lettered outbox event. */
++export const DEAD_LETTER_QUEUE = 'dead-letter';
++
++export const OUTBOX_EVENT_TYPES = {
++  ALERT_TRIAGE_REQUESTED: 'ALERT_TRIAGE_REQUESTED',
++  SLA_EVALUATION_REQUESTED: 'SLA_EVALUATION_REQUESTED',
++  NOTIFICATION_REQUESTED: 'NOTIFICATION_REQUESTED',
++  POSTMORTEM_GENERATION_REQUESTED: 'POSTMORTEM_GENERATION_REQUESTED',
++  INVESTIGATION_REQUESTED: 'INVESTIGATION_REQUESTED',
++} as const;
++
++export type OutboxEventType = (typeof OUTBOX_EVENT_TYPES)[keyof typeof OUTBOX_EVENT_TYPES];
++
++const uuid = z.uuid();
++/** Same character set and limit as the `X-Request-Id` header. */
++const requestId = z
++  .string()
++  .max(128)
++  .regex(/^[A-Za-z0-9_-]+$/)
++  .optional();
++
++/**
++ * Payloads carry ids and the minimum facts only. Notification payloads are open-ended (SLICE-09
++ * owns the kinds), so extra keys are allowed but only as short scalars or short id lists, which
++ * keeps bodies, prompts and secrets out of the outbox.
++ */
++const notificationExtra = z.union([
++  z.string().max(128),
++  z.number(),
++  z.boolean(),
++  z.array(z.string().max(128)).max(50),
++]);
++
++const payloadSchemas = {
++  ALERT_TRIAGE_REQUESTED: z.strictObject({ alertId: uuid, incidentId: uuid, requestId }),
++  SLA_EVALUATION_REQUESTED: z.strictObject({ incidentId: uuid, requestId }),
++  NOTIFICATION_REQUESTED: z
++    .object({
++      kind: z.string().min(1).max(64),
++      incidentId: uuid.optional(),
++      actorId: uuid.optional(),
++      requestId,
++    })
++    .catchall(notificationExtra),
++  POSTMORTEM_GENERATION_REQUESTED: z.strictObject({
++    postmortemId: uuid,
++    incidentId: uuid,
++    requestId,
++  }),
++  INVESTIGATION_REQUESTED: z.strictObject({ investigationId: uuid, incidentId: uuid, requestId }),
++} as const satisfies Record<OutboxEventType, z.ZodType>;
++
++const EVENT_QUEUE: Record<OutboxEventType, QueueName> = {
++  ALERT_TRIAGE_REQUESTED: QUEUES.AI_TRIAGE,
++  SLA_EVALUATION_REQUESTED: QUEUES.SLA_ESCALATION,
++  NOTIFICATION_REQUESTED: QUEUES.NOTIFICATIONS,
++  POSTMORTEM_GENERATION_REQUESTED: QUEUES.POSTMORTEM,
++  INVESTIGATION_REQUESTED: QUEUES.INVESTIGATION,
++};
++
++export type OutboxPayload = Record<string, unknown> & { requestId?: string };
++
++export function isOutboxEventType(value: string): value is OutboxEventType {
++  return Object.prototype.hasOwnProperty.call(EVENT_QUEUE, value);
++}
++
++/** The queue that consumes `eventType`, or `undefined` when the event type is not in the catalog. */
++export function queueForEvent(eventType: string): QueueName | undefined {
++  return isOutboxEventType(eventType) ? EVENT_QUEUE[eventType] : undefined;
++}
++
++/** Validates a payload against its event type's schema; returns the issue paths on failure. */
++export function validatePayload(
++  eventType: OutboxEventType,
++  payload: unknown,
++): { ok: true; payload: OutboxPayload } | { ok: false; fields: string[] } {
++  const result = payloadSchemas[eventType].safeParse(payload);
++  if (result.success) return { ok: true, payload: result.data as OutboxPayload };
++  return {
++    ok: false,
++    fields: [...new Set(result.error.issues.map((i) => i.path.join('.') || '*'))],
++  };
++}
+diff --git a/backend/src/infra/jobs/gateway.ts b/backend/src/infra/jobs/gateway.ts
+new file mode 100644
+index 0000000..bcddc03
+--- /dev/null
++++ b/backend/src/infra/jobs/gateway.ts
+@@ -0,0 +1,68 @@
++import { Queue } from 'bullmq';
++import type { Redis } from 'ioredis';
++import { logger } from '../../shared/observability/logger.js';
++import { DEAD_LETTER_QUEUE, type QueueName } from './events.js';
++
++/** What a BullMQ job carries: the outbox row's identity and its (ids-only) payload. */
++export type JobData = {
++  outboxEventId: string;
++  eventType: string;
++  aggregateType: string;
++  aggregateId: string;
++  payload: unknown;
++};
++
++/** Describes one dead-lettered outbox event on the shared `dead-letter` queue. */
++export type DeadLetterJobData = {
++  outboxEventId: string;
++  eventType: string;
++  sourceQueue: string;
++  errorClass: string;
++};
++
++/** The only door to Redis for business jobs, so tests can replace it. */
++export interface QueueGateway {
++  publish(queue: QueueName, data: JobData): Promise<void>;
++  publishDeadLetter(data: DeadLetterJobData): Promise<void>;
++  close(): Promise<void>;
++}
++
++/**
++ * BullMQ-backed gateway. Jobs use the outbox event id as `jobId` (BullMQ de-duplicates while the
++ * job exists), finished jobs are removed (the outbox row is the durable record), and retries use
++ * the custom backoff strategy the workers register.
++ */
++export function createBullmqGateway(connection: Redis, executionAttempts: number): QueueGateway {
++  const queues = new Map<string, Queue>();
++
++  const queueFor = (name: string): Queue => {
++    let queue = queues.get(name);
++    if (!queue) {
++      queue = new Queue(name, { connection });
++      queue.on('error', (err) => logger.warn({ err, queue: name }, 'Queue error'));
++      queues.set(name, queue);
++    }
++    return queue;
++  };
++
++  return {
++    async publish(queue, data) {
++      await queueFor(queue).add(data.eventType, data, {
++        jobId: data.outboxEventId,
++        attempts: executionAttempts,
++        backoff: { type: 'custom' },
++        removeOnComplete: true,
++        removeOnFail: true,
++      });
++    },
++    async publishDeadLetter(data) {
++      await queueFor(DEAD_LETTER_QUEUE).add('DEAD_LETTERED', data, {
++        removeOnComplete: true,
++      });
++    },
++    async close() {
++      await Promise.all([...queues.values()].map((queue) => queue.close().catch(() => undefined)));
++      queues.clear();
++    },
++  };
++}
+diff --git a/backend/src/infra/jobs/index.ts b/backend/src/infra/jobs/index.ts
+new file mode 100644
+index 0000000..4ce62c8
+--- /dev/null
++++ b/backend/src/infra/jobs/index.ts
+@@ -0,0 +1,18 @@
++export { enqueueOutbox, OutboxContractError, type EnqueueOutboxInput } from './outbox.js';
++export {
++  DEAD_LETTER_QUEUE,
++  OUTBOX_EVENT_TYPES,
++  QUEUES,
++  QUEUE_NAMES,
++  queueForEvent,
++  type OutboxEventType,
++  type OutboxPayload,
++  type QueueName,
++} from './events.js';
++export {
++  NonRetryableJobError,
++  RetryableJobError,
++  type NonRetryableReason,
++  type RetryableReason,
++} from './errors.js';
++export { registerProcessor, type OutboxProcessor, type ProcessorInput } from './registry.js';
+diff --git a/backend/src/infra/jobs/loop.ts b/backend/src/infra/jobs/loop.ts
+new file mode 100644
+index 0000000..02edef5
+--- /dev/null
++++ b/backend/src/infra/jobs/loop.ts
+@@ -0,0 +1,44 @@
++import { logger } from '../../shared/observability/logger.js';
++
++export type Loop = { stop(): Promise<void> };
++
++/**
++ * Runs `run` repeatedly, one run at a time. When `run` returns `true` (more work is waiting) the next
++ * run starts immediately; otherwise it waits `intervalMs`. A failing run is logged and retried.
++ */
++export function startLoop(
++  name: string,
++  intervalMs: number,
++  run: () => Promise<boolean | void>,
++): Loop {
++  let stopped = false;
++  let timer: NodeJS.Timeout | undefined;
++  let current: Promise<void> = Promise.resolve();
++
++  const schedule = (delayMs: number) => {
++    if (stopped) return;
++    timer = setTimeout(() => {
++      current = tick();
++    }, delayMs);
++  };
++
++  const tick = async (): Promise<void> => {
++    let more = false;
++    try {
++      more = (await run()) === true;
++    } catch (err) {
++      logger.error({ err, loop: name, outcome: 'loop_failed' }, 'Background loop run failed');
++    }
++    schedule(more ? 0 : intervalMs);
++  };
++
++  schedule(0);
++
++  return {
++    async stop() {
++      stopped = true;
++      if (timer) clearTimeout(timer);
++      await current;
++    },
++  };
++}
+diff --git a/backend/src/infra/jobs/maintenance.ts b/backend/src/infra/jobs/maintenance.ts
+new file mode 100644
+index 0000000..1293e70
+--- /dev/null
++++ b/backend/src/infra/jobs/maintenance.ts
+@@ -0,0 +1,29 @@
++import { logger } from '../../shared/observability/logger.js';
++import { getPrisma } from '../db/prisma.js';
++import { deleteExpiredSuccess, recoverStaleProcessing } from './outbox.repository.js';
++
++/** Returns `PROCESSING` rows past their deadline to `PENDING` so the relay republishes them. */
++export async function recoverStaleOutbox(): Promise<number> {
++  const started = Date.now();
++  const recovered = await getPrisma().$transaction((tx) => recoverStaleProcessing(tx));
++  if (recovered > 0) {
++    logger.warn(
++      { recovered, outcome: 'stale_recovered', durationMs: Date.now() - started },
++      'Stale PROCESSING outbox rows returned to PENDING',
++    );
++  }
++  return recovered;
++}
++
++/** Deletes `SUCCESS` rows older than the retention window. `DEAD_LETTER` rows are never deleted. */
++export async function purgeFinishedOutbox(retentionMs: number): Promise<number> {
++  const started = Date.now();
++  const deleted = await getPrisma().$transaction((tx) => deleteExpiredSuccess(tx, retentionMs));
++  if (deleted > 0) {
++    logger.info(
++      { deleted, outcome: 'retention_deleted', durationMs: Date.now() - started },
++      'Finished outbox rows deleted by retention',
++    );
++  }
++  return deleted;
++}
+diff --git a/backend/src/infra/jobs/outbox.repository.ts b/backend/src/infra/jobs/outbox.repository.ts
+new file mode 100644
+index 0000000..badc281
+--- /dev/null
++++ b/backend/src/infra/jobs/outbox.repository.ts
+@@ -0,0 +1,155 @@
++import { Prisma } from '../../generated/prisma/client.js';
++import type { TransactionClient } from '../db/prisma.js';
++
++/** Anything that can run raw SQL: the Prisma client or a transaction handle. */
++export type Db = Pick<TransactionClient, '$queryRaw' | '$executeRaw'>;
++
++/**
++ * Timestamps in `OutboxEvent` are `timestamp` columns holding UTC, so every comparison and
++ * assignment here uses the database clock converted to UTC.
++ */
++const NOW = Prisma.sql`timezone('UTC', now())`;
++const ms = (value: number) => Prisma.sql`(${value}::double precision * interval '1 millisecond')`;
++
++export type ClaimedEvent = {
++  id: string;
++  eventType: string;
++  aggregateType: string;
++  aggregateId: string;
++  payload: unknown;
++  publishAttemptCount: number;
++  executionAttemptCount: number;
++  /** The claim's lease expiry as stored, used to prove the claim is still ours on later updates. */
++  lease: string;
++};
++
++/**
++ * Claims up to `batchSize` publishable rows in one statement: `FOR UPDATE SKIP LOCKED` picks rows no
++ * other relay holds and the lease is set before the locks are released, so each row has one claimant.
++ */
++export function claimBatch(
++  db: Db,
++  batchSize: number,
++  claimLeaseMs: number,
++): Promise<ClaimedEvent[]> {
++  return db.$queryRaw<ClaimedEvent[]>(Prisma.sql`
++    UPDATE "OutboxEvent" SET "leaseExpiresAt" = ${NOW} + ${ms(claimLeaseMs)}
++    WHERE "id" IN (
++      SELECT "id" FROM "OutboxEvent"
++      WHERE "status" = 'PENDING'
++        AND "availableAt" <= ${NOW}
++        AND ("leaseExpiresAt" IS NULL OR "leaseExpiresAt" <= ${NOW})
++      ORDER BY "availableAt", "id"
++      LIMIT ${batchSize}
++      FOR UPDATE SKIP LOCKED
++    )
++    RETURNING "id", "eventType", "aggregateType", "aggregateId", "payload",
++      "publishAttemptCount", "executionAttemptCount", "leaseExpiresAt"::text AS "lease"`);
++}
++
++const holdsClaim = (id: string, lease: string) =>
++  Prisma.sql`"id" = ${id}::uuid AND "status" = 'PENDING' AND "leaseExpiresAt"::text = ${lease}`;
++
++/** The job is in BullMQ: `PENDING → PROCESSING` if the claim is still ours. */
++export async function markPublished(
++  db: Db,
++  id: string,
++  lease: string,
++  processingWindowMs: number,
++): Promise<boolean> {
++  const changed = await db.$executeRaw(Prisma.sql`
++    UPDATE "OutboxEvent" SET "status" = 'PROCESSING', "publishedAt" = ${NOW},
++      "publishAttemptCount" = "publishAttemptCount" + 1,
++      "leaseExpiresAt" = ${NOW} + ${ms(processingWindowMs)},
++      "errorClass" = NULL, "lastError" = NULL
++    WHERE ${holdsClaim(id, lease)}`);
++  return changed > 0;
++}
++
++/** Retryable publication failure: stay `PENDING`, release the claim, retry after `delayMs`. */
++export async function schedulePublishRetry(
++  db: Db,
++  args: { id: string; lease: string; delayMs: number; errorClass: string; lastError: string },
++): Promise<boolean> {
++  const changed = await db.$executeRaw(Prisma.sql`
++    UPDATE "OutboxEvent" SET "publishAttemptCount" = "publishAttemptCount" + 1,
++      "errorClass" = ${args.errorClass}, "lastError" = ${args.lastError},
++      "leaseExpiresAt" = NULL, "availableAt" = ${NOW} + ${ms(args.delayMs)}
++    WHERE ${holdsClaim(args.id, args.lease)}`);
++  return changed > 0;
++}
++
++/** Non-retryable publication failure: the durable failure record. */
++export async function deadLetterUnpublished(
++  db: Db,
++  args: { id: string; lease: string; errorClass: string; lastError: string },
++): Promise<boolean> {
++  const changed = await db.$executeRaw(Prisma.sql`
++    UPDATE "OutboxEvent" SET "status" = 'DEAD_LETTER',
++      "publishAttemptCount" = "publishAttemptCount" + 1,
++      "errorClass" = ${args.errorClass}, "lastError" = ${args.lastError}, "leaseExpiresAt" = NULL
++    WHERE ${holdsClaim(args.id, args.lease)}`);
++  return changed > 0;
++}
++
++/** The worker finished the job: `PROCESSING → SUCCESS`. */
++export async function markSuccess(db: Db, id: string): Promise<boolean> {
++  const changed = await db.$executeRaw(Prisma.sql`
++    UPDATE "OutboxEvent" SET "status" = 'SUCCESS', "processedAt" = ${NOW}, "leaseExpiresAt" = NULL
++    WHERE "id" = ${id}::uuid AND "status" = 'PROCESSING'`);
++  return changed > 0;
++}
++
++/** A retryable execution failure: count it and keep the row alive until the retry is due. */
++export async function recordExecutionRetry(
++  db: Db,
++  args: {
++    id: string;
++    delayMs: number;
++    processingWindowMs: number;
++    errorClass: string;
++    lastError: string;
++  },
++): Promise<boolean> {
++  const changed = await db.$executeRaw(Prisma.sql`
++    UPDATE "OutboxEvent" SET "executionAttemptCount" = "executionAttemptCount" + 1,
++      "errorClass" = ${args.errorClass}, "lastError" = ${args.lastError},
++      "leaseExpiresAt" = ${NOW} + ${ms(args.delayMs)} + ${ms(args.processingWindowMs)}
++    WHERE "id" = ${args.id}::uuid AND "status" = 'PROCESSING'`);
++  return changed > 0;
++}
++
++export type DeadLettered = {
++  id: string;
++  eventType: string;
++  publishAttemptCount: number;
++  executionAttemptCount: number;
++};
++
++/** Terminal execution failure: `PROCESSING → DEAD_LETTER` with the failure record. */
++export async function deadLetterExecution(
++  db: Db,
++  args: { id: string; errorClass: string; lastError: string },
++): Promise<DeadLettered | null> {
++  const rows = await db.$queryRaw<DeadLettered[]>(Prisma.sql`
++    UPDATE "OutboxEvent" SET "status" = 'DEAD_LETTER',
++      "executionAttemptCount" = "executionAttemptCount" + 1,
++      "errorClass" = ${args.errorClass}, "lastError" = ${args.lastError}, "leaseExpiresAt" = NULL
++    WHERE "id" = ${args.id}::uuid AND "status" = 'PROCESSING'
++    RETURNING "id", "eventType", "publishAttemptCount", "executionAttemptCount"`);
++  return rows[0] ?? null;
++}
++
++/** `PROCESSING` rows whose deadline passed (worker or Redis lost) go back to `PENDING`. */
++export function recoverStaleProcessing(db: Db): Promise<number> {
++  return db.$executeRaw(Prisma.sql`
++    UPDATE "OutboxEvent" SET "status" = 'PENDING', "availableAt" = ${NOW}, "leaseExpiresAt" = NULL
++    WHERE "status" = 'PROCESSING' AND "leaseExpiresAt" < ${NOW}`);
++}
++
++/** Deletes finished rows older than the retention window; `DEAD_LETTER` rows are never touched. */
++export function deleteExpiredSuccess(db: Db, retentionMs: number): Promise<number> {
++  return db.$executeRaw(Prisma.sql`
++    DELETE FROM "OutboxEvent"
++    WHERE "status" = 'SUCCESS' AND "processedAt" < ${NOW} - ${ms(retentionMs)}`);
++}
+diff --git a/backend/src/infra/jobs/outbox.ts b/backend/src/infra/jobs/outbox.ts
+new file mode 100644
+index 0000000..d09f849
+--- /dev/null
++++ b/backend/src/infra/jobs/outbox.ts
+@@ -0,0 +1,59 @@
++import type { Prisma } from '../../generated/prisma/client.js';
++import type { TransactionClient } from '../db/prisma.js';
++import { isOutboxEventType, validatePayload } from './events.js';
++
++export type EnqueueOutboxInput = {
++  eventType: string;
++  aggregateType: string;
++  aggregateId: string;
++  payload: unknown;
++  availableAt?: Date;
++};
++
++/** Thrown to the producer when the event or its payload is not acceptable; nothing is written. */
++export class OutboxContractError extends Error {
++  constructor(
++    readonly reason: 'UNSUPPORTED_EVENT_TYPE' | 'INVALID_PAYLOAD' | 'INVALID_AGGREGATE',
++    message: string,
++  ) {
++    super(message);
++    this.name = 'OutboxContractError';
++  }
++}
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++
++/**
++ * Writes one `PENDING` outbox row on the caller's transaction. It never commits, opens a
++ * transaction or touches Redis: the row exists exactly when the producer's change commits.
++ */
++export async function enqueueOutbox(
++  tx: TransactionClient,
++  input: EnqueueOutboxInput,
++): Promise<string> {
++  if (!isOutboxEventType(input.eventType)) {
++    throw new OutboxContractError('UNSUPPORTED_EVENT_TYPE', 'Unsupported outbox event type');
++  }
++  if (!UUID.test(input.aggregateId)) {
++    throw new OutboxContractError('INVALID_AGGREGATE', 'aggregateId must be a UUID');
++  }
++  const checked = validatePayload(input.eventType, input.payload);
++  if (!checked.ok) {
++    throw new OutboxContractError(
++      'INVALID_PAYLOAD',
++      `Invalid payload for ${input.eventType}: ${checked.fields.join(', ')}`,
++    );
++  }
++
++  const row = await tx.outboxEvent.create({
++    data: {
++      eventType: input.eventType,
++      aggregateType: input.aggregateType,
++      aggregateId: input.aggregateId,
++      payload: checked.payload as Prisma.InputJsonObject,
++      ...(input.availableAt === undefined ? {} : { availableAt: input.availableAt }),
++    },
++    select: { id: true },
++  });
++  return row.id;
++}
+diff --git a/backend/src/infra/jobs/processor.ts b/backend/src/infra/jobs/processor.ts
+new file mode 100644
+index 0000000..a7d0132
+--- /dev/null
++++ b/backend/src/infra/jobs/processor.ts
+@@ -0,0 +1,172 @@
++import { UnrecoverableError, Worker, type Job } from 'bullmq';
++import type { Redis } from 'ioredis';
++import { z } from 'zod';
++import type { JobsConfig } from '../../config/env.js';
++import { logger } from '../../shared/observability/logger.js';
++import { getPrisma } from '../db/prisma.js';
++import { executionRetryDelayMs } from './backoff.js';
++import { announceDeadLetter } from './dead-letter.js';
++import { classifyError, NonRetryableJobError, sanitizeError } from './errors.js';
++import { isOutboxEventType, queueForEvent, validatePayload, type QueueName } from './events.js';
++import type { QueueGateway } from './gateway.js';
++import { deadLetterExecution, markSuccess, recordExecutionRetry } from './outbox.repository.js';
++import type { OutboxProcessor } from './registry.js';
++import { requestIdOf } from './relay.js';
++
++export type WorkerConfig = Pick<
++  JobsConfig,
++  | 'executionAttempts'
++  | 'executionBackoffBaseMs'
++  | 'executionBackoffCapMs'
++  | 'processingWindowMs'
++  | 'workerConcurrency'
++  | 'queueRateLimits'
++>;
++
++const jobDataSchema = z.object({
++  outboxEventId: z.uuid(),
++  eventType: z.string(),
++  aggregateType: z.string(),
++  aggregateId: z.string(),
++  payload: z.unknown(),
++});
++
++type JobLike = Pick<Job, 'data' | 'attemptsMade' | 'opts'>;
++
++/**
++ * The common wrapper around every consumer. On success the outbox row becomes `SUCCESS`; on failure
++ * the error is classified: retryable errors are counted and rethrown so BullMQ retries (up to the
++ * configured attempts); non-retryable errors and the last failed attempt write the `DEAD_LETTER`
++ * record first and then announce it on the `dead-letter` queue.
++ */
++export async function processOutboxJob(
++  job: JobLike,
++  queue: QueueName,
++  processor: OutboxProcessor,
++  deps: { config: WorkerConfig; gateway: QueueGateway },
++): Promise<void> {
++  const parsed = jobDataSchema.safeParse(job.data);
++  if (!parsed.success) {
++    logger.error(
++      { queue, outcome: 'unreadable_job' },
++      'Job data does not identify an outbox event',
++    );
++    throw new UnrecoverableError('Unreadable job data');
++  }
++  const data = parsed.data;
++
++  const db = getPrisma();
++  const started = Date.now();
++  const attempt = job.attemptsMade + 1;
++  const maxAttempts = job.opts.attempts ?? deps.config.executionAttempts;
++  const requestId = requestIdOf(data.payload);
++  const fields = {
++    queue,
++    jobId: data.outboxEventId,
++    outboxEventId: data.outboxEventId,
++    eventType: data.eventType,
++    attempt,
++    maxAttempts,
++    requestId,
++  };
++
++  try {
++    if (!isOutboxEventType(data.eventType) || queueForEvent(data.eventType) !== queue) {
++      throw new NonRetryableJobError('UNSUPPORTED_EVENT_TYPE', 'Unsupported event type');
++    }
++    const checked = validatePayload(data.eventType, data.payload);
++    if (!checked.ok) {
++      throw new NonRetryableJobError(
++        'INVALID_PAYLOAD',
++        `Invalid payload fields: ${checked.fields.join(', ')}`,
++      );
++    }
++
++    await processor({
++      outboxEventId: data.outboxEventId,
++      eventType: data.eventType,
++      aggregateType: data.aggregateType,
++      aggregateId: data.aggregateId,
++      payload: checked.payload,
++      attempt,
++    });
++    const marked = await markSuccess(db, data.outboxEventId);
++    logger.info(
++      {
++        ...fields,
++        outcome: marked ? 'success' : 'success_row_not_processing',
++        durationMs: Date.now() - started,
++      },
++      'Job completed',
++    );
++  } catch (error) {
++    const { retryable, errorClass } = classifyError(error);
++    const lastError = sanitizeError(error);
++    const durationMs = Date.now() - started;
++
++    if (!retryable || attempt >= maxAttempts) {
++      const record = await deadLetterExecution(db, {
++        id: data.outboxEventId,
++        errorClass,
++        lastError,
++      });
++      logger.error(
++        { ...fields, errorClass, retryable, outcome: 'dead_letter', durationMs },
++        'Job dead-lettered',
++      );
++      if (record) {
++        await announceDeadLetter(deps.gateway, {
++          outboxEventId: data.outboxEventId,
++          eventType: data.eventType,
++          sourceQueue: queue,
++          errorClass,
++          requestId,
++        });
++      }
++      throw new UnrecoverableError(lastError);
++    }
++
++    const delayMs = executionRetryDelayMs(attempt, error, deps.config);
++    await recordExecutionRetry(db, {
++      id: data.outboxEventId,
++      delayMs,
++      processingWindowMs: deps.config.processingWindowMs,
++      errorClass,
++      lastError,
++    });
++    logger.warn(
++      {
++        ...fields,
++        errorClass,
++        retryable,
++        retryInMs: delayMs,
++        outcome: 'retry_scheduled',
++        durationMs,
++      },
++      'Job failed; will retry',
++    );
++    throw error;
++  }
++}
++
++/** One BullMQ worker for `queue`, running the common wrapper around `processor`. */
++export function createJobWorker(
++  queue: QueueName,
++  processor: OutboxProcessor,
++  deps: { config: WorkerConfig; gateway: QueueGateway },
++  connection: Redis,
++): Worker {
++  const limit = deps.config.queueRateLimits[queue];
++  const worker = new Worker(queue, (job) => processOutboxJob(job, queue, processor, deps), {
++    connection,
++    concurrency: deps.config.workerConcurrency,
++    limiter: { max: limit.max, duration: limit.durationMs },
++    settings: {
++      backoffStrategy: (attemptsMade, _type, error) =>
++        executionRetryDelayMs(attemptsMade, error, deps.config),
++    },
++  });
++  worker.on('error', (err) => logger.warn({ err, queue }, 'Worker error'));
++  worker.on('stalled', (jobId) => logger.warn({ queue, jobId, outcome: 'stalled' }, 'Job stalled'));
++  return worker;
++}
+diff --git a/backend/src/infra/jobs/redrive.ts b/backend/src/infra/jobs/redrive.ts
+new file mode 100644
+index 0000000..5b4e032
+--- /dev/null
++++ b/backend/src/infra/jobs/redrive.ts
+@@ -0,0 +1,60 @@
++import { z } from 'zod';
++import { logger } from '../../shared/observability/logger.js';
++import { lockRowForUpdate, runInTransaction } from '../db/prisma.js';
++import { isOutboxEventType, validatePayload } from './events.js';
++
++export class RedriveError extends Error {
++  constructor(
++    readonly code:
++      'INVALID_ID' | 'NOT_FOUND' | 'NOT_DEAD_LETTER' | 'UNSUPPORTED_EVENT_TYPE' | 'INVALID_PAYLOAD',
++    message: string,
++  ) {
++    super(message);
++    this.name = 'RedriveError';
++  }
++}
++
++/**
++ * Operator action: returns a `DEAD_LETTER` outbox row to `PENDING` so the relay publishes it again.
++ * The row is validated first (it exists, is dead-lettered, its event type is supported and its
++ * payload is valid). Business keys are unchanged, so reprocessing stays idempotent.
++ */
++export async function redriveOutboxEvent(id: string, operator: string): Promise<void> {
++  if (!z.uuid().safeParse(id).success) {
++    throw new RedriveError('INVALID_ID', 'The outbox event id must be a UUID');
++  }
++
++  await runInTransaction(async (tx) => {
++    if (!(await lockRowForUpdate(tx, 'OutboxEvent', id))) {
++      throw new RedriveError('NOT_FOUND', 'Outbox event not found');
++    }
++    const row = await tx.outboxEvent.findUniqueOrThrow({ where: { id } });
++    if (row.status !== 'DEAD_LETTER') {
++      throw new RedriveError('NOT_DEAD_LETTER', `Outbox event is ${row.status}, not DEAD_LETTER`);
++    }
++    if (!isOutboxEventType(row.eventType)) {
++      throw new RedriveError('UNSUPPORTED_EVENT_TYPE', 'The event type is not supported');
++    }
++    if (!validatePayload(row.eventType, row.payload).ok) {
++      throw new RedriveError(
++        'INVALID_PAYLOAD',
++        'The stored payload is not valid for its event type',
++      );
++    }
++
++    await tx.outboxEvent.update({
++      where: { id },
++      data: {
++        status: 'PENDING',
++        availableAt: new Date(),
++        leaseExpiresAt: null,
++        executionAttemptCount: 0,
++      },
++    });
++  });
++
++  logger.info(
++    { outboxEventId: id, operator, redrivenAt: new Date().toISOString(), outcome: 'redriven' },
++    'Dead-letter outbox event re-driven',
++  );
++}
+diff --git a/backend/src/infra/jobs/registry.ts b/backend/src/infra/jobs/registry.ts
+new file mode 100644
+index 0000000..c9a8a64
+--- /dev/null
++++ b/backend/src/infra/jobs/registry.ts
+@@ -0,0 +1,34 @@
++import type { OutboxPayload, QueueName } from './events.js';
++
++export type ProcessorInput = {
++  outboxEventId: string;
++  eventType: string;
++  aggregateType: string;
++  aggregateId: string;
++  payload: OutboxPayload;
++  /** 1-based execution attempt number. */
++  attempt: number;
++};
++
++/**
++ * A consumer. It must be idempotent (delivery is at-least-once) and signal failures by throwing
++ * `RetryableJobError` / `NonRetryableJobError`; any other error is retried a limited number of times.
++ */
++export type OutboxProcessor = (input: ProcessorInput) => Promise<void>;
++
++const processors = new Map<QueueName, OutboxProcessor>();
++
++/** Called by a consumer's slice (from `src/workers`) to attach its processor to a queue. */
++export function registerProcessor(queue: QueueName, processor: OutboxProcessor): void {
++  if (processors.has(queue)) throw new Error(`A processor is already registered for ${queue}`);
++  processors.set(queue, processor);
++}
++
++export function getRegisteredProcessors(): ReadonlyMap<QueueName, OutboxProcessor> {
++  return processors;
++}
++
++/** Test support. */
++export function clearProcessors(): void {
++  processors.clear();
++}
+diff --git a/backend/src/infra/jobs/relay.ts b/backend/src/infra/jobs/relay.ts
+new file mode 100644
+index 0000000..e92fabf
+--- /dev/null
++++ b/backend/src/infra/jobs/relay.ts
+@@ -0,0 +1,199 @@
++import type { JobsConfig } from '../../config/env.js';
++import { logger } from '../../shared/observability/logger.js';
++import { getPrisma, runInTransaction } from '../db/prisma.js';
++import { exponentialBackoffMs } from './backoff.js';
++import { announceDeadLetter } from './dead-letter.js';
++import { classifyError, RetryableJobError, sanitizeError } from './errors.js';
++import { queueForEvent, isOutboxEventType, validatePayload } from './events.js';
++import type { QueueGateway } from './gateway.js';
++import {
++  claimBatch,
++  deadLetterUnpublished,
++  markPublished,
++  schedulePublishRetry,
++  type ClaimedEvent,
++} from './outbox.repository.js';
++
++export type RelayConfig = Pick<
++  JobsConfig,
++  | 'relayBatchSize'
++  | 'claimLeaseMs'
++  | 'processingWindowMs'
++  | 'publishTimeoutMs'
++  | 'publishBackoffBaseMs'
++  | 'publishBackoffCapMs'
++>;
++
++export type RelayCycleResult = {
++  claimed: number;
++  published: number;
++  retried: number;
++  deadLettered: number;
++  /** Rows whose claim expired and was taken over before this relay could update them. */
++  lostClaims: number;
++};
++
++export function requestIdOf(payload: unknown): string | undefined {
++  if (typeof payload !== 'object' || payload === null) return undefined;
++  const { requestId } = payload as { requestId?: unknown };
++  return typeof requestId === 'string' && requestId.length <= 128 ? requestId : undefined;
++}
++
++async function withTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
++  let timer: NodeJS.Timeout | undefined;
++  const timeout = new Promise<never>((_resolve, reject) => {
++    timer = setTimeout(
++      () => reject(new RetryableJobError('REDIS_UNAVAILABLE', 'Publishing timed out')),
++      timeoutMs,
++    );
++  });
++  try {
++    return await Promise.race([work, timeout]);
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
++type Outcome = 'published' | 'retried' | 'dead_lettered' | 'lost_claim';
++
++/** Publishes one claimed row and records the result. Never throws for a row-level failure. */
++async function relayOne(
++  row: ClaimedEvent,
++  config: RelayConfig,
++  gateway: QueueGateway,
++): Promise<Outcome> {
++  const started = Date.now();
++  const db = getPrisma();
++  const queue = queueForEvent(row.eventType);
++  const requestId = requestIdOf(row.payload);
++  const fields = {
++    outboxEventId: row.id,
++    jobId: row.id,
++    eventType: row.eventType,
++    queue,
++    requestId,
++    publishAttempt: row.publishAttemptCount + 1,
++    executionAttempts: row.executionAttemptCount,
++  };
++
++  const deadLetter = async (errorClass: string, lastError: string): Promise<Outcome> => {
++    const won = await deadLetterUnpublished(db, {
++      id: row.id,
++      lease: row.lease,
++      errorClass,
++      lastError,
++    });
++    if (!won) return 'lost_claim';
++    logger.error(
++      {
++        ...fields,
++        errorClass,
++        retryable: false,
++        outcome: 'dead_letter',
++        durationMs: Date.now() - started,
++      },
++      'Outbox event dead-lettered at publication',
++    );
++    await announceDeadLetter(gateway, {
++      outboxEventId: row.id,
++      eventType: row.eventType,
++      sourceQueue: queue ?? 'unknown',
++      errorClass,
++      requestId,
++    });
++    return 'dead_lettered';
++  };
++
++  if (!queue || !isOutboxEventType(row.eventType)) {
++    return deadLetter('UNSUPPORTED_EVENT_TYPE', 'Unsupported event type');
++  }
++  const checked = validatePayload(row.eventType, row.payload);
++  if (!checked.ok) {
++    return deadLetter('INVALID_PAYLOAD', `Invalid payload fields: ${checked.fields.join(', ')}`);
++  }
++
++  try {
++    await withTimeout(
++      gateway.publish(queue, {
++        outboxEventId: row.id,
++        eventType: row.eventType,
++        aggregateType: row.aggregateType,
++        aggregateId: row.aggregateId,
++        payload: checked.payload,
++      }),
++      config.publishTimeoutMs,
++    );
++  } catch (error) {
++    // Publication is retried without a maximum: a Redis outage must never dead-letter work.
++    const errorClass = classifyError(error).errorClass;
++    const delayMs = exponentialBackoffMs(
++      row.publishAttemptCount + 1,
++      config.publishBackoffBaseMs,
++      config.publishBackoffCapMs,
++    );
++    const scheduled = await schedulePublishRetry(db, {
++      id: row.id,
++      lease: row.lease,
++      delayMs,
++      errorClass,
++      lastError: sanitizeError(error),
++    });
++    logger.warn(
++      {
++        ...fields,
++        errorClass,
++        retryable: true,
++        retryInMs: delayMs,
++        outcome: 'publish_retry_scheduled',
++        durationMs: Date.now() - started,
++      },
++      'Outbox publication failed; will retry',
++    );
++    return scheduled ? 'retried' : 'lost_claim';
++  }
++
++  const marked = await markPublished(db, row.id, row.lease, config.processingWindowMs);
++  logger.info(
++    {
++      ...fields,
++      outcome: marked ? 'published' : 'published_claim_lost',
++      durationMs: Date.now() - started,
++    },
++    'Outbox event published',
++  );
++  return marked ? 'published' : 'lost_claim';
++}
++
++/** One relay pass: claim a batch in a short transaction, then publish it outside any transaction. */
++export async function runRelayCycle(
++  config: RelayConfig,
++  gateway: QueueGateway,
++): Promise<RelayCycleResult> {
++  const claimed = await runInTransaction((tx) =>
++    claimBatch(tx, config.relayBatchSize, config.claimLeaseMs),
++  );
++
++  const outcomes = await Promise.all(
++    claimed.map(async (row) => {
++      try {
++        return await relayOne(row, config, gateway);
++      } catch (err) {
++        // A database failure while recording the result: the lease expires and the row is reclaimed.
++        logger.error(
++          { err, outboxEventId: row.id, eventType: row.eventType, outcome: 'relay_update_failed' },
++          'Could not record the publication result',
++        );
++        return 'lost_claim' as const;
++      }
++    }),
++  );
++
++  const count = (outcome: Outcome) => outcomes.filter((o) => o === outcome).length;
++  return {
++    claimed: claimed.length,
++    published: count('published'),
++    retried: count('retried'),
++    deadLettered: count('dead_lettered'),
++    lostClaims: count('lost_claim'),
++  };
++}
+diff --git a/backend/src/infra/jobs/runtime.ts b/backend/src/infra/jobs/runtime.ts
+new file mode 100644
+index 0000000..39d88d9
+--- /dev/null
++++ b/backend/src/infra/jobs/runtime.ts
+@@ -0,0 +1,59 @@
++import type { Worker } from 'bullmq';
++import type { JobsConfig } from '../../config/env.js';
++import { logger } from '../../shared/observability/logger.js';
++import { createRedisConnection } from '../redis/redis.js';
++import { createBullmqGateway, type QueueGateway } from './gateway.js';
++import { startLoop } from './loop.js';
++import { purgeFinishedOutbox, recoverStaleOutbox } from './maintenance.js';
++import { createJobWorker } from './processor.js';
++import { getRegisteredProcessors } from './registry.js';
++import { runRelayCycle } from './relay.js';
++
++export type JobsRuntime = { stop(): Promise<void> };
++
++/**
++ * Starts everything the worker process runs: the relay, the stale-`PROCESSING` recovery pass, the
++ * retention job and one BullMQ worker for every queue that has a registered processor.
++ * `stop()` finishes in-flight work and closes the Redis connections.
++ */
++export function startJobsRuntime(config: JobsConfig, gatewayOverride?: QueueGateway): JobsRuntime {
++  const publisherConnection = gatewayOverride ? undefined : createRedisConnection('general');
++  const gateway =
++    gatewayOverride ?? createBullmqGateway(publisherConnection!, config.executionAttempts);
++
++  const processors = [...getRegisteredProcessors()];
++  const workerConnection = processors.length > 0 ? createRedisConnection('bullmq') : undefined;
++  const workers: Worker[] = workerConnection
++    ? processors.map(([queue, processor]) =>
++        createJobWorker(queue, processor, { config, gateway }, workerConnection),
++      )
++    : [];
++
++  const loops = [
++    startLoop('outbox-relay', config.relayPollIntervalMs, async () => {
++      const result = await runRelayCycle(config, gateway);
++      return result.claimed >= config.relayBatchSize;
++    }),
++    startLoop('outbox-stale-recovery', config.staleRecoveryIntervalMs, async () => {
++      await recoverStaleOutbox();
++    }),
++    startLoop('outbox-retention', config.retentionIntervalMs, async () => {
++      await purgeFinishedOutbox(config.retentionWindowMs);
++    }),
++  ];
++
++  logger.info(
++    { queues: processors.map(([queue]) => queue) },
++    'Jobs runtime started (relay, recovery, retention, workers)',
++  );
++
++  return {
++    async stop() {
++      await Promise.all(loops.map((loop) => loop.stop()));
++      await Promise.all(workers.map((worker) => worker.close()));
++      await gateway.close();
++      publisherConnection?.disconnect();
++      workerConnection?.disconnect();
++    },
++  };
++}
+diff --git a/backend/src/modules/appService/escalation-policies/policy.controller.ts b/backend/src/modules/appService/escalation-policies/policy.controller.ts
+index c69ffa8..a0cec21 100644
+--- a/backend/src/modules/appService/escalation-policies/policy.controller.ts
++++ b/backend/src/modules/appService/escalation-policies/policy.controller.ts
+@@ -24,6 +24,11 @@ export const getPolicyHandler: RequestHandler = async (req, res) => {
+ export const updatePolicyHandler: RequestHandler = async (req, res) => {
+   const { serviceId, escalationPolicyId } = parseOrThrow(policyParamsSchema, req.params);
+   const body = parseOrThrow(updatePolicyBodySchema, req.body);
+-  const policy = await policyService.updatePolicyUsers(serviceId, escalationPolicyId, body);
++  const policy = await policyService.updatePolicyUsers(
++    serviceId,
++    escalationPolicyId,
++    body,
++    getAuth(req).userId,
++  );
+   res.status(200).json({ data: policy });
+ };
+diff --git a/backend/src/modules/appService/escalation-policies/policy.service.ts b/backend/src/modules/appService/escalation-policies/policy.service.ts
+index 32a5184..7bb5be7 100644
+--- a/backend/src/modules/appService/escalation-policies/policy.service.ts
++++ b/backend/src/modules/appService/escalation-policies/policy.service.ts
+@@ -1,3 +1,4 @@
++import { appendAuditEvent } from '../../../infra/audit/append-audit-event.js';
+ import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
+ import { ConflictError } from '../../../shared/errors/AppError.js';
+ import type { AuthContext } from '../../../shared/types/auth-context.js';
+@@ -40,6 +41,7 @@ export async function updatePolicyUsers(
+   serviceId: string,
+   policyId: string,
+   body: UpdatePolicyBody,
++  actorId: string,
+ ): Promise<EscalationPolicyResponse> {
+   return runServiceTransaction(async (tx) => {
+     // Same lock as the service update, so the incident check cannot race incident creation.
+@@ -72,7 +74,24 @@ export async function updatePolicyUsers(
+     if (await hasUnresolvedIncidents(tx, serviceId)) {
+       throw new ConflictError('Service has unresolved incidents', 'POLICY_IN_USE');
+     }
+-    return toPolicyResponse(await updatePolicy(tx, policyId, changes));
++    const updated = await updatePolicy(tx, policyId, changes);
++    const changedFields = (
++      [
++        ['level1', changes.level1Id],
++        ['level2', changes.level2Id],
++        ['level3', changes.level3Id],
++        ['fallbackAdmin', changes.fallbackAdminId],
++      ] as const
++    )
++      .filter(([, value]) => value !== undefined)
++      .map(([name]) => name);
++    await appendAuditEvent(tx, {
++      incidentId: null,
++      eventType: 'ESCALATION_POLICY_UPDATED',
++      actorId,
++      metadata: { escalationPolicyId: policyId, changedFields },
++    });
++    return toPolicyResponse(updated);
+   });
+ }
+ 
+diff --git a/backend/src/modules/appService/services/service.controller.ts b/backend/src/modules/appService/services/service.controller.ts
+index 6343684..4e6ee1a 100644
+--- a/backend/src/modules/appService/services/service.controller.ts
++++ b/backend/src/modules/appService/services/service.controller.ts
+@@ -28,5 +28,7 @@ export const getServiceHandler: RequestHandler = async (req, res) => {
+ export const updateServiceHandler: RequestHandler = async (req, res) => {
+   const { serviceId } = parseOrThrow(serviceParamsSchema, req.params);
+   const body = parseOrThrow(updateServiceBodySchema, req.body);
+-  res.status(200).json({ data: await serviceService.updateService(serviceId, body) });
++  res
++    .status(200)
++    .json({ data: await serviceService.updateService(serviceId, body, getAuth(req).userId) });
+ };
+diff --git a/backend/src/modules/appService/services/service.service.ts b/backend/src/modules/appService/services/service.service.ts
+index 5e6f927..a55290b 100644
+--- a/backend/src/modules/appService/services/service.service.ts
++++ b/backend/src/modules/appService/services/service.service.ts
+@@ -1,3 +1,4 @@
++import { appendAuditEvent } from '../../../infra/audit/append-audit-event.js';
+ import { isUniqueViolation } from '../../../infra/db/errors.js';
+ import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
+ import { ConflictError, ValidationError } from '../../../shared/errors/AppError.js';
+@@ -103,6 +104,7 @@ function changedFields<T extends object>(current: object, patch: T): Partial<T>
+ export async function updateService(
+   serviceId: string,
+   body: UpdateServiceBody,
++  actorId: string,
+ ): Promise<ServiceResponse> {
+   try {
+     return await runServiceTransaction(async (tx) => {
+@@ -151,7 +153,14 @@ export async function updateService(
+       }
+ 
+       if (Object.keys(changes).length === 0) return toServiceResponse(stored);
+-      return toServiceResponse(await writeService(tx, serviceId, changes));
++      const updated = await writeService(tx, serviceId, changes);
++      await appendAuditEvent(tx, {
++        incidentId: null,
++        eventType: deactivating ? 'SERVICE_DEACTIVATED' : 'SERVICE_UPDATED',
++        actorId,
++        metadata: { serviceId, changedFields: Object.keys(changes) },
++      });
++      return toServiceResponse(updated);
+     });
+   } catch (error) {
+     if (isUniqueViolation(error)) throw duplicateService();
+diff --git a/backend/src/modules/identity/teams/team.controller.ts b/backend/src/modules/identity/teams/team.controller.ts
+index e3234d6..bd143b6 100644
+--- a/backend/src/modules/identity/teams/team.controller.ts
++++ b/backend/src/modules/identity/teams/team.controller.ts
+@@ -28,5 +28,5 @@ export const getTeamHandler: RequestHandler = async (req, res) => {
+ export const updateTeamHandler: RequestHandler = async (req, res) => {
+   const { teamId } = parseOrThrow(teamParamsSchema, req.params);
+   const body = parseOrThrow(updateTeamBodySchema, req.body);
+-  res.status(200).json({ data: await teamService.updateTeam(teamId, body) });
++  res.status(200).json({ data: await teamService.updateTeam(teamId, body, getAuth(req).userId) });
+ };
+diff --git a/backend/src/modules/identity/teams/team.service.ts b/backend/src/modules/identity/teams/team.service.ts
+index 173bd70..929aabf 100644
+--- a/backend/src/modules/identity/teams/team.service.ts
++++ b/backend/src/modules/identity/teams/team.service.ts
+@@ -1,3 +1,4 @@
++import { appendAuditEvent } from '../../../infra/audit/append-audit-event.js';
+ import { isUniqueViolation } from '../../../infra/db/errors.js';
+ import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
+ import { ConflictError } from '../../../shared/errors/AppError.js';
+@@ -45,7 +46,11 @@ export async function getTeam(auth: AuthContext, teamId: string): Promise<TeamRe
+   return toTeamResponse(team);
+ }
+ 
+-export async function updateTeam(teamId: string, body: UpdateTeamBody): Promise<TeamResponse> {
++export async function updateTeam(
++  teamId: string,
++  body: UpdateTeamBody,
++  actorId: string,
++): Promise<TeamResponse> {
+   try {
+     return await runIdentityTransaction(async (tx) => {
+       if (!(await lockRowForUpdate(tx, 'Team', teamId))) throw teamNotFound();
+@@ -64,6 +69,17 @@ export async function updateTeam(teamId: string, body: UpdateTeamBody): Promise<
+       }
+ 
+       const updated = await writeTeam(tx, teamId, { name: body.name, status: body.status });
++      const changedFields = (['name', 'status'] as const).filter(
++        (field) => body[field] !== undefined && body[field] !== team[field],
++      );
++      if (changedFields.length > 0) {
++        await appendAuditEvent(tx, {
++          incidentId: null,
++          eventType: deactivating ? 'TEAM_DEACTIVATED' : 'TEAM_UPDATED',
++          actorId,
++          metadata: { teamId, changedFields },
++        });
++      }
+       if (deactivating) {
+         const userIds = await detachUsersFromTeam(tx, teamId);
+         await revokeSessionsForUsers(tx, userIds);
+diff --git a/backend/src/modules/identity/users/user.controller.ts b/backend/src/modules/identity/users/user.controller.ts
+index c4e39b4..a564d21 100644
+--- a/backend/src/modules/identity/users/user.controller.ts
++++ b/backend/src/modules/identity/users/user.controller.ts
+@@ -30,5 +30,5 @@ export const getUserHandler: RequestHandler = async (req, res) => {
+ export const updateUserHandler: RequestHandler = async (req, res) => {
+   const { userId } = parseOrThrow(userParamsSchema, req.params);
+   const body = parseOrThrow(updateUserBodySchema, req.body);
+-  res.status(200).json({ data: await userService.updateUser(userId, body) });
++  res.status(200).json({ data: await userService.updateUser(userId, body, getAuth(req).userId) });
+ };
+diff --git a/backend/src/modules/identity/users/user.service.ts b/backend/src/modules/identity/users/user.service.ts
+index dcd4880..4d3517a 100644
+--- a/backend/src/modules/identity/users/user.service.ts
++++ b/backend/src/modules/identity/users/user.service.ts
+@@ -1,3 +1,4 @@
++import { appendAuditEvent } from '../../../infra/audit/append-audit-event.js';
+ import { isUniqueViolation } from '../../../infra/db/errors.js';
+ import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
+ import { ConflictError } from '../../../shared/errors/AppError.js';
+@@ -100,7 +101,11 @@ async function lockInOrder(tx: Db, teamIds: string[], userIds: string[]): Promis
+   for (const id of [...new Set(userIds)].sort()) await lockRowForUpdate(tx, 'User', id);
+ }
+ 
+-export async function updateUser(userId: string, body: UpdateUserBody): Promise<UserResponse> {
++export async function updateUser(
++  userId: string,
++  body: UpdateUserBody,
++  actorId: string,
++): Promise<UserResponse> {
+   const passwordHash = body.password === undefined ? undefined : await hashPassword(body.password);
+   return runIdentityTransaction(async (tx) => {
+     const preRead = await findUserById(tx, userId);
+@@ -125,6 +130,20 @@ export async function updateUser(userId: string, body: UpdateUserBody): Promise<
+       ...plan.data,
+       ...(passwordHash === undefined ? {} : { passwordHash }),
+     });
++    // Field names only, never values; a password change shows just the name `password`.
++    const changedFields = [
++      // A re-sent, identical name is not a change (the plan keeps it, the audit trail must not).
++      ...Object.keys(plan.data).filter((key) => key !== 'name' || plan.data.name !== target.name),
++      ...(body.password === undefined ? [] : ['password']),
++    ];
++    if (changedFields.length > 0) {
++      await appendAuditEvent(tx, {
++        incidentId: null,
++        eventType: plan.data.status === 'DEACTIVATED' ? 'USER_DEACTIVATED' : 'USER_UPDATED',
++        actorId,
++        metadata: { userId, changedFields },
++      });
++    }
+     if (plan.revokeSessions) await revokeSessionsForUsers(tx, [userId]);
+     return toUserResponse(updated);
+   });
+diff --git a/backend/src/scripts/redrive-outbox.ts b/backend/src/scripts/redrive-outbox.ts
+new file mode 100644
+index 0000000..e7c3257
+--- /dev/null
++++ b/backend/src/scripts/redrive-outbox.ts
+@@ -0,0 +1,42 @@
++import os from 'node:os';
++import { getConfig, getJobsConfig } from '../config/env.js';
++import { disconnectPrisma } from '../infra/db/prisma.js';
++import { RedriveError, redriveOutboxEvent } from '../infra/jobs/redrive.js';
++
++/** Usage: npm run redrive:outbox -- <outboxEventId> [--operator <name>] */
++async function main(): Promise<number> {
++  const args = process.argv.slice(2);
++  const operatorFlag = args.indexOf('--operator');
++  const operator = operatorFlag >= 0 ? (args[operatorFlag + 1] ?? '') : os.userInfo().username;
++  const operatorValueIndex = operatorFlag >= 0 ? operatorFlag + 1 : -1;
++  const id = args.find((arg, index) => !arg.startsWith('--') && index !== operatorValueIndex);
++
++  if (!id || operator === '') {
++    console.error('Usage: npm run redrive:outbox -- <outboxEventId> [--operator <name>]');
++    return 2;
++  }
++
++  getConfig();
++  getJobsConfig();
++  try {
++    await redriveOutboxEvent(id, operator);
++    console.log(`Outbox event ${id} requeued (PENDING).`);
++    return 0;
++  } catch (error) {
++    if (error instanceof RedriveError) {
++      console.error(`Not re-driven: ${error.message}`);
++      return 1;
++    }
++    throw error;
++  } finally {
++    await disconnectPrisma();
++  }
++}
++
++main().then(
++  (code) => process.exit(code),
++  (error: unknown) => {
++    console.error(error instanceof Error ? error.message : 'Re-drive failed');
++    process.exit(1);
++  },
++);
+diff --git a/backend/src/worker.ts b/backend/src/worker.ts
+index 8a72a95..cefbe14 100644
+--- a/backend/src/worker.ts
++++ b/backend/src/worker.ts
+@@ -1,18 +1,22 @@
+-import { getConfig } from './config/env.js';
++import { getConfig, getJobsConfig } from './config/env.js';
+ import { disconnectPrisma, pingDatabase } from './infra/db/prisma.js';
+ import { closeRedis, pingRedis } from './infra/redis/redis.js';
+ import { onShutdownSignal } from './shared/lifecycle/shutdown.js';
+ import { logger } from './shared/observability/logger.js';
++import { startWorkers } from './workers/index.js';
+ 
+ async function main(): Promise<void> {
+   const config = getConfig();
++  getJobsConfig(); // fails startup when any outbox/worker setting is missing
+ 
+   await pingDatabase();
+   await pingRedis();
+ 
++  const runtime = startWorkers();
+   logger.info({ nodeEnv: config.nodeEnv }, 'Worker ready');
+ 
+   onShutdownSignal(async () => {
++    await runtime.stop();
+     await disconnectPrisma();
+     await closeRedis();
+   });
+diff --git a/backend/src/workers/index.ts b/backend/src/workers/index.ts
+new file mode 100644
+index 0000000..4244a6f
+--- /dev/null
++++ b/backend/src/workers/index.ts
+@@ -0,0 +1,10 @@
++import { getJobsConfig } from '../config/env.js';
++import { startJobsRuntime, type JobsRuntime } from '../infra/jobs/runtime.js';
++
++/**
++ * Composition point of the worker process. Slices that own a consumer register their processor
++ * here (`registerProcessor(QUEUES.X, handler)`) before the runtime starts; none exist yet.
++ */
++export function startWorkers(): JobsRuntime {
++  return startJobsRuntime(getJobsConfig());
++}
+diff --git a/backend/test/helpers/jobs.ts b/backend/test/helpers/jobs.ts
+new file mode 100644
+index 0000000..d465f37
+--- /dev/null
++++ b/backend/test/helpers/jobs.ts
+@@ -0,0 +1,92 @@
++import { randomUUID } from 'node:crypto';
++import { parseJobsConfig, type JobsConfig } from '../../src/config/env';
++import { runInTransaction } from '../../src/infra/db/prisma';
++import type { QueueName } from '../../src/infra/jobs/events';
++import type { DeadLetterJobData, JobData, QueueGateway } from '../../src/infra/jobs/gateway';
++import { enqueueOutbox } from '../../src/infra/jobs/outbox';
++
++/** Fast, deterministic test settings; the application itself has no built-in defaults. */
++export function testJobsEnv(): NodeJS.ProcessEnv {
++  const env: NodeJS.ProcessEnv = {
++    OUTBOX_RELAY_POLL_INTERVAL_MS: '50',
++    OUTBOX_RELAY_BATCH_SIZE: '20',
++    OUTBOX_CLAIM_LEASE_MS: '60000',
++    OUTBOX_PROCESSING_WINDOW_MS: '60000',
++    OUTBOX_PUBLISH_TIMEOUT_MS: '1000',
++    OUTBOX_PUBLISH_BACKOFF_BASE_MS: '1000',
++    OUTBOX_PUBLISH_BACKOFF_CAP_MS: '8000',
++    JOBS_EXECUTION_BACKOFF_BASE_MS: '10',
++    JOBS_EXECUTION_BACKOFF_CAP_MS: '50',
++    JOBS_EXECUTION_ATTEMPTS: '5',
++    OUTBOX_STALE_RECOVERY_INTERVAL_MS: '100',
++    OUTBOX_RETENTION_WINDOW_MS: '3600000',
++    OUTBOX_RETENTION_INTERVAL_MS: '100',
++    WORKER_CONCURRENCY: '2',
++  };
++  for (const queue of [
++    'AI_TRIAGE',
++    'SLA_ESCALATION',
++    'NOTIFICATIONS',
++    'POSTMORTEM',
++    'INVESTIGATION',
++  ]) {
++    env[`JOBS_RATE_${queue}_MAX`] = '1000';
++    env[`JOBS_RATE_${queue}_DURATION_MS`] = '1000';
++  }
++  return env;
++}
++
++export function testJobsConfig(overrides: Partial<JobsConfig> = {}): JobsConfig {
++  return { ...parseJobsConfig(testJobsEnv()), ...overrides };
++}
++
++/** Records what would be published; can be told to fail. */
++export class FakeGateway implements QueueGateway {
++  published: { queue: QueueName; data: JobData }[] = [];
++  deadLetters: DeadLetterJobData[] = [];
++  failWith: Error | null = null;
++  publishDelayMs = 0;
++
++  async publish(queue: QueueName, data: JobData): Promise<void> {
++    if (this.publishDelayMs > 0) await sleep(this.publishDelayMs);
++    if (this.failWith) throw this.failWith;
++    this.published.push({ queue, data });
++  }
++
++  async publishDeadLetter(data: DeadLetterJobData): Promise<void> {
++    this.deadLetters.push(data);
++  }
++
++  async close(): Promise<void> {}
++}
++
++export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
++
++export async function waitFor<T>(
++  probe: () => Promise<T | undefined | false>,
++  timeoutMs = 10_000,
++): Promise<T> {
++  const deadline = Date.now() + timeoutMs;
++  for (;;) {
++    const value = await probe();
++    if (value) return value;
++    if (Date.now() > deadline) throw new Error('waitFor timed out');
++    await sleep(25);
++  }
++}
++
++/** Writes a valid `SLA_EVALUATION_REQUESTED` outbox row in its own committed transaction. */
++export async function insertOutbox(
++  overrides: { incidentId?: string; eventType?: string; payload?: unknown } = {},
++): Promise<{ id: string; incidentId: string }> {
++  const incidentId = overrides.incidentId ?? randomUUID();
++  const id = await runInTransaction((tx) =>
++    enqueueOutbox(tx, {
++      eventType: overrides.eventType ?? 'SLA_EVALUATION_REQUESTED',
++      aggregateType: 'Incident',
++      aggregateId: incidentId,
++      payload: overrides.payload ?? { incidentId, requestId: 'req-test' },
++    }),
++  );
++  return { id, incidentId };
++}
+diff --git a/backend/test/integration/env.ts b/backend/test/integration/env.ts
+index 277fefd..f5e683e 100644
+--- a/backend/test/integration/env.ts
++++ b/backend/test/integration/env.ts
+@@ -1,4 +1,5 @@
+ import { logger } from '../../src/shared/observability/logger';
++import { testJobsEnv } from '../helpers/jobs';
+ import { testDatabaseUrl, testRedisUrl } from '../helpers/test-env';
+ 
+ // Runs before every integration test file: point the app at the test services.
+@@ -9,4 +10,6 @@ process.env.DIRECT_URL = testDatabaseUrl();
+ process.env.REDIS_URL = testRedisUrl();
+ process.env.JWT_SECRET = process.env.JWT_SECRET ?? 'integration-test-secret';
+ 
++Object.assign(process.env, testJobsEnv());
++
+ logger.level = 'silent';
+diff --git a/backend/test/integration/jobs-worker.int-spec.ts b/backend/test/integration/jobs-worker.int-spec.ts
+new file mode 100644
+index 0000000..5bb8e9a
+--- /dev/null
++++ b/backend/test/integration/jobs-worker.int-spec.ts
+@@ -0,0 +1,431 @@
++import { Queue, UnrecoverableError, type Worker } from 'bullmq';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { NonRetryableJobError, RetryableJobError } from '../../src/infra/jobs/errors';
++import { createBullmqGateway, type QueueGateway } from '../../src/infra/jobs/gateway';
++import { createJobWorker, processOutboxJob } from '../../src/infra/jobs/processor';
++import { recoverStaleOutbox } from '../../src/infra/jobs/maintenance';
++import {
++  clearProcessors,
++  registerProcessor,
++  type OutboxProcessor,
++} from '../../src/infra/jobs/registry';
++import { runRelayCycle } from '../../src/infra/jobs/relay';
++import { startJobsRuntime } from '../../src/infra/jobs/runtime';
++import { createRedisConnection, getRedis } from '../../src/infra/redis/redis';
++import { resetState } from '../helpers/identity';
++import { FakeGateway, insertOutbox, sleep, testJobsConfig, waitFor } from '../helpers/jobs';
++
++const db = () => getPrisma();
++const row = (id: string) => db().outboxEvent.findUniqueOrThrow({ where: { id } });
++const config = testJobsConfig();
++
++beforeEach(async () => {
++  clearProcessors();
++  await resetState();
++});
++afterAll(async () => {
++  await db().$disconnect();
++  getRedis().disconnect();
++});
++
++/** The BullMQ job as the wrapper sees it, built from an outbox row id. */
++async function jobFor(id: string, attemptsMade = 0) {
++  const stored = await row(id);
++  return {
++    data: {
++      outboxEventId: id,
++      eventType: stored.eventType,
++      aggregateType: stored.aggregateType,
++      aggregateId: stored.aggregateId,
++      payload: stored.payload,
++    },
++    attemptsMade,
++    opts: { attempts: 5 },
++  };
++}
++
++/** Puts a row into PROCESSING as the relay would. */
++async function publishedRow() {
++  const made = await insertOutbox();
++  await runRelayCycle(config, new FakeGateway());
++  expect((await row(made.id)).status).toBe('PROCESSING');
++  return made;
++}
++
++const QUEUE = 'sla-escalation';
++
++describe('worker wrapper', () => {
++  it('marks the row SUCCESS (processedAt set, lease cleared) when the consumer succeeds', async () => {
++    const { id } = await publishedRow();
++    const seen: number[] = [];
++    await processOutboxJob(
++      await jobFor(id),
++      QUEUE,
++      async (input) => void seen.push(input.attempt),
++      {
++        config,
++        gateway: new FakeGateway(),
++      },
++    );
++    expect(seen).toEqual([1]);
++    const stored = await row(id);
++    expect(stored.status).toBe('SUCCESS');
++    expect(stored.processedAt).not.toBeNull();
++    expect(stored.leaseExpiresAt).toBeNull();
++  });
++
++  it('passes the validated payload (with requestId) to the consumer', async () => {
++    const { id, incidentId } = await publishedRow();
++    let payload: unknown;
++    await processOutboxJob(
++      await jobFor(id),
++      QUEUE,
++      async (input) => void (payload = input.payload),
++      {
++        config,
++        gateway: new FakeGateway(),
++      },
++    );
++    expect(payload).toEqual({ incidentId, requestId: 'req-test' });
++  });
++
++  it('retries a retryable failure up to 5 attempts, then dead-letters with a durable record', async () => {
++    const { id } = await publishedRow();
++    const gateway = new FakeGateway();
++    const failing: OutboxProcessor = async () => {
++      throw new RetryableJobError('SERVICE_UNAVAILABLE', 'provider temporarily down');
++    };
++
++    for (let attempt = 1; attempt <= 4; attempt++) {
++      await expect(
++        processOutboxJob(await jobFor(id, attempt - 1), QUEUE, failing, { config, gateway }),
++      ).rejects.toBeInstanceOf(RetryableJobError);
++      const stored = await row(id);
++      expect(stored).toMatchObject({
++        status: 'PROCESSING',
++        executionAttemptCount: attempt,
++        errorClass: 'SERVICE_UNAVAILABLE',
++      });
++      expect(stored.leaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
++    }
++    expect(gateway.deadLetters).toHaveLength(0);
++
++    await expect(
++      processOutboxJob(await jobFor(id, 4), QUEUE, failing, { config, gateway }),
++    ).rejects.toBeInstanceOf(UnrecoverableError);
++    expect(await row(id)).toMatchObject({
++      status: 'DEAD_LETTER',
++      executionAttemptCount: 5,
++      publishAttemptCount: 1,
++      errorClass: 'SERVICE_UNAVAILABLE',
++      lastError: 'provider temporarily down',
++      leaseExpiresAt: null,
++    });
++    expect(gateway.deadLetters).toEqual([
++      {
++        outboxEventId: id,
++        eventType: 'SLA_EVALUATION_REQUESTED',
++        sourceQueue: QUEUE,
++        errorClass: 'SERVICE_UNAVAILABLE',
++      },
++    ]);
++  });
++
++  it('dead-letters a non-retryable failure immediately', async () => {
++    const { id } = await publishedRow();
++    const gateway = new FakeGateway();
++    await expect(
++      processOutboxJob(
++        await jobFor(id),
++        QUEUE,
++        async () => {
++          throw new NonRetryableJobError('RESOURCE_NOT_FOUND', 'incident does not exist');
++        },
++        { config, gateway },
++      ),
++    ).rejects.toBeInstanceOf(UnrecoverableError);
++    expect(await row(id)).toMatchObject({
++      status: 'DEAD_LETTER',
++      executionAttemptCount: 1,
++      errorClass: 'RESOURCE_NOT_FOUND',
++    });
++    expect(gateway.deadLetters).toHaveLength(1);
++  });
++
++  it('retries an unknown error a limited number of times, then dead-letters it', async () => {
++    const { id } = await publishedRow();
++    const gateway = new FakeGateway();
++    const boom: OutboxProcessor = async () => {
++      throw new Error('SELECT secret FROM somewhere');
++    };
++    for (let attempt = 1; attempt <= 5; attempt++) {
++      await expect(
++        processOutboxJob(await jobFor(id, attempt - 1), QUEUE, boom, { config, gateway }),
++      ).rejects.toThrow();
++    }
++    const stored = await row(id);
++    expect(stored).toMatchObject({
++      status: 'DEAD_LETTER',
++      executionAttemptCount: 5,
++      errorClass: 'UNKNOWN_INTERNAL',
++      lastError: 'Error',
++    });
++    expect(gateway.deadLetters).toHaveLength(1);
++  });
++
++  it('dead-letters a poison payload without running the consumer', async () => {
++    const { id } = await publishedRow();
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "payload" = '{"nope":1}'::jsonb WHERE id = ${id}::uuid`;
++    const consumer = jest.fn();
++    await expect(
++      processOutboxJob(await jobFor(id), QUEUE, consumer, { config, gateway: new FakeGateway() }),
++    ).rejects.toBeInstanceOf(UnrecoverableError);
++    expect(consumer).not.toHaveBeenCalled();
++    expect(await row(id)).toMatchObject({ status: 'DEAD_LETTER', errorClass: 'INVALID_PAYLOAD' });
++  });
++
++  it('dead-letters an event that does not belong to the queue it arrived on', async () => {
++    const { id } = await publishedRow();
++    await expect(
++      processOutboxJob(await jobFor(id), 'notifications', jest.fn(), {
++        config,
++        gateway: new FakeGateway(),
++      }),
++    ).rejects.toBeInstanceOf(UnrecoverableError);
++    expect((await row(id)).errorClass).toBe('UNSUPPORTED_EVENT_TYPE');
++  });
++
++  it('rejects job data that does not identify an outbox event', async () => {
++    await expect(
++      processOutboxJob(
++        { data: { hello: 'x' }, attemptsMade: 0, opts: { attempts: 5 } },
++        QUEUE,
++        jest.fn(),
++        {
++          config,
++          gateway: new FakeGateway(),
++        },
++      ),
++    ).rejects.toBeInstanceOf(UnrecoverableError);
++  });
++
++  it('a duplicate publication has a single business effect and one final SUCCESS', async () => {
++    const { id, incidentId } = await publishedRow();
++    const effects = new Map<string, number>(); // the consumer's own once-only key
++    const consumer: OutboxProcessor = async ({ payload }) => {
++      const key = String(payload.incidentId);
++      if (!effects.has(key)) effects.set(key, 1);
++    };
++
++    // The worker did the work, then "crashed" before marking SUCCESS: the row stays PROCESSING.
++    await consumer({ ...(await jobFor(id)).data, attempt: 1, payload: { incidentId } });
++    expect((await row(id)).status).toBe('PROCESSING');
++
++    // Recovery republishes; the idempotent consumer is a no-op that then marks SUCCESS.
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "leaseExpiresAt" = now() - interval '1 minute' WHERE id = ${id}::uuid`;
++    await recoverStaleOutbox();
++    const gateway = new FakeGateway();
++    await runRelayCycle(config, gateway);
++    expect(gateway.published).toHaveLength(1);
++
++    await processOutboxJob(await jobFor(id), QUEUE, consumer, { config, gateway });
++    await processOutboxJob(await jobFor(id), QUEUE, consumer, { config, gateway }); // duplicate job
++    expect([...effects.values()]).toEqual([1]);
++    expect((await row(id)).status).toBe('SUCCESS');
++  });
++});
++
++describe('relay -> BullMQ -> worker (real Redis)', () => {
++  const openGateways: QueueGateway[] = [];
++  const openWorkers: Worker[] = [];
++  const connections: ReturnType<typeof createRedisConnection>[] = [];
++
++  function realGateway(): QueueGateway {
++    const connection = createRedisConnection('general');
++    connections.push(connection);
++    const gateway = createBullmqGateway(connection, config.executionAttempts);
++    openGateways.push(gateway);
++    return gateway;
++  }
++
++  function startWorker(gateway: QueueGateway, processor: OutboxProcessor): Worker {
++    const connection = createRedisConnection('bullmq');
++    connections.push(connection);
++    const worker = createJobWorker(QUEUE, processor, { config, gateway }, connection);
++    openWorkers.push(worker);
++    return worker;
++  }
++
++  afterEach(async () => {
++    await Promise.all(openWorkers.splice(0).map((w) => w.close()));
++    await Promise.all(openGateways.splice(0).map((g) => g.close()));
++    connections.splice(0).forEach((c) => c.disconnect());
++  });
++
++  it('delivers an outbox event end to end and marks it SUCCESS', async () => {
++    const gateway = realGateway();
++    const calls: string[] = [];
++    startWorker(gateway, async ({ outboxEventId }) => void calls.push(outboxEventId));
++
++    const { id } = await insertOutbox();
++    await runRelayCycle(config, gateway);
++    await waitFor(async () => (await row(id)).status === 'SUCCESS');
++    expect(calls).toEqual([id]);
++  });
++
++  it('retries with exponential backoff for 5 attempts in total, then dead-letters and announces it', async () => {
++    const gateway = realGateway();
++    const attempts: number[] = [];
++    startWorker(gateway, async ({ attempt }) => {
++      attempts.push(attempt);
++      throw new RetryableJobError('NETWORK', 'temporary network failure');
++    });
++
++    const { id } = await insertOutbox();
++    await runRelayCycle(config, gateway);
++    await waitFor(async () => (await row(id)).status === 'DEAD_LETTER');
++
++    expect(attempts).toEqual([1, 2, 3, 4, 5]);
++    expect(await row(id)).toMatchObject({
++      executionAttemptCount: 5,
++      publishAttemptCount: 1,
++      errorClass: 'NETWORK',
++    });
++
++    const dlqConnection = createRedisConnection('general');
++    connections.push(dlqConnection);
++    const dlq = new Queue('dead-letter', { connection: dlqConnection });
++    try {
++      const jobs = await waitFor(async () => {
++        const found = await dlq.getJobs(['waiting', 'delayed', 'completed']);
++        return found.length > 0 && found;
++      });
++      expect(jobs).toHaveLength(1);
++      expect(jobs[0].data).toEqual({
++        outboxEventId: id,
++        eventType: 'SLA_EVALUATION_REQUESTED',
++        sourceQueue: QUEUE,
++        errorClass: 'NETWORK',
++      });
++    } finally {
++      await dlq.close();
++    }
++  });
++
++  it('does not retry a non-retryable failure', async () => {
++    const gateway = realGateway();
++    let calls = 0;
++    startWorker(gateway, async () => {
++      calls++;
++      throw new NonRetryableJobError('BUSINESS_RULE_VIOLATION', 'cannot be done');
++    });
++    const { id } = await insertOutbox();
++    await runRelayCycle(config, gateway);
++    await waitFor(async () => (await row(id)).status === 'DEAD_LETTER');
++    await sleep(300);
++    expect(calls).toBe(1);
++    expect((await row(id)).executionAttemptCount).toBe(1);
++  });
++
++  it('honors a provider-supplied delay when rate limited', async () => {
++    const gateway = realGateway();
++    const times: number[] = [];
++    startWorker(gateway, async () => {
++      times.push(Date.now());
++      if (times.length === 1) throw new RetryableJobError('RATE_LIMITED', 'slow down', 400);
++    });
++    const { id } = await insertOutbox();
++    await runRelayCycle(config, gateway);
++    await waitFor(async () => (await row(id)).status === 'SUCCESS');
++    expect(times).toHaveLength(2);
++    expect(times[1] - times[0]).toBeGreaterThanOrEqual(380);
++  });
++
++  it('re-publishes the same event while its job still exists without running it twice', async () => {
++    const gateway = realGateway();
++    const { id } = await insertOutbox();
++    await runRelayCycle(config, gateway);
++    // Simulate the relay losing track: the row goes back to PENDING while the job is still queued.
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "status" = 'PENDING', "leaseExpiresAt" = NULL WHERE id = ${id}::uuid`;
++    await runRelayCycle(config, gateway);
++
++    const calls: string[] = [];
++    startWorker(gateway, async ({ outboxEventId }) => void calls.push(outboxEventId));
++    await waitFor(async () => (await row(id)).status === 'SUCCESS');
++    await sleep(200);
++    expect(calls).toEqual([id]); // BullMQ de-duplicated by jobId
++  });
++
++  it('recovers after Redis loses its jobs: the stale row is republished and processed', async () => {
++    const gateway = realGateway();
++    const { id } = await insertOutbox();
++    await runRelayCycle(config, gateway);
++    await getRedis().flushdb(); // Redis wiped: the job is gone, the row says PROCESSING
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "leaseExpiresAt" = now() - interval '1 minute' WHERE id = ${id}::uuid`;
++
++    const calls: string[] = [];
++    startWorker(gateway, async ({ outboxEventId }) => void calls.push(outboxEventId));
++    expect(await recoverStaleOutbox()).toBe(1);
++    await runRelayCycle(config, gateway);
++    await waitFor(async () => (await row(id)).status === 'SUCCESS');
++    expect(calls).toEqual([id]);
++  });
++
++  it('keeps events PENDING with backoff while Redis is unreachable, then publishes when it returns', async () => {
++    const down = createRedisConnection('general', 'redis://127.0.0.1:1/0');
++    connections.push(down);
++    const downGateway = createBullmqGateway(down, config.executionAttempts);
++    const { id } = await insertOutbox();
++
++    const result = await runRelayCycle({ ...config, publishTimeoutMs: 500 }, downGateway);
++    expect(result).toMatchObject({ claimed: 1, retried: 1, deadLettered: 0 });
++    const stored = await row(id);
++    expect(stored).toMatchObject({ status: 'PENDING', publishAttemptCount: 1 });
++    expect(['REDIS_UNAVAILABLE', 'NETWORK']).toContain(stored.errorClass);
++    expect(stored.availableAt.getTime()).toBeGreaterThan(Date.now());
++    down.disconnect();
++
++    // Redis is back: the same row is published through a healthy gateway.
++    await db().$executeRaw`UPDATE "OutboxEvent" SET "availableAt" = now() WHERE id = ${id}::uuid`;
++    const calls: string[] = [];
++    const healthy = realGateway();
++    startWorker(healthy, async ({ outboxEventId }) => void calls.push(outboxEventId));
++    await runRelayCycle(config, healthy);
++    await waitFor(async () => (await row(id)).status === 'SUCCESS');
++    expect(calls).toEqual([id]);
++  });
++});
++
++describe('jobs runtime', () => {
++  it('drains pending rows through the relay loop, recovers stale rows and applies retention', async () => {
++    const calls: string[] = [];
++    registerProcessor(QUEUE, async ({ outboxEventId }) => void calls.push(outboxEventId));
++
++    const staleSuccess = await insertOutbox();
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "status" = 'SUCCESS', "processedAt" = now() - interval '2 days' WHERE id = ${staleSuccess.id}::uuid`;
++    const ids = await Promise.all(Array.from({ length: 30 }, () => insertOutbox()));
++
++    const runtime = startJobsRuntime({
++      ...config,
++      relayBatchSize: 10,
++      retentionWindowMs: 3_600_000,
++    });
++    try {
++      await waitFor(
++        async () => (await db().outboxEvent.count({ where: { status: 'SUCCESS' } })) === 30,
++      );
++      expect(new Set(calls)).toEqual(new Set(ids.map((x) => x.id)));
++      await waitFor(
++        async () =>
++          (await db().outboxEvent.findUnique({ where: { id: staleSuccess.id } })) === null,
++      );
++    } finally {
++      await runtime.stop();
++    }
++  });
++});
+diff --git a/backend/test/integration/migrations.int-spec.ts b/backend/test/integration/migrations.int-spec.ts
+index 417d31b..6c941ea 100644
+--- a/backend/test/integration/migrations.int-spec.ts
++++ b/backend/test/integration/migrations.int-spec.ts
+@@ -1,4 +1,6 @@
+ import { Client } from 'pg';
++import { readdirSync, readFileSync } from 'node:fs';
++import path from 'node:path';
+ import { applyMigrations } from '../helpers/migrations';
+ import { testDatabaseUrl, withDatabase } from '../helpers/test-env';
+ 
+@@ -41,4 +43,138 @@ describe('migrations', () => {
+       await client.end();
+     }
+   });
++
++  it('adds the audit event types and the outbox lifecycle columns, enum and indexes', async () => {
++    const client = new Client({ connectionString: withDatabase(testDatabaseUrl(), scratchName) });
++    await client.connect();
++    try {
++      await client.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
++      await applyMigrations(client);
++
++      const audit = await client.query<{ enumlabel: string }>(
++        `SELECT enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
++         WHERE t.typname = 'AuditEventType'`,
++      );
++      expect(audit.rows.map((r) => r.enumlabel)).toEqual(
++        expect.arrayContaining([
++          'USER_UPDATED',
++          'USER_DEACTIVATED',
++          'TEAM_UPDATED',
++          'TEAM_DEACTIVATED',
++          'SERVICE_UPDATED',
++          'SERVICE_DEACTIVATED',
++          'ESCALATION_POLICY_UPDATED',
++          'ALERT_SOURCE_UPDATED',
++        ]),
++      );
++
++      const status = await client.query<{ enumlabel: string }>(
++        `SELECT enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
++         WHERE t.typname = 'OutboxStatus' ORDER BY e.enumsortorder`,
++      );
++      expect(status.rows.map((r) => r.enumlabel)).toEqual([
++        'PENDING',
++        'PROCESSING',
++        'SUCCESS',
++        'DEAD_LETTER',
++      ]);
++
++      const columns = await client.query<{ column_name: string }>(
++        `SELECT column_name FROM information_schema.columns WHERE table_name = 'OutboxEvent'`,
++      );
++      const names = columns.rows.map((r) => r.column_name);
++      expect(names).toEqual(
++        expect.arrayContaining([
++          'publishAttemptCount',
++          'executionAttemptCount',
++          'publishedAt',
++          'leaseExpiresAt',
++          'errorClass',
++          'lastError',
++        ]),
++      );
++      expect(names).not.toContain('attemptCount');
++
++      const indexes = await client.query<{ indexname: string }>(
++        `SELECT indexname FROM pg_indexes WHERE tablename = 'OutboxEvent'`,
++      );
++      expect(indexes.rows.map((r) => r.indexname)).toEqual(
++        expect.arrayContaining(['idx_outbox_claim', 'idx_outbox_retention']),
++      );
++
++      const lifecycle = await client.query<{ enumlabel: string }>(
++        `SELECT enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
++         WHERE t.typname = 'LifecycleStates'`,
++      );
++      expect(lifecycle.rows.map((r) => r.enumlabel)).toContain('FAILED'); // shared enum untouched
++    } finally {
++      await client.end();
++    }
++  });
++
++  it('converts existing outbox rows: FAILED becomes DEAD_LETTER and attempts carry over', async () => {
++    const client = new Client({ connectionString: withDatabase(testDatabaseUrl(), scratchName) });
++    await client.connect();
++    try {
++      await client.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
++      const dir = path.resolve(__dirname, '../../prisma/migrations');
++      const init = readFileSync(path.join(dir, '20261003225123_init', 'migration.sql'), 'utf8');
++      await client.query(init);
++
++      const aggregate = '11111111-1111-4111-8111-111111111111';
++      const insert = `INSERT INTO "OutboxEvent" ("id","eventType","aggregateType","aggregateId","payload","status","attemptCount")
++        VALUES ($1,'LEGACY','Incident',$2,'{}'::jsonb,$3::"LifecycleStates",$4)`;
++      await client.query(insert, ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', aggregate, 'PENDING', 0]);
++      await client.query(insert, ['bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', aggregate, 'SUCCESS', 1]);
++      await client.query(insert, ['cccccccc-cccc-4ccc-8ccc-cccccccccccc', aggregate, 'FAILED', 3]);
++
++      // Apply everything after init, in order.
++
++      const later = readdirSync(dir, { withFileTypes: true })
++        .filter((e) => e.isDirectory() && e.name > '20261003225123_init')
++        .map((e) => e.name)
++        .sort();
++      for (const name of later) {
++        await client.query(readFileSync(path.join(dir, name, 'migration.sql'), 'utf8'));
++      }
++
++      const rows = await client.query<{
++        id: string;
++        status: string;
++        executionAttemptCount: number;
++        publishAttemptCount: number;
++      }>(
++        `SELECT "id","status"::text AS "status","executionAttemptCount","publishAttemptCount"
++         FROM "OutboxEvent" ORDER BY "id"`,
++      );
++      expect(rows.rows).toEqual([
++        {
++          id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
++          status: 'PENDING',
++          executionAttemptCount: 0,
++          publishAttemptCount: 0,
++        },
++        {
++          id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
++          status: 'SUCCESS',
++          executionAttemptCount: 1,
++          publishAttemptCount: 0,
++        },
++        {
++          id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
++          status: 'DEAD_LETTER',
++          executionAttemptCount: 3,
++          publishAttemptCount: 0,
++        },
++      ]);
++
++      const def = await client.query<{ column_default: string }>(
++        `SELECT column_default FROM information_schema.columns
++         WHERE table_name = 'OutboxEvent' AND column_name = 'status'`,
++      );
++      expect(def.rows[0].column_default).toContain('PENDING');
++    } finally {
++      await client.end();
++    }
++  });
+ });
+diff --git a/backend/test/integration/outbox.int-spec.ts b/backend/test/integration/outbox.int-spec.ts
+new file mode 100644
+index 0000000..6dabe85
+--- /dev/null
++++ b/backend/test/integration/outbox.int-spec.ts
+@@ -0,0 +1,393 @@
++import { randomUUID } from 'node:crypto';
++import { getPrisma, runInTransaction } from '../../src/infra/db/prisma';
++import { OutboxContractError, enqueueOutbox } from '../../src/infra/jobs/outbox';
++import { claimBatch, markPublished } from '../../src/infra/jobs/outbox.repository';
++import { purgeFinishedOutbox, recoverStaleOutbox } from '../../src/infra/jobs/maintenance';
++import { redriveOutboxEvent, RedriveError } from '../../src/infra/jobs/redrive';
++import { runRelayCycle } from '../../src/infra/jobs/relay';
++import { getRedis } from '../../src/infra/redis/redis';
++import { resetState } from '../helpers/identity';
++import { FakeGateway, insertOutbox, testJobsConfig } from '../helpers/jobs';
++
++const db = () => getPrisma();
++const row = (id: string) => db().outboxEvent.findUniqueOrThrow({ where: { id } });
++const config = testJobsConfig();
++
++beforeEach(resetState);
++afterAll(async () => {
++  await db().$disconnect();
++  getRedis().disconnect();
++});
++
++describe('enqueueOutbox (write contract)', () => {
++  it('leaves exactly one PENDING row with zero counters when the transaction commits', async () => {
++    const { id, incidentId } = await insertOutbox();
++    const stored = await row(id);
++    expect(stored).toMatchObject({
++      eventType: 'SLA_EVALUATION_REQUESTED',
++      aggregateType: 'Incident',
++      aggregateId: incidentId,
++      status: 'PENDING',
++      publishAttemptCount: 0,
++      executionAttemptCount: 0,
++      publishedAt: null,
++      processedAt: null,
++      leaseExpiresAt: null,
++      errorClass: null,
++      lastError: null,
++    });
++    expect(stored.payload).toEqual({ incidentId, requestId: 'req-test' });
++    expect(await db().outboxEvent.count()).toBe(1);
++  });
++
++  it('leaves no row when the producer transaction rolls back', async () => {
++    await expect(
++      runInTransaction(async (tx) => {
++        await insertInTx(tx);
++        throw new Error('producer failed after enqueue');
++      }),
++    ).rejects.toThrow('producer failed');
++    expect(await db().outboxEvent.count()).toBe(0);
++  });
++
++  it('honors availableAt', async () => {
++    const later = new Date(Date.now() + 3_600_000);
++    const id = await runInTransaction((tx) => insertInTx(tx, later));
++    expect((await row(id)).availableAt.getTime()).toBe(later.getTime());
++  });
++
++  it.each([
++    ['an unsupported event type', { eventType: 'NOPE' }, 'UNSUPPORTED_EVENT_TYPE'],
++    ['an invalid payload', { payload: { incidentId: 'not-a-uuid' } }, 'INVALID_PAYLOAD'],
++    [
++      'a payload with extra keys',
++      { payload: { incidentId: randomUUID(), body: 'x' } },
++      'INVALID_PAYLOAD',
++    ],
++    ['a non-UUID aggregate id', { aggregateId: 'abc' }, 'INVALID_AGGREGATE'],
++  ])('rejects %s and writes nothing', async (_name, override, reason) => {
++    const attempt = runInTransaction((tx) =>
++      enqueueOutbox(tx, {
++        eventType: 'SLA_EVALUATION_REQUESTED',
++        aggregateType: 'Incident',
++        aggregateId: randomUUID(),
++        payload: { incidentId: randomUUID() },
++        ...override,
++      }),
++    );
++    await expect(attempt).rejects.toMatchObject({ name: 'OutboxContractError', reason });
++    await expect(attempt).rejects.toBeInstanceOf(OutboxContractError);
++    expect(await db().outboxEvent.count()).toBe(0);
++  });
++});
++
++async function insertInTx(tx: Parameters<typeof enqueueOutbox>[0], availableAt?: Date) {
++  const incidentId = randomUUID();
++  return enqueueOutbox(tx, {
++    eventType: 'SLA_EVALUATION_REQUESTED',
++    aggregateType: 'Incident',
++    aggregateId: incidentId,
++    payload: { incidentId },
++    availableAt,
++  });
++}
++
++describe('relay: claim and publish', () => {
++  it('publishes once and moves the row to PROCESSING with publishedAt and a lease', async () => {
++    const { id } = await insertOutbox();
++    const gateway = new FakeGateway();
++
++    const result = await runRelayCycle(config, gateway);
++    expect(result).toMatchObject({ claimed: 1, published: 1, retried: 0, deadLettered: 0 });
++    expect(gateway.published).toHaveLength(1);
++    expect(gateway.published[0]).toMatchObject({
++      queue: 'sla-escalation',
++      data: { outboxEventId: id, eventType: 'SLA_EVALUATION_REQUESTED' },
++    });
++
++    const stored = await row(id);
++    expect(stored.status).toBe('PROCESSING');
++    expect(stored.publishedAt).not.toBeNull();
++    expect(stored.publishAttemptCount).toBe(1);
++    expect(stored.leaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
++
++    // Nothing left to claim.
++    expect((await runRelayCycle(config, gateway)).claimed).toBe(0);
++    expect(gateway.published).toHaveLength(1);
++  });
++
++  it('does not claim rows that are not yet available', async () => {
++    const later = new Date(Date.now() + 3_600_000);
++    await runInTransaction((tx) => insertInTx(tx, later));
++    const gateway = new FakeGateway();
++    expect((await runRelayCycle(config, gateway)).claimed).toBe(0);
++  });
++
++  it('never double-claims when two relays run in parallel', async () => {
++    const ids = await Promise.all(Array.from({ length: 20 }, () => insertOutbox()));
++    const [a, b] = [new FakeGateway(), new FakeGateway()];
++    a.publishDelayMs = b.publishDelayMs = 30;
++
++    const [first, second] = await Promise.all([
++      runRelayCycle({ ...config, relayBatchSize: 20 }, a),
++      runRelayCycle({ ...config, relayBatchSize: 20 }, b),
++    ]);
++
++    const published = [...a.published, ...b.published].map((p) => p.data.outboxEventId);
++    expect(new Set(published).size).toBe(published.length);
++    expect([...published].sort()).toEqual(ids.map((x) => x.id).sort());
++    expect(first.claimed + second.claimed).toBe(20);
++  });
++
++  it('claims in batches no larger than the configured size', async () => {
++    await Promise.all(Array.from({ length: 5 }, () => insertOutbox()));
++    const result = await runRelayCycle({ ...config, relayBatchSize: 2 }, new FakeGateway());
++    expect(result.claimed).toBe(2);
++  });
++
++  it('reclaims and republishes a row whose claim expired (relay crashed after claiming)', async () => {
++    const { id } = await insertOutbox();
++    const claimed = await runInTransaction((tx) => claimBatch(tx, 10, 60_000));
++    expect(claimed).toHaveLength(1); // the "crashed" relay holds the claim and never publishes
++
++    const gateway = new FakeGateway();
++    expect((await runRelayCycle(config, gateway)).claimed).toBe(0); // lease still valid
++
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "leaseExpiresAt" = now() - interval '1 minute' WHERE id = ${id}::uuid`;
++    expect((await runRelayCycle(config, gateway)).published).toBe(1);
++    expect((await row(id)).status).toBe('PROCESSING');
++  });
++
++  it('a stale relay cannot overwrite a row that was reclaimed', async () => {
++    const { id } = await insertOutbox();
++    const [stale] = await runInTransaction((tx) => claimBatch(tx, 10, 60_000));
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "leaseExpiresAt" = now() - interval '1 minute' WHERE id = ${id}::uuid`;
++    expect((await runRelayCycle(config, new FakeGateway())).published).toBe(1);
++
++    expect(await markPublished(db(), id, stale.lease, 60_000)).toBe(false);
++    expect((await row(id)).publishAttemptCount).toBe(1);
++  });
++});
++
++describe('relay: publication failures', () => {
++  it('keeps the row PENDING, counts attempts, backs off and never dead-letters (no maximum)', async () => {
++    const { id } = await insertOutbox();
++    const gateway = new FakeGateway();
++    gateway.failWith = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
++
++    const delays: number[] = [];
++    for (let attempt = 1; attempt <= 8; attempt++) {
++      await db().$executeRaw`UPDATE "OutboxEvent" SET "availableAt" = now() WHERE id = ${id}::uuid`;
++      const before = Date.now();
++      const result = await runRelayCycle(config, gateway);
++      expect(result).toMatchObject({ claimed: 1, retried: 1, deadLettered: 0 });
++
++      const stored = await row(id);
++      expect(stored.status).toBe('PENDING');
++      expect(stored.publishAttemptCount).toBe(attempt);
++      expect(stored.executionAttemptCount).toBe(0);
++      expect(stored.leaseExpiresAt).toBeNull();
++      expect(stored.errorClass).toBe('NETWORK');
++      expect(stored.lastError).toBe('Error (ECONNREFUSED)');
++      delays.push(Math.round((stored.availableAt.getTime() - before) / 1000));
++    }
++    // base 1s, cap 8s: 1, 2, 4, 8, 8, 8, 8, 8 (seconds, allowing rounding)
++    expect(delays.map((d, i) => Math.abs(d - Math.min(8, 2 ** i)) <= 1)).toEqual(
++      Array(8).fill(true),
++    );
++    expect(gateway.deadLetters).toHaveLength(0);
++  });
++
++  it('does not retry before the backoff has elapsed, then publishes when Redis returns', async () => {
++    const { id } = await insertOutbox();
++    const gateway = new FakeGateway();
++    gateway.failWith = new Error('Redis down');
++    await runRelayCycle(config, gateway);
++    expect((await runRelayCycle(config, gateway)).claimed).toBe(0); // still backing off
++
++    gateway.failWith = null;
++    await db().$executeRaw`UPDATE "OutboxEvent" SET "availableAt" = now() WHERE id = ${id}::uuid`;
++    expect((await runRelayCycle(config, gateway)).published).toBe(1);
++    const stored = await row(id);
++    expect(stored.status).toBe('PROCESSING');
++    expect(stored.publishAttemptCount).toBe(2);
++    expect(stored.errorClass).toBeNull();
++  });
++
++  it('treats a publish that hangs as a retryable failure', async () => {
++    const { id } = await insertOutbox();
++    const gateway = new FakeGateway();
++    gateway.publishDelayMs = 400;
++    const result = await runRelayCycle({ ...config, publishTimeoutMs: 50 }, gateway);
++    expect(result.retried).toBe(1);
++    expect(await row(id)).toMatchObject({ status: 'PENDING', errorClass: 'REDIS_UNAVAILABLE' });
++  });
++
++  it('dead-letters an unsupported event type and an invalid payload straight away', async () => {
++    const unsupported = await insertOutbox();
++    const invalid = await insertOutbox();
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "eventType" = 'RETIRED_EVENT' WHERE id = ${unsupported.id}::uuid`;
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "payload" = '{"incidentId":"x","secret":"s3cr3t"}'::jsonb WHERE id = ${invalid.id}::uuid`;
++
++    const gateway = new FakeGateway();
++    const result = await runRelayCycle(config, gateway);
++    expect(result).toMatchObject({ claimed: 2, deadLettered: 2, published: 0 });
++    expect(gateway.published).toHaveLength(0);
++
++    const [u, i] = [await row(unsupported.id), await row(invalid.id)];
++    expect(u).toMatchObject({
++      status: 'DEAD_LETTER',
++      errorClass: 'UNSUPPORTED_EVENT_TYPE',
++      publishAttemptCount: 1,
++    });
++    expect(i).toMatchObject({ status: 'DEAD_LETTER', errorClass: 'INVALID_PAYLOAD' });
++    expect(i.lastError).not.toContain('s3cr3t');
++    expect(gateway.deadLetters.map((d) => d.outboxEventId).sort()).toEqual(
++      [unsupported.id, invalid.id].sort(),
++    );
++    expect(gateway.deadLetters.find((d) => d.outboxEventId === invalid.id)).toEqual({
++      outboxEventId: invalid.id,
++      eventType: 'SLA_EVALUATION_REQUESTED',
++      sourceQueue: 'sla-escalation',
++      errorClass: 'INVALID_PAYLOAD',
++    });
++  });
++
++  it('keeps the DEAD_LETTER record when the dead-letter job cannot be published', async () => {
++    const { id } = await insertOutbox();
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "eventType" = 'RETIRED_EVENT' WHERE id = ${id}::uuid`;
++    const gateway = new FakeGateway();
++    gateway.publishDeadLetter = async () => {
++      throw new Error('Redis down');
++    };
++    await runRelayCycle(config, gateway);
++    expect((await row(id)).status).toBe('DEAD_LETTER');
++  });
++});
++
++describe('stale PROCESSING recovery', () => {
++  it('returns expired PROCESSING rows to PENDING and they are republished', async () => {
++    const stale = await insertOutbox();
++    const fresh = await insertOutbox();
++    const gateway = new FakeGateway();
++    await runRelayCycle(config, gateway);
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "leaseExpiresAt" = now() - interval '1 minute' WHERE id = ${stale.id}::uuid`;
++
++    expect(await recoverStaleOutbox()).toBe(1);
++    expect(await row(stale.id)).toMatchObject({ status: 'PENDING', leaseExpiresAt: null });
++    expect((await row(fresh.id)).status).toBe('PROCESSING'); // deadline not reached
++
++    const republish = new FakeGateway();
++    expect((await runRelayCycle(config, republish)).published).toBe(1);
++    expect(republish.published[0].data.outboxEventId).toBe(stale.id);
++    expect((await row(stale.id)).publishAttemptCount).toBe(2);
++  });
++
++  it('ignores SUCCESS, DEAD_LETTER and PENDING rows', async () => {
++    const [a, b, c] = await Promise.all([insertOutbox(), insertOutbox(), insertOutbox()]);
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "status" = 'SUCCESS', "leaseExpiresAt" = now() - interval '1 hour' WHERE id = ${a.id}::uuid`;
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "status" = 'DEAD_LETTER', "leaseExpiresAt" = now() - interval '1 hour' WHERE id = ${b.id}::uuid`;
++    expect(await recoverStaleOutbox()).toBe(0);
++    expect((await row(a.id)).status).toBe('SUCCESS');
++    expect((await row(b.id)).status).toBe('DEAD_LETTER');
++    expect((await row(c.id)).status).toBe('PENDING');
++  });
++});
++
++describe('retention', () => {
++  it('deletes SUCCESS rows past the window and never DEAD_LETTER rows', async () => {
++    const ids = await Promise.all(Array.from({ length: 5 }, () => insertOutbox()));
++    const [oldSuccess, freshSuccess, oldDead, oldPending, oldProcessing] = ids.map((x) => x.id);
++    const old = `now() - interval '2 hours'`;
++    await db().$executeRawUnsafe(
++      `UPDATE "OutboxEvent" SET "status" = 'SUCCESS', "processedAt" = ${old} WHERE id = '${oldSuccess}'::uuid`,
++    );
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "status" = 'SUCCESS', "processedAt" = now() WHERE id = ${freshSuccess}::uuid`;
++    await db().$executeRawUnsafe(
++      `UPDATE "OutboxEvent" SET "status" = 'DEAD_LETTER', "processedAt" = ${old} WHERE id = '${oldDead}'::uuid`,
++    );
++    await db().$executeRawUnsafe(
++      `UPDATE "OutboxEvent" SET "createdAt" = ${old} WHERE id = '${oldPending}'::uuid`,
++    );
++    await db().$executeRawUnsafe(
++      `UPDATE "OutboxEvent" SET "status" = 'PROCESSING', "processedAt" = ${old} WHERE id = '${oldProcessing}'::uuid`,
++    );
++
++    expect(await purgeFinishedOutbox(3_600_000)).toBe(1);
++    const remaining = (await db().outboxEvent.findMany({ select: { id: true } })).map((r) => r.id);
++    expect(remaining.sort()).toEqual([freshSuccess, oldDead, oldPending, oldProcessing].sort());
++  });
++});
++
++describe('re-drive', () => {
++  async function deadLetter(): Promise<string> {
++    const { id } = await insertOutbox();
++    await db().outboxEvent.update({
++      where: { id },
++      data: {
++        status: 'DEAD_LETTER',
++        errorClass: 'UNKNOWN_INTERNAL',
++        lastError: 'Error',
++        executionAttemptCount: 5,
++        publishAttemptCount: 1,
++        leaseExpiresAt: new Date(),
++      },
++    });
++    return id;
++  }
++
++  it('requeues a DEAD_LETTER row: PENDING, available now, lease cleared, execution counter reset', async () => {
++    const id = await deadLetter();
++    await redriveOutboxEvent(id, 'operator-1');
++    const stored = await row(id);
++    expect(stored).toMatchObject({
++      status: 'PENDING',
++      leaseExpiresAt: null,
++      executionAttemptCount: 0,
++      publishAttemptCount: 1,
++    });
++    expect(stored.availableAt.getTime()).toBeLessThanOrEqual(Date.now());
++
++    const gateway = new FakeGateway();
++    expect((await runRelayCycle(config, gateway)).published).toBe(1);
++    expect(gateway.published[0].data.outboxEventId).toBe(id);
++  });
++
++  it.each(['PENDING', 'PROCESSING', 'SUCCESS'] as const)('rejects a %s row', async (status) => {
++    const { id } = await insertOutbox();
++    await db().outboxEvent.update({ where: { id }, data: { status } });
++    await expect(redriveOutboxEvent(id, 'op')).rejects.toMatchObject({ code: 'NOT_DEAD_LETTER' });
++    expect((await row(id)).status).toBe(status);
++  });
++
++  it('rejects an unknown id, a malformed id, an unsupported event type and an invalid payload', async () => {
++    await expect(redriveOutboxEvent(randomUUID(), 'op')).rejects.toMatchObject({
++      code: 'NOT_FOUND',
++    });
++    await expect(redriveOutboxEvent('nope', 'op')).rejects.toBeInstanceOf(RedriveError);
++
++    const unsupported = await deadLetter();
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "eventType" = 'RETIRED_EVENT' WHERE id = ${unsupported}::uuid`;
++    await expect(redriveOutboxEvent(unsupported, 'op')).rejects.toMatchObject({
++      code: 'UNSUPPORTED_EVENT_TYPE',
++    });
++
++    const invalid = await deadLetter();
++    await db()
++      .$executeRaw`UPDATE "OutboxEvent" SET "payload" = '{}'::jsonb WHERE id = ${invalid}::uuid`;
++    await expect(redriveOutboxEvent(invalid, 'op')).rejects.toMatchObject({
++      code: 'INVALID_PAYLOAD',
++    });
++    expect((await row(invalid)).status).toBe('DEAD_LETTER');
++  });
++});
+diff --git a/backend/test/integration/services.int-spec.ts b/backend/test/integration/services.int-spec.ts
+index 901a50f..fba0f73 100644
+--- a/backend/test/integration/services.int-spec.ts
++++ b/backend/test/integration/services.int-spec.ts
+@@ -1,5 +1,6 @@
+ import { randomUUID } from 'node:crypto';
+ import { Client } from 'pg';
++import * as audit from '../../src/infra/audit/append-audit-event';
+ import request from 'supertest';
+ import { getPrisma } from '../../src/infra/db/prisma';
+ import { getRedis } from '../../src/infra/redis/redis';
+@@ -1135,3 +1136,112 @@ describe('database constraints and configuration read contract', () => {
+     expect(await getEscalationPolicyByService(NIL)).toBeNull();
+   });
+ });
++
++/** Runs the real append, then fails: the transaction must leave neither the change nor the event. */
++function failAfterAudit() {
++  const original = audit.appendAuditEvent;
++  return jest.spyOn(audit, 'appendAuditEvent').mockImplementation(async (tx, input) => {
++    await original(tx, input);
++    throw new Error('injected fault after the audit write');
++  });
++}
++const auditRows = () => getPrisma().auditEvent.findMany({ orderBy: { createdAt: 'asc' } });
++
++describe('S4 and S7 audit events', () => {
++  it('writes no audit event for S1 or S5', async () => {
++    await setup();
++    expect(await auditRows()).toHaveLength(0);
++  });
++
++  it('S4 records SERVICE_UPDATED with the changed field names', async () => {
++    const { admin, service } = await setup();
++    expect((await patchService(admin.token, service.id, { name: 'renamed-svc' })).status).toBe(200);
++    const rows = await auditRows();
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({
++      eventType: 'SERVICE_UPDATED',
++      actor: admin.admin.id,
++      incidentId: null,
++      metadata: { serviceId: service.id, changedFields: ['name'] },
++    });
++  });
++
++  it('S4 records only SERVICE_DEACTIVATED when a deactivation also changes other fields', async () => {
++    const { admin, service } = await setup();
++    const res = await patchService(admin.token, service.id, {
++      status: 'DEACTIVATED',
++      name: 'closing-svc',
++    });
++    expect(res.status).toBe(200);
++    const rows = await auditRows();
++    expect(rows.map((r) => r.eventType)).toEqual(['SERVICE_DEACTIVATED']);
++    expect((rows[0].metadata as { changedFields: string[] }).changedFields.sort()).toEqual([
++      'name',
++      'status',
++    ]);
++  });
++
++  it('S4 and S7 write nothing for a no-op, a failed validation or an unknown id', async () => {
++    const { k, admin, service } = await setup();
++    const url = policyUrl(service.id, service.escalationPolicyId);
++    expect((await patchService(admin.token, service.id, { name: service.name })).status).toBe(200);
++    expect((await patchService(admin.token, service.id, { name: '' })).status).toBe(422);
++    expect((await patchService(admin.token, NIL, { name: 'x' })).status).toBe(404);
++    expect(
++      (await request(app).patch(url).set(bearer(admin.token)).send({ level1: k.engineer1.id }))
++        .status,
++    ).toBe(200); // same value as stored
++    expect(
++      (await request(app).patch(url).set(bearer(admin.token)).send({ level1: NIL })).status,
++    ).toBe(403);
++    expect(await auditRows()).toHaveLength(0);
++  });
++
++  it('S7 records ESCALATION_POLICY_UPDATED with the changed level names', async () => {
++    const { k, admin, service } = await setup();
++    const url = policyUrl(service.id, service.escalationPolicyId);
++    const replacement = await createUser({ role: 'ENGINEER', teamId: k.team.id });
++    const newAdmin = await createUser({ role: 'ADMIN' });
++    const res = await request(app)
++      .patch(url)
++      .set(bearer(admin.token))
++      .send({ fallbackAdmin: newAdmin.id, level1: replacement.id });
++    expect(res.status).toBe(200);
++
++    const rows = await auditRows();
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({
++      eventType: 'ESCALATION_POLICY_UPDATED',
++      actor: admin.admin.id,
++      incidentId: null,
++      metadata: {
++        escalationPolicyId: service.escalationPolicyId,
++        changedFields: ['level1', 'fallbackAdmin'],
++      },
++    });
++    expect(JSON.stringify(rows[0].metadata)).not.toContain(replacement.id);
++  });
++
++  it('a fault after the audit write leaves neither the change nor the event (S4 and S7)', async () => {
++    const { k, admin, service } = await setup();
++    const url = policyUrl(service.id, service.escalationPolicyId);
++    const replacement = await createUser({ role: 'ENGINEER', teamId: k.team.id });
++
++    const spy = failAfterAudit();
++    expect((await patchService(admin.token, service.id, { name: 'lost-name' })).status).toBe(500);
++    expect(
++      (await request(app).patch(url).set(bearer(admin.token)).send({ level1: replacement.id }))
++        .status,
++    ).toBe(500);
++    expect(spy).toHaveBeenCalled();
++    jest.restoreAllMocks();
++
++    const stored = await getPrisma().appService.findUniqueOrThrow({ where: { id: service.id } });
++    expect(stored.name).toBe(service.name);
++    const policy = await getPrisma().escalationPolicy.findUniqueOrThrow({
++      where: { id: service.escalationPolicyId },
++    });
++    expect(policy.level1Id).toBe(k.engineer1.id);
++    expect(await auditRows()).toHaveLength(0);
++  });
++});
+diff --git a/backend/test/integration/teams.int-spec.ts b/backend/test/integration/teams.int-spec.ts
+index 5ac156d..f2b4a4d 100644
+--- a/backend/test/integration/teams.int-spec.ts
++++ b/backend/test/integration/teams.int-spec.ts
+@@ -1,5 +1,7 @@
++import { randomUUID } from 'node:crypto';
+ import request from 'supertest';
+ import { getPrisma } from '../../src/infra/db/prisma';
++import * as audit from '../../src/infra/audit/append-audit-event';
+ import { getRedis } from '../../src/infra/redis/redis';
+ import * as sessions from '../../src/modules/identity/auth/session.repository';
+ import { buildTestApp } from '../helpers/app';
+@@ -385,3 +387,70 @@ describe('T4 PATCH /identity/teams/:teamId', () => {
+     });
+   });
+ });
++
++/** Runs the real append, then fails: the transaction must leave neither the change nor the event. */
++function failAfterAudit() {
++  const original = audit.appendAuditEvent;
++  return jest.spyOn(audit, 'appendAuditEvent').mockImplementation(async (tx, input) => {
++    await original(tx, input);
++    throw new Error('injected fault after the audit write');
++  });
++}
++const auditRows = () => getPrisma().auditEvent.findMany({ orderBy: { createdAt: 'asc' } });
++
++describe('T4 audit events', () => {
++  const patch = (token: string, teamId: string, body: object) =>
++    request(app).patch(`${api}/${teamId}`).set(bearer(token)).send(body);
++
++  it('records TEAM_UPDATED with the changed field names in the same transaction', async () => {
++    const team = await createTeam('before');
++    const { token, admin } = await adminSession(app);
++    expect((await patch(token, team.id, { name: 'after' })).status).toBe(200);
++
++    const rows = await auditRows();
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({
++      eventType: 'TEAM_UPDATED',
++      actor: admin.id,
++      incidentId: null,
++      metadata: { teamId: team.id, changedFields: ['name'] },
++    });
++  });
++
++  it('records only TEAM_DEACTIVATED when a deactivation also renames', async () => {
++    const team = await createTeam('keep');
++    const { token } = await adminSession(app);
++    expect((await patch(token, team.id, { name: 'renamed', status: 'DEACTIVATED' })).status).toBe(
++      200,
++    );
++    const rows = await auditRows();
++    expect(rows).toHaveLength(1);
++    expect(rows[0].eventType).toBe('TEAM_DEACTIVATED');
++    expect((rows[0].metadata as { changedFields: string[] }).changedFields.sort()).toEqual([
++      'name',
++      'status',
++    ]);
++  });
++
++  it('writes nothing for a request that changes nothing, fails validation or finds no team', async () => {
++    const team = await createTeam('same');
++    const { token } = await adminSession(app);
++    expect((await patch(token, team.id, { name: 'same' })).status).toBe(200);
++    expect((await patch(token, team.id, { name: '' })).status).toBe(422);
++    expect((await patch(token, randomUUID(), { name: 'x' })).status).toBe(404);
++    expect(await auditRows()).toHaveLength(0);
++  });
++
++  it('a fault after the audit write leaves neither the change nor the event', async () => {
++    const team = await createTeam('stays');
++    const { token } = await adminSession(app);
++    const spy = failAfterAudit();
++    expect((await patch(token, team.id, { name: 'lost' })).status).toBe(500);
++    expect(spy).toHaveBeenCalled();
++    jest.restoreAllMocks();
++    expect((await getPrisma().team.findUniqueOrThrow({ where: { id: team.id } })).name).toBe(
++      'stays',
++    );
++    expect(await auditRows()).toHaveLength(0);
++  });
++});
+diff --git a/backend/test/integration/users.int-spec.ts b/backend/test/integration/users.int-spec.ts
+index 9a16605..cbb743a 100644
+--- a/backend/test/integration/users.int-spec.ts
++++ b/backend/test/integration/users.int-spec.ts
+@@ -1,4 +1,5 @@
+ import request from 'supertest';
++import * as audit from '../../src/infra/audit/append-audit-event';
+ import { getPrisma } from '../../src/infra/db/prisma';
+ import { getRedis } from '../../src/infra/redis/redis';
+ import * as sessions from '../../src/modules/identity/auth/session.repository';
+@@ -556,3 +557,69 @@ describe('U4 PATCH /identity/users/:userId', () => {
+     }
+   });
+ });
++
++/** Runs the real append, then fails: the transaction must leave neither the change nor the event. */
++function failAfterAudit() {
++  const original = audit.appendAuditEvent;
++  return jest.spyOn(audit, 'appendAuditEvent').mockImplementation(async (tx, input) => {
++    await original(tx, input);
++    throw new Error('injected fault after the audit write');
++  });
++}
++const auditRows = () => getPrisma().auditEvent.findMany({ orderBy: { createdAt: 'asc' } });
++
++describe('U4 audit events', () => {
++  it('records USER_UPDATED with field names only; a password change shows just its name', async () => {
++    const user = await createUser({ name: 'Before' });
++    const { token, admin } = await adminSession(app);
++    const res = await patch(token, user.id, { name: 'After', password: 'N3wPassw0rd!' });
++    expect(res.status).toBe(200);
++
++    const rows = await auditRows();
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({
++      eventType: 'USER_UPDATED',
++      actor: admin.id,
++      incidentId: null,
++    });
++    const metadata = rows[0].metadata as { userId: string; changedFields: string[] };
++    expect(metadata.userId).toBe(user.id);
++    expect(metadata.changedFields.sort()).toEqual(['name', 'password']);
++    expect(JSON.stringify(rows[0].metadata)).not.toMatch(/N3wPassw0rd|After|Before/);
++  });
++
++  it('records only USER_DEACTIVATED when a deactivation also changes other fields', async () => {
++    const user = await createUser({ name: 'Leaving' });
++    const { token } = await adminSession(app);
++    expect((await patch(token, user.id, { name: 'Gone', status: 'DEACTIVATED' })).status).toBe(200);
++    const rows = await auditRows();
++    expect(rows.map((r) => r.eventType)).toEqual(['USER_DEACTIVATED']);
++    expect((rows[0].metadata as { changedFields: string[] }).changedFields.sort()).toEqual([
++      'name',
++      'status',
++    ]);
++  });
++
++  it('writes nothing for creates, no-op updates or failed requests', async () => {
++    const team = await createTeam();
++    const user = await createUser({ name: 'Same', teamId: team.id });
++    const { token } = await adminSession(app);
++    expect((await create(token, body({ teamId: team.id }))).status).toBe(201);
++    expect((await patch(token, user.id, { name: 'Same' })).status).toBe(200);
++    expect((await patch(token, user.id, { password: 'short' })).status).toBe(422);
++    expect(await auditRows()).toHaveLength(0);
++  });
++
++  it('a fault after the audit write leaves neither the change nor the event', async () => {
++    const user = await createUser({ name: 'Stays' });
++    const { token } = await adminSession(app);
++    const spy = failAfterAudit();
++    expect((await patch(token, user.id, { name: 'Lost' })).status).toBe(500);
++    expect(spy).toHaveBeenCalled();
++    jest.restoreAllMocks();
++    expect((await getPrisma().user.findUniqueOrThrow({ where: { id: user.id } })).name).toBe(
++      'Stays',
++    );
++    expect(await auditRows()).toHaveLength(0);
++  });
++});

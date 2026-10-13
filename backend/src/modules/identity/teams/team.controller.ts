@@ -28,5 +28,5 @@ export const getTeamHandler: RequestHandler = async (req, res) => {
 export const updateTeamHandler: RequestHandler = async (req, res) => {
   const { teamId } = parseOrThrow(teamParamsSchema, req.params);
   const body = parseOrThrow(updateTeamBodySchema, req.body);
-  res.status(200).json({ data: await teamService.updateTeam(teamId, body) });
+  res.status(200).json({ data: await teamService.updateTeam(teamId, body, getAuth(req).userId) });
 };

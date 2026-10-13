@@ -62,6 +62,21 @@ enum AuditEventType {
   CLOSED
   REASSIGNED
   OPEN
+  USER_UPDATED
+  USER_DEACTIVATED
+  TEAM_UPDATED
+  TEAM_DEACTIVATED
+  SERVICE_UPDATED
+  SERVICE_DEACTIVATED
+  ESCALATION_POLICY_UPDATED
+  ALERT_SOURCE_UPDATED
+}
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  DEAD_LETTER
 }
 
 enum PostmortemReviewStatus {
@@ -373,14 +388,25 @@ model OutboxEvent {
 
   eventType     String
   aggregateType String
-  aggregateId   String          @db.Uuid
+  aggregateId   String       @db.Uuid
   payload       Json
-  status        LifecycleStates @default(PENDING)
-  attemptCount  Int             @default(0)
-  availableAt   DateTime        @default(now())
-  processedAt   DateTime?
+  status        OutboxStatus @default(PENDING)
+
+  publishAttemptCount   Int @default(0)
+  executionAttemptCount Int @default(0)
+
+  availableAt    DateTime  @default(now())
+  publishedAt    DateTime?
+  processedAt    DateTime?
+  leaseExpiresAt DateTime?
+
+  errorClass String?
+  lastError  String?
 
   createdAt DateTime @default(now())
+
+  @@index([status, availableAt, leaseExpiresAt], map: "idx_outbox_claim")
+  @@index([status, processedAt], map: "idx_outbox_retention")
 }
 
 model AuditEvent {

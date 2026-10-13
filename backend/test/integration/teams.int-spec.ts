@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import request from 'supertest';
 import { getPrisma } from '../../src/infra/db/prisma';
+import * as audit from '../../src/infra/audit/append-audit-event';
 import { getRedis } from '../../src/infra/redis/redis';
 import * as sessions from '../../src/modules/identity/auth/session.repository';
 import { buildTestApp } from '../helpers/app';
@@ -383,5 +385,72 @@ describe('T4 PATCH /identity/teams/:teamId', () => {
         ).status,
       ).toBe(200);
     });
+  });
+});
+
+/** Runs the real append, then fails: the transaction must leave neither the change nor the event. */
+function failAfterAudit() {
+  const original = audit.appendAuditEvent;
+  return jest.spyOn(audit, 'appendAuditEvent').mockImplementation(async (tx, input) => {
+    await original(tx, input);
+    throw new Error('injected fault after the audit write');
+  });
+}
+const auditRows = () => getPrisma().auditEvent.findMany({ orderBy: { createdAt: 'asc' } });
+
+describe('T4 audit events', () => {
+  const patch = (token: string, teamId: string, body: object) =>
+    request(app).patch(`${api}/${teamId}`).set(bearer(token)).send(body);
+
+  it('records TEAM_UPDATED with the changed field names in the same transaction', async () => {
+    const team = await createTeam('before');
+    const { token, admin } = await adminSession(app);
+    expect((await patch(token, team.id, { name: 'after' })).status).toBe(200);
+
+    const rows = await auditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      eventType: 'TEAM_UPDATED',
+      actor: admin.id,
+      incidentId: null,
+      metadata: { teamId: team.id, changedFields: ['name'] },
+    });
+  });
+
+  it('records only TEAM_DEACTIVATED when a deactivation also renames', async () => {
+    const team = await createTeam('keep');
+    const { token } = await adminSession(app);
+    expect((await patch(token, team.id, { name: 'renamed', status: 'DEACTIVATED' })).status).toBe(
+      200,
+    );
+    const rows = await auditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].eventType).toBe('TEAM_DEACTIVATED');
+    expect((rows[0].metadata as { changedFields: string[] }).changedFields.sort()).toEqual([
+      'name',
+      'status',
+    ]);
+  });
+
+  it('writes nothing for a request that changes nothing, fails validation or finds no team', async () => {
+    const team = await createTeam('same');
+    const { token } = await adminSession(app);
+    expect((await patch(token, team.id, { name: 'same' })).status).toBe(200);
+    expect((await patch(token, team.id, { name: '' })).status).toBe(422);
+    expect((await patch(token, randomUUID(), { name: 'x' })).status).toBe(404);
+    expect(await auditRows()).toHaveLength(0);
+  });
+
+  it('a fault after the audit write leaves neither the change nor the event', async () => {
+    const team = await createTeam('stays');
+    const { token } = await adminSession(app);
+    const spy = failAfterAudit();
+    expect((await patch(token, team.id, { name: 'lost' })).status).toBe(500);
+    expect(spy).toHaveBeenCalled();
+    jest.restoreAllMocks();
+    expect((await getPrisma().team.findUniqueOrThrow({ where: { id: team.id } })).name).toBe(
+      'stays',
+    );
+    expect(await auditRows()).toHaveLength(0);
   });
 });

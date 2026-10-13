@@ -1,3 +1,4 @@
+import { appendAuditEvent } from '../../../infra/audit/append-audit-event.js';
 import { isUniqueViolation } from '../../../infra/db/errors.js';
 import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
 import { ConflictError, ValidationError } from '../../../shared/errors/AppError.js';
@@ -103,6 +104,7 @@ function changedFields<T extends object>(current: object, patch: T): Partial<T> 
 export async function updateService(
   serviceId: string,
   body: UpdateServiceBody,
+  actorId: string,
 ): Promise<ServiceResponse> {
   try {
     return await runServiceTransaction(async (tx) => {
@@ -151,7 +153,14 @@ export async function updateService(
       }
 
       if (Object.keys(changes).length === 0) return toServiceResponse(stored);
-      return toServiceResponse(await writeService(tx, serviceId, changes));
+      const updated = await writeService(tx, serviceId, changes);
+      await appendAuditEvent(tx, {
+        incidentId: null,
+        eventType: deactivating ? 'SERVICE_DEACTIVATED' : 'SERVICE_UPDATED',
+        actorId,
+        metadata: { serviceId, changedFields: Object.keys(changes) },
+      });
+      return toServiceResponse(updated);
     });
   } catch (error) {
     if (isUniqueViolation(error)) throw duplicateService();

@@ -10,7 +10,7 @@ The webhook request pipeline steps 1–6 (below), raw-body capture, HMAC verific
 Per-alert processing, normalization, identity, dedup, severity mapping logic and persistence (SLICE-04). Alert-source CRUD/management APIs (none exist; sources are seeded/out-of-band). Delivery of the Admin notification (SLICE-09).
 
 ## 3. Dependencies
-From SLICE-00: Redis client, error envelope. From SLICE-08: the in-transaction outbox write contract `enqueueOutbox(tx, …)` and the outbox event catalog (`NOTIFICATION_REQUESTED`, routed to the `notifications` queue). If the function does not yet exist, create only the minimal function with that signature in its owning location and report it.
+From SLICE-00: Redis client, error envelope. From SLICE-08: the in-transaction outbox write contract `enqueueOutbox(tx, …)` and the outbox event catalog (`NOTIFICATION_REQUESTED`, routed to the `notifications` queue). If the function does not yet exist, create only the minimal function with that signature in its owning location and report it. The seed's audit write uses `appendAuditEvent(tx, …)` and the `ALERT_SOURCE_UPDATED` enum value owned by SLICE-06 (create only those minimal pieces if absent, and report it).
 
 **Provided to SLICE-04:** a verified context `{ alertSource (including its `configuration`), items: unknown[] (≤100, in request order), rateLimitedIndices }`.
 
@@ -47,6 +47,8 @@ From SLICE-00: Redis client, error envelope. From SLICE-08: the in-transaction o
 
 Secrets come from environment/config at seed time, never from source code. `severityMapping` is read by SLICE-04; this slice only seeds it (the four default values above).
 
+**Seed updates are audited.** Re-running the seed against an **existing** source that changes its `configuration` (for example rotating `signingSecret` or editing `severityMapping`) is the only out-of-band configuration change, and it appends audit `ALERT_SOURCE_UPDATED` in the same transaction as the update: `actor = null` (the seed runs outside any user session), `incidentId = null`, `metadata` = the alert source id and the **names of the changed configuration keys only** — never their values, and never the signing secret. Creating a new source writes no audit event. The seed identifies an existing source by the identifier it seeds (implementation-defined).
+
 ## 5. Domain & Data Context
 `AlertSource`: `id` uuid(v7), `name`, `sourceType` (string), `configuration` (JSON; keys `signingSecret`, `severityMapping` as above), `status` (`ACTIVE|DEACTIVATED`, default `ACTIVE`), timestamps; index `(sourceType, status)`. `Alert` rows reference `alertSourceId` (SLICE-04). Redis holds replay keys and rate-limit/ladder/block state. This Redis state is intentionally ephemeral: if Redis is wiped, replay records, rate-limit counters, ladder memory and blocks reset (counters are ephemeral by design; Redis is never the source of truth for business state).
 
@@ -66,7 +68,7 @@ Only the final-stage Admin notice: one `NOTIFICATION_REQUESTED` outbox event as 
 Redis (replay store / rate limiter) unavailable → `503 DEPENDENCY_UNAVAILABLE` with `Retry-After`, nothing processed (fail closed). Database lookup failure → `503`. No partial acceptance: steps 1–6 never persist alerts. After a Redis wipe, replay protection and rate-limit state restart empty (ephemeral by design); the 300 s timestamp window still bounds old signed requests.
 
 ## 11. Implementation Surface
-Application: Alerts module — webhook controller, raw-body capture middleware (mounted before JSON parsing for this route), source repository, HMAC verifier, replay store, rate limiter, envelope validator, Admin-notice writer. Infrastructure: Redis keys. Seed script. No schema change. Tests: unit (HMAC, timestamp window, ladder math), integration (Redis + PostgreSQL).
+Application: Alerts module — webhook controller, raw-body capture middleware (mounted before JSON parsing for this route), source repository, HMAC verifier, replay store, rate limiter, envelope validator, Admin-notice writer. Infrastructure: Redis keys. Seed script (including the audited update path). No schema change in this slice (the `AuditEventType` migration is owned by SLICE-06). Tests: unit (HMAC, timestamp window, ladder math), integration (Redis + PostgreSQL).
 
 ## 12. Verification Requirements
 - Valid signature accepted; wrong secret, tampered body, unknown/deactivated source, malformed id, missing headers → identical `401 SOURCE_AUTH_FAILED`.
@@ -77,8 +79,9 @@ Application: Alerts module — webhook controller, raw-body capture middleware (
 - 1 MB boundary (`413`), 100/101 items, empty/missing `alerts`, malformed JSON, missing `Content-Type`.
 - Redis down at step 4 and at step 5 → `503` with `Retry-After`, nothing stored or processed, replay/rate checks never skipped; Redis wiped → state resets and requests proceed.
 - Seed creates `configuration` with `signingSecret` (from environment) and the four-value `severityMapping`; secrets never appear in logs or responses.
+- Seed re-run that changes an existing source's configuration appends exactly one `ALERT_SOURCE_UPDATED` (null actor, `incidentId = null`, metadata = source id + changed key names, no values/secret) atomically with the update; an unchanged re-run and the creation of a new source write none.
 
 ## 13. Completion Criteria
 - Steps 1–6 behave in the stated order with the stated codes; verified context (including `configuration`) is handed to SLICE-04.
 - Redis outage fails closed; replay and rate-limit state are atomic and Redis-backed; ladder and the `ALERT_SOURCE_BLOCKED` Admin notice work.
-- Seed script creates sources with `signingSecret` and `severityMapping` without committing secrets; tests pass; typecheck/lint/format clean on touched files.
+- Seed script creates sources with `signingSecret` and `severityMapping` without committing secrets and audits configuration updates to existing sources; tests pass; typecheck/lint/format clean on touched files.

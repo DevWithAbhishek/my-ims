@@ -30,5 +30,5 @@ export const getUserHandler: RequestHandler = async (req, res) => {
 export const updateUserHandler: RequestHandler = async (req, res) => {
   const { userId } = parseOrThrow(userParamsSchema, req.params);
   const body = parseOrThrow(updateUserBodySchema, req.body);
-  res.status(200).json({ data: await userService.updateUser(userId, body) });
+  res.status(200).json({ data: await userService.updateUser(userId, body, getAuth(req).userId) });
 };

@@ -1,3 +1,4 @@
+import { appendAuditEvent } from '../../../infra/audit/append-audit-event.js';
 import { isUniqueViolation } from '../../../infra/db/errors.js';
 import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
 import { ConflictError } from '../../../shared/errors/AppError.js';
@@ -45,7 +46,11 @@ export async function getTeam(auth: AuthContext, teamId: string): Promise<TeamRe
   return toTeamResponse(team);
 }
 
-export async function updateTeam(teamId: string, body: UpdateTeamBody): Promise<TeamResponse> {
+export async function updateTeam(
+  teamId: string,
+  body: UpdateTeamBody,
+  actorId: string,
+): Promise<TeamResponse> {
   try {
     return await runIdentityTransaction(async (tx) => {
       if (!(await lockRowForUpdate(tx, 'Team', teamId))) throw teamNotFound();
@@ -64,6 +69,17 @@ export async function updateTeam(teamId: string, body: UpdateTeamBody): Promise<
       }
 
       const updated = await writeTeam(tx, teamId, { name: body.name, status: body.status });
+      const changedFields = (['name', 'status'] as const).filter(
+        (field) => body[field] !== undefined && body[field] !== team[field],
+      );
+      if (changedFields.length > 0) {
+        await appendAuditEvent(tx, {
+          incidentId: null,
+          eventType: deactivating ? 'TEAM_DEACTIVATED' : 'TEAM_UPDATED',
+          actorId,
+          metadata: { teamId, changedFields },
+        });
+      }
       if (deactivating) {
         const userIds = await detachUsersFromTeam(tx, teamId);
         await revokeSessionsForUsers(tx, userIds);

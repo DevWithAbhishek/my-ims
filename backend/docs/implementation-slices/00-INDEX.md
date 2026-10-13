@@ -637,6 +637,34 @@ Define:
 
 **Answer:**
 
+- How should pending outbox rows be claimed?
+  SELECT ... FOR UPDATE SKIP LOCKED
+  Each relay claims eligible rows while skipping rows locked by other relays.
+
+- What transaction and locking mechanism should be used?
+  Claim in a short transaction, publish outside it.
+  Transactional claim rows and commit; publish to Redis outside the transaction; update status afterward
+  Requires durable claim state and lease recovery. Duplicate publication remains possible.
+
+- What status values should the outbox have?
+  Lifecycle with terminal dead-letter state: PENDING → PROCESSING → PUBLISHED → DEAD_LETTER / SUCCESS (depending upon if event is completed or failed multiple times).
+  Retryable failures can remain PENDING, with a future availableAt, rather than introducing a separate FAILED state.
+
+- Who owns retries: the relay, BullMQ, or the worker?
+  Separate retry ownership by stage.
+  Relay for publication; BullMQ for execution. Clear separation between delivery and execution
+  Relay retries failed or uncertain enqueue operations; BullMQ retries failed worker jobs.
+  But it requires careful coordination and idempotency across both stages.
+
+- Should processed outbox rows be retained or deleted?
+  Retain for a defined period, then archive.
+  Keep published events for a configured retention window, then archive them.
+  Challenge: The retention period must exceed the required recovery and investigation window.
+
+- What happens if the relay crashes?
+  The relay should provide at-least-once publication, not exactly-once publication.
+  Reclaim stale claims, retry uncertain enqueues, and tolerate duplicates.
+
 >
 
 ---
@@ -657,6 +685,30 @@ Define the common worker policy:
 - inspect/re-drive mechanism.
 
 **Answer:**
+
+- maximum attempts;
+  5 attempts. Initial execution plus up to 4 retries.
+
+- backoff;
+  Exponential backoff. Increase the delay after each failure.
+
+- retryable errors;
+  Temporary network failure, Temporary service failure, Rate limiting (with appropriate delay), Transient database failure, Temporary Redis/provider outage, Worker process interruption (through queue recovery), Unknown internal error (Limited retry, then investigate).
+
+- non-retryable errors;
+  Invalid payload, Unsupported event type, Permanent business-rule violation, Authentication/configuration error, Resource not found, Authorization failure.
+
+- terminal failure state;
+  Durable task failure record in PostgreSQL
+  Persist the task's terminal status, error classification, attempt count, and relevant timestamps
+
+- DLQ representation;
+  Database record plus dedicated DLQ queue
+  Persist the failure and route the job to a separate queue
+
+- inspect/re-drive mechanism.
+  Operational script or CLI
+  A controlled command validates and requeues a task.
 
 >
 
@@ -682,7 +734,7 @@ Redis is never the source of truth for business state. Workers run as a separate
 - what work is recoverable from PostgreSQL/outbox?
   The unpublished events marked as PENDING in the OutboxEvent table. But we need to add something more - to re-publish the events that were not successfully executed by workers at time of Redis / BullMQ unavailability.
   Selected solution:
-  Expand the lifecycle to distinguish at least: PENDING → PUBLISHED → PROCESSING → SUCCESS, with FAILED for a defined failure state.
+  Expand the lifecycle to distinguish at least: PENDING → PROCESSING → PUBLISHED → DEAD_LETTER / SUCCESS (depending upon if event is completed or failed multiple times).
   Add sufficient metadata to identify stale work, such as publishedAt, a processing lease or heartbeat, and error details.
   A stale PROCESSING state must also be recoverable if the worker crashes. A lease or timeout is necessary; otherwise, the event can remain stuck indefinitely.
   _Limitation: The outbox now also acts as an execution ledger. The publisher and workers must coordinate state transitions carefully. A PUBLISHED event cannot simply be ignored forever: a recovery process must detect when it has not progressed and safely republish it._
@@ -728,6 +780,33 @@ Redis is never the source of truth for business state. Workers run as a separate
 Exactly which domain events generate notifications, and what notification severity/type does each use?
 
 **Answer:**
+For below events, which also create audit events:
+
+| Event                      | Notification Type |
+| -------------------------- | ----------------- |
+| AI_TRIAGE_COMPLETED        | INFO              |
+| ASSIGNED                   | ALERT             |
+| INCIDENT_CREATED           | ALERT             |
+| ACKNOWLEDGED               | ALERT             |
+| SEVERITY_CONFIRMED         | ALERT             |
+| SLA_WARNING                | WARNING           |
+| ESCALATED_L1               | WARNING           |
+| ESCALATED_L2               | WARNING           |
+| ESCALATED_L3               | WARNING           |
+| ESCALATED_L4               | WARNING           |
+| SOURCE_ALERT_RESOLVED      | ALERT             |
+| RESOLVED                   | ALERT             |
+| POSTMORTEM_GENERATED       | INFO              |
+| POSTMORTEM_REVIEWED        | INFO              |
+| AI_INVESTIGATION_COMPLETED | INFO              |
+| CLOSED                     | ALERT             |
+| REASSIGNED                 | ALERT             |
+| OPEN                       | ALERT             |
+| TEAM_UPDATED               | INFO              |
+| TEAM_DEACTIVATED           | INFO              |
+| SERVICE_UPDATED            | INFO              |
+| SERVICE_DEACTIVATED        | INFO              |
+| ESCALATION_POLICY_UPDATED  | ALERT             |
 
 >
 
@@ -750,6 +829,34 @@ For every notification event, define the exact recipient rule:
 
 **Answer:**
 
+- Resolve the recipient for each event at enqueue time.
+
+| Event                      | Current Assignee                | Assignee's Lead              | Service 'level 3' Contact    | Fallback Admin                       | If no assignee? |
+| -------------------------- | ------------------------------- | ---------------------------- | ---------------------------- | ------------------------------------ | --------------- |
+| AI_TRIAGE_COMPLETED        | Affected Service's team lead    | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| ASSIGNED                   | Assigned User                   | Affected Service's team lead | Affected Service's team lead | Escalation policy's fallbackAdmin    | NA              |
+| INCIDENT_CREATED           | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| ACKNOWLEDGED               | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| SEVERITY_CONFIRMED         | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| SLA_WARNING                | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| ESCALATED_L1               | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| ESCALATED_L2               | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| ESCALATED_L3               | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| ESCALATED_L4               | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| SOURCE_ALERT_RESOLVED      | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| RESOLVED                   | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| POSTMORTEM_GENERATED       | ResolvedBy User                 | Affected Service's team lead | Affected Service's team lead | Escalation policy's fallbackAdmin    | NA              |
+| POSTMORTEM_REVIEWED        | ResolvedBy User                 | Affected Service's team lead | Affected Service's team lead | Escalation policy's fallbackAdmin    | NA              |
+| AI_INVESTIGATION_COMPLETED | RequestedBy                     | Affected Service's team lead | Affected Service's team lead | Escalation policy's fallbackAdmin    | NA              |
+| CLOSED                     | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| REASSIGNED                 | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| OPEN                       | Affected Service's team members | NA                           | NA                           | Escalation policy's fallbackAdmin    | NA              |
+| TEAM_UPDATED               | Team members                    | NA                           | NA                           | Service Esca. policy's fallbackAdmin | NA              |
+| TEAM_DEACTIVATED           | Team members                    | NA                           | NA                           | Service Esca. policy's fallbackAdmin | NA              |
+| SERVICE_UPDATED            | Team members                    | NA                           | NA                           | Service Esca. policy's fallbackAdmin | NA              |
+| SERVICE_DEACTIVATED        | Team members                    | NA                           | NA                           | Service Esca. policy's fallbackAdmin | NA              |
+| ESCALATION_POLICY_UPDATED  | Team members                    | NA                           | NA                           | Service Esca. policy's fallbackAdmin | NA              |
+
 >
 
 ---
@@ -769,6 +876,12 @@ Define:
 
 **Answer:**
 
+- one Notification row per recipient vs recipient collection: One notification row per recipient collection.
+- idempotency-key derivation: event_type + incident_id / team_id / service_id / alert_id (whichever applicable)
+- producer vs worker creation: - Producer (API/service): Creates a durable Notification record and an outbox event in the same PostgreSQL transaction - Worker: reads the request, resolves recipients if needed, and sends the notification. - Durability: Notification record exists before the worker runs. - Failure recovery: Can recover delivery from the existing notification record. - Duplicate handling: Must prevent duplicate delivery and duplicate records.
+- retrying vs FAILED representation: deliveryStatus ( REQUESTED, RUNNING, COMPLETED, FAILED)
+- duplicate notification prevention" check for idempotency using key.
+
 >
 
 ---
@@ -781,6 +894,13 @@ Define:
 What IMS data may be sent to the LLM, what must be redacted/excluded, and what provenance must be stored?
 
 **Answer:**
+It will be different, only below data will be sent:
+
+1. Triage: Alert table (summary, description, labels, additionalDetails)
+2. Postmortem: Incident table (description, severity). All Comments (title, description) of incident.
+3. Investigation: Incident table (description, severity), past reviewed postmortem reports of service (summary, impact, rootCause, factors, resolution).
+4. Evidence: past reviewed postmortems (summary, impact, rootCause, factors, resolution, incidentId).
+5. Evaluation: Evidence (id, relevanceInfo, evidenceType).
 
 >
 
@@ -803,6 +923,12 @@ Define:
 
 **Answer:**
 
+- persistence structure: AITriage table in DB.
+- lifecycle/status: PENDING, FAILED, SUCCESS.
+- retry: with exponential backoff (with DLQ).
+- failure representation: FAILED.
+- relation to Incident/Alert: 1-1 relation with Alert.
+
 >
 
 ---
@@ -816,6 +942,10 @@ Which records are eligible as investigation evidence, how are they retrieved, wh
 
 **Answer:**
 
+- Records shared: Incident table (description, severity), past reviewed postmortem reports of service (summary, impact, rootCause, factors, resolution).
+- Retrieved via repository call.
+- Only reviewed postmortems eligible.
+
 >
 
 ---
@@ -828,6 +958,9 @@ Which records are eligible as investigation evidence, how are they retrieved, wh
 How long are investigation results and evidence retained?
 
 **Answer:**
+
+- Evidence retained till Service exists, for future investigation.
+- Results: deleted periodically (like after 7 days).
 
 >
 
@@ -848,6 +981,13 @@ Define:
 - evaluation execution/reporting format.
 
 **Answer:**
+
+- whether evaluation fixtures live only in the repository or also in the database: also in the database using Evaluation table.
+- what is evaluated: Recurring patterns over multiple incidents of a particular service.
+- retrieval relevance definition: Reviewed by team members and modified accordingly (manually).
+- evidence validity definition: evidence will be factual / inference / unknown but will have a origin (no assumptions).
+- output validity definition: There will be output guardrails, evaluation will be manually reviewed.
+- evaluation execution/reporting format: They may be requested by a service's team members manually, and they will reviewed it.
 
 >
 
@@ -936,20 +1076,20 @@ A slice can move to **READY FOR SLICE SPEC** only when:
 - shared invariants are owned by exactly one slice;
 - the finalized API decisions relevant to the slice are already reflected.
 
-| Slice | Status  | Blocking Questions  |
-| ----- | ------- | ------------------- |
-| 01    | CLOSED  | OPEN-01             |
-| 02    | CLOSED  | OPEN-02             |
-| 03    | PARTIAL | OPEN-13             |
-| 04    | CLOSED  | OPEN-03, OPEN-04    |
-| 05    | READY\* | —                   |
-| 06    | CLOSED  | OPEN-05             |
-| 07    | CLOSED  | OPEN-06–09          |
-| 08    | OPEN    | OPEN-10–13          |
-| 09    | OPEN    | OPEN-14–16          |
-| 10    | OPEN    | OPEN-17–18          |
-| 11    | OPEN    | OPEN-17             |
-| 12    | OPEN    | OPEN-17, OPEN-19–21 |
+| Slice | Status | Blocking Questions  |
+| ----- | ------ | ------------------- |
+| 01    | CLOSED | OPEN-01             |
+| 02    | CLOSED | OPEN-02             |
+| 03    | CLOSED | OPEN-13             |
+| 04    | CLOSED | OPEN-03, OPEN-04    |
+| 05    | CLOSED | —                   |
+| 06    | CLOSED | OPEN-05             |
+| 07    | CLOSED | OPEN-06–09          |
+| 08    | CLOSED | OPEN-10–13          |
+| 09    | CLOSED | OPEN-14–16          |
+| 10    | CLOSED | OPEN-17–18          |
+| 11    | CLOSED | OPEN-17             |
+| 12    | CLOSED | OPEN-17, OPEN-19–21 |
 
 `*` Recheck against canonical design conflicts before freezing the slice.
 

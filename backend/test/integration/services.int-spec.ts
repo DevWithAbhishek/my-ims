@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Client } from 'pg';
+import * as audit from '../../src/infra/audit/append-audit-event';
 import request from 'supertest';
 import { getPrisma } from '../../src/infra/db/prisma';
 import { getRedis } from '../../src/infra/redis/redis';
@@ -1133,5 +1134,114 @@ describe('database constraints and configuration read contract', () => {
     });
     expect(await getServiceConfig(NIL)).toBeNull();
     expect(await getEscalationPolicyByService(NIL)).toBeNull();
+  });
+});
+
+/** Runs the real append, then fails: the transaction must leave neither the change nor the event. */
+function failAfterAudit() {
+  const original = audit.appendAuditEvent;
+  return jest.spyOn(audit, 'appendAuditEvent').mockImplementation(async (tx, input) => {
+    await original(tx, input);
+    throw new Error('injected fault after the audit write');
+  });
+}
+const auditRows = () => getPrisma().auditEvent.findMany({ orderBy: { createdAt: 'asc' } });
+
+describe('S4 and S7 audit events', () => {
+  it('writes no audit event for S1 or S5', async () => {
+    await setup();
+    expect(await auditRows()).toHaveLength(0);
+  });
+
+  it('S4 records SERVICE_UPDATED with the changed field names', async () => {
+    const { admin, service } = await setup();
+    expect((await patchService(admin.token, service.id, { name: 'renamed-svc' })).status).toBe(200);
+    const rows = await auditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      eventType: 'SERVICE_UPDATED',
+      actor: admin.admin.id,
+      incidentId: null,
+      metadata: { serviceId: service.id, changedFields: ['name'] },
+    });
+  });
+
+  it('S4 records only SERVICE_DEACTIVATED when a deactivation also changes other fields', async () => {
+    const { admin, service } = await setup();
+    const res = await patchService(admin.token, service.id, {
+      status: 'DEACTIVATED',
+      name: 'closing-svc',
+    });
+    expect(res.status).toBe(200);
+    const rows = await auditRows();
+    expect(rows.map((r) => r.eventType)).toEqual(['SERVICE_DEACTIVATED']);
+    expect((rows[0].metadata as { changedFields: string[] }).changedFields.sort()).toEqual([
+      'name',
+      'status',
+    ]);
+  });
+
+  it('S4 and S7 write nothing for a no-op, a failed validation or an unknown id', async () => {
+    const { k, admin, service } = await setup();
+    const url = policyUrl(service.id, service.escalationPolicyId);
+    expect((await patchService(admin.token, service.id, { name: service.name })).status).toBe(200);
+    expect((await patchService(admin.token, service.id, { name: '' })).status).toBe(422);
+    expect((await patchService(admin.token, NIL, { name: 'x' })).status).toBe(404);
+    expect(
+      (await request(app).patch(url).set(bearer(admin.token)).send({ level1: k.engineer1.id }))
+        .status,
+    ).toBe(200); // same value as stored
+    expect(
+      (await request(app).patch(url).set(bearer(admin.token)).send({ level1: NIL })).status,
+    ).toBe(403);
+    expect(await auditRows()).toHaveLength(0);
+  });
+
+  it('S7 records ESCALATION_POLICY_UPDATED with the changed level names', async () => {
+    const { k, admin, service } = await setup();
+    const url = policyUrl(service.id, service.escalationPolicyId);
+    const replacement = await createUser({ role: 'ENGINEER', teamId: k.team.id });
+    const newAdmin = await createUser({ role: 'ADMIN' });
+    const res = await request(app)
+      .patch(url)
+      .set(bearer(admin.token))
+      .send({ fallbackAdmin: newAdmin.id, level1: replacement.id });
+    expect(res.status).toBe(200);
+
+    const rows = await auditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      eventType: 'ESCALATION_POLICY_UPDATED',
+      actor: admin.admin.id,
+      incidentId: null,
+      metadata: {
+        escalationPolicyId: service.escalationPolicyId,
+        changedFields: ['level1', 'fallbackAdmin'],
+      },
+    });
+    expect(JSON.stringify(rows[0].metadata)).not.toContain(replacement.id);
+  });
+
+  it('a fault after the audit write leaves neither the change nor the event (S4 and S7)', async () => {
+    const { k, admin, service } = await setup();
+    const url = policyUrl(service.id, service.escalationPolicyId);
+    const replacement = await createUser({ role: 'ENGINEER', teamId: k.team.id });
+
+    const spy = failAfterAudit();
+    expect((await patchService(admin.token, service.id, { name: 'lost-name' })).status).toBe(500);
+    expect(
+      (await request(app).patch(url).set(bearer(admin.token)).send({ level1: replacement.id }))
+        .status,
+    ).toBe(500);
+    expect(spy).toHaveBeenCalled();
+    jest.restoreAllMocks();
+
+    const stored = await getPrisma().appService.findUniqueOrThrow({ where: { id: service.id } });
+    expect(stored.name).toBe(service.name);
+    const policy = await getPrisma().escalationPolicy.findUniqueOrThrow({
+      where: { id: service.escalationPolicyId },
+    });
+    expect(policy.level1Id).toBe(k.engineer1.id);
+    expect(await auditRows()).toHaveLength(0);
   });
 });
