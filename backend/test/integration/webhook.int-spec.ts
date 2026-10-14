@@ -5,7 +5,7 @@ import { createRedisConnection, getRedis } from '../../src/infra/redis/redis';
 import { writeBlockedNotice } from '../../src/modules/alerts/admin-notice';
 import { createRateLimiter, rateLimitKeys } from '../../src/modules/alerts/rate-limiter';
 import { createReplayStore, replayKey } from '../../src/modules/alerts/replay.store';
-import type { VerifiedAlertContext } from '../../src/modules/alerts';
+import type { IngestResponse, VerifiedAlertContext } from '../../src/modules/alerts';
 import { buildTestApp } from '../helpers/app';
 import {
   createAlertSource,
@@ -19,7 +19,7 @@ import {
 } from '../helpers/alert-source';
 import { resetState } from '../helpers/identity';
 
-const ingest = jest.fn<Promise<unknown>, [VerifiedAlertContext]>();
+const ingest = jest.fn<Promise<IngestResponse>, [VerifiedAlertContext]>();
 let app: Express;
 let sourceId: string;
 
@@ -27,7 +27,7 @@ const OK_BODY = { data: { results: [] } };
 
 beforeEach(async () => {
   await resetState();
-  ingest.mockReset().mockResolvedValue(OK_BODY);
+  ingest.mockReset().mockResolvedValue({ statusCode: 200, body: OK_BODY });
   app = buildTestApp(undefined, { ingest });
   sourceId = (await createAlertSource()).id;
 });
@@ -63,10 +63,22 @@ describe('W1 · POST /webhooks/alerts/:alertSourceId', () => {
       });
     });
 
-    it('without ingestion wired (SLICE-04 pending) is answered 501 NOT_IMPLEMENTED', async () => {
+    it('sends the status and body chosen by ingestion as they are', async () => {
+      const rejectedBody = { data: { results: [{ index: 0, outcome: 'REJECTED' }] } };
+      ingest.mockResolvedValue({ statusCode: 400, body: rejectedBody });
+      const res = await postWebhook(app, sourceId, makeAlerts(1));
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual(rejectedBody);
+    });
+
+    it('uses the real ingestion by default: an invalid alert is reported per item', async () => {
       const res = await postWebhook(buildTestApp(), sourceId, makeAlerts(1));
-      expect(res.status).toBe(501);
-      expect(res.body.error).toMatchObject({ code: 'NOT_IMPLEMENTED', details: [] });
+      expect(res.status).toBe(400);
+      expect(res.body.data.results[0]).toMatchObject({
+        index: 0,
+        outcome: 'REJECTED',
+        error: { code: 'ALERT_INVALID' },
+      });
       expect(await getPrisma().alert.count()).toBe(0);
     });
   });

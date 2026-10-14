@@ -1,4 +1,4 @@
-/** The alert source a request was verified against; `configuration` is read by SLICE-04. */
+/** The alert source a request was verified against; `configuration` holds the severity mapping. */
 export type VerifiedAlertSource = {
   id: string;
   name: string;
@@ -6,7 +6,7 @@ export type VerifiedAlertSource = {
   configuration: Record<string, unknown>;
 };
 
-/** What the trust gate hands to ingestion (SLICE-04) once steps 1–6 passed. */
+/** What the trust gate hands to ingestion once steps 1–6 passed. */
 export type VerifiedAlertContext = {
   alertSource: VerifiedAlertSource;
   /** Alert elements in request order, at most 100; validated per alert by ingestion. */
@@ -17,8 +17,8 @@ export type VerifiedAlertContext = {
   requestId: string;
 };
 
-/**
- * The seam SLICE-04 fills: processes a verified request and returns the success response body
- * (sent with status 200).
- */
-export type IngestHandler = (context: VerifiedAlertContext) => Promise<unknown>;
+/** What ingestion answers: the HTTP status (200, or 400 when every alert was rejected) and body. */
+export type IngestResponse = { statusCode: 200 | 400; body: unknown };
+
+/** Processes a verified request (SLICE-04) and returns the response to send. */
+export type IngestHandler = (context: VerifiedAlertContext) => Promise<IngestResponse>;

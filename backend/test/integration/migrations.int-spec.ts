@@ -36,9 +36,23 @@ describe('migrations', () => {
       const indexes = await client.query<{ indexname: string }>(
         "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'",
       );
-      expect(indexes.rows.map((row) => row.indexname)).toEqual(
-        expect.arrayContaining(['uq_alert_source_event_id', 'uq_alert_source_fingerprint']),
+      const names = indexes.rows.map((row) => row.indexname);
+      // SLICE-04: identity may repeat across incidents, so these are lookup indexes, not unique.
+      expect(names).toEqual(
+        expect.arrayContaining([
+          'idx_alert_sourceId_sourceEventId',
+          'idx_alert_sourceId_fingerprint',
+        ]),
       );
+      expect(names).not.toContain('uq_alert_source_event_id');
+      expect(names).not.toContain('uq_alert_source_fingerprint');
+
+      const unique = await client.query<{ indexname: string; indexdef: string }>(
+        `SELECT indexname, indexdef FROM pg_indexes
+         WHERE schemaname = 'public' AND indexname LIKE 'idx_alert_sourceId_%'`,
+      );
+      expect(unique.rows).toHaveLength(2);
+      for (const row of unique.rows) expect(row.indexdef).not.toMatch(/UNIQUE/i);
     } finally {
       await client.end();
     }

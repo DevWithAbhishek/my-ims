@@ -5,7 +5,7 @@ import type { IngestHandler } from './webhook.types.js';
 
 export type WebhookDeps = TrustGateDeps & { ingest: IngestHandler };
 
-/** W1: the trust gate (steps 1–6), then the verified context goes to ingestion (SLICE-04). */
+/** W1: the trust gate (steps 1–6), then the verified context goes to ingestion. */
 export function createWebhookHandler(deps: WebhookDeps): RequestHandler {
   return async (req, res) => {
     const context = await runTrustGate(
@@ -19,6 +19,7 @@ export function createWebhookHandler(deps: WebhookDeps): RequestHandler {
       },
       deps,
     );
-    res.status(200).json(await deps.ingest(context));
+    const { statusCode, body } = await deps.ingest(context);
+    res.status(statusCode).json(body);
   };
 }

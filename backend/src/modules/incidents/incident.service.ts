@@ -7,10 +7,14 @@ import type { ListIncidentsQuery } from './incident.schema.js';
 import {
   findFeedIncidentIds,
   findIncidentDetail,
+  findIncidentScope,
   findListRows,
   findTriageByAlertId,
+  insertIncident,
+  lockTeamForShare,
+  type NewIncident,
 } from './incident.repository.js';
-import { assertIncidentAccess } from './incidents.common.js';
+import { assertIncidentAccess, type Db } from './incidents.common.js';
 import type { IncidentDetailResponse, IncidentListItem } from './incidents.types.js';
 
 export type IncidentFeedPage = {
@@ -76,4 +80,26 @@ export async function getIncident(
   const latestAlert = row.alert.at(-1);
   const triage = latestAlert ? await findTriageByAlertId(db, latestAlert.id) : null;
   return toIncidentDetail(row, triage, new Date());
+}
+
+/**
+ * Creates an `OPEN` incident on the caller's transaction (alert ingestion, SLICE-04). The team and
+ * service are the service's own, chosen by the caller of this function, never by a client.
+ */
+export async function createIncident(tx: Db, input: NewIncident): Promise<{ id: string }> {
+  await lockTeamForShare(tx, input.teamId);
+  return insertIncident(tx, input);
+}
+
+/**
+ * Gates for incident-scoped reads owned by other modules: the caller needs a team
+ * (`403 INVALID_ACTION`), the incident must exist (`404`) and belong to that team (`403`).
+ */
+export async function assertCanAccessIncident(
+  auth: AuthContext,
+  incidentId: string,
+): Promise<void> {
+  requireTeam(auth);
+  const scope = await findIncidentScope(getPrisma(), incidentId);
+  assertIncidentAccess(auth, scope);
 }

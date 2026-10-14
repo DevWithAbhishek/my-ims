@@ -99,6 +99,30 @@ export function findTriageByAlertId(db: Db, alertId: string) {
   });
 }
 
+export type NewIncident = {
+  title: string;
+  description: string;
+  severity: Severity;
+  teamId: string;
+  affectedServiceId: string;
+};
+
+/**
+ * Takes a `FOR SHARE` lock on the team row, so a concurrent team deactivation (which checks for
+ * unresolved incidents under `FOR UPDATE`) waits for the transaction that creates the incident.
+ */
+export async function lockTeamForShare(db: Db, teamId: string): Promise<void> {
+  await db.$queryRaw(Prisma.sql`SELECT "id" FROM "Team" WHERE "id" = ${teamId}::uuid FOR SHARE`);
+}
+
+/** Inserts an `OPEN` incident; assignee, acknowledgement, resolution and closure stay `NULL`. */
+export async function insertIncident(db: Db, data: NewIncident): Promise<{ id: string }> {
+  return db.incident.create({
+    data: { ...data, status: 'OPEN' },
+    select: { id: true },
+  });
+}
+
 export function findIncidentScope(db: Db, id: string): Promise<IncidentScope | null> {
   return db.incident.findUnique({ where: { id }, select: { teamId: true, status: true } });
 }
