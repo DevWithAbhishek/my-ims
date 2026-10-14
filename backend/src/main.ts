@@ -5,6 +5,7 @@ import { getConfig } from './config/env.js';
 import { disconnectPrisma, pingDatabase } from './infra/db/prisma.js';
 import { buildReadinessChecks } from './infra/readiness.js';
 import { closeRedis, pingRedis } from './infra/redis/redis.js';
+import { createWebhookRouter } from './modules/alerts/index.js';
 import { onShutdownSignal } from './shared/lifecycle/shutdown.js';
 import { logger } from './shared/observability/logger.js';
 
@@ -17,6 +18,7 @@ async function main(): Promise<void> {
   const app = createApp({
     readinessChecks: buildReadinessChecks(),
     apiRouter: createApiRouter(),
+    webhookRouter: createWebhookRouter(),
   });
   // Express 5 passes a listen failure (e.g. EADDRINUSE) to this callback.
   const server = await new Promise<Server>((resolve, reject) => {

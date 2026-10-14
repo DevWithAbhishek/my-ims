@@ -1,0 +1,2723 @@
+diff --git a/backend/.env.example b/backend/.env.example
+index 99313bb..6683f66 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -57,3 +57,13 @@ JOBS_RATE_POSTMORTEM_MAX=5
+ JOBS_RATE_POSTMORTEM_DURATION_MS=1000
+ JOBS_RATE_INVESTIGATION_MAX=5
+ JOBS_RATE_INVESTIGATION_DURATION_MS=1000
++
++# --- Alert source seed (npm run seed:alert-source, SLICE-03) -----------------------
++# The id identifies the source: re-running the seed with the same id updates its configuration
++# (and audits the change); a new id creates another source. The signing secret must be at least
++# 32 characters; use a real secret per environment, never commit it.
++SEED_ALERT_SOURCE_ID=0192b5e0-7c1a-7d2e-8f3b-4a5c6d7e8f90
++SEED_ALERT_SOURCE_NAME="Generic alert source"
++SEED_ALERT_SOURCE_SIGNING_SECRET=change-me-development-only-signing-secret
++# Optional JSON; defaults to {"critical":"P0","high":"P1","warning":"P2","info":"P3"}.
++# SEED_ALERT_SOURCE_SEVERITY_MAPPING={"critical":"P0","high":"P1","warning":"P2","info":"P3"}
+diff --git a/backend/package.json b/backend/package.json
+index 42a70f7..05f726a 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -9,6 +9,7 @@
+     "start": "node dist/main.js",
+     "start:worker": "node dist/worker.js",
+     "seed:admin": "tsx src/scripts/seed-admin.ts",
++    "seed:alert-source": "tsx src/scripts/seed-alert-source.ts",
+     "redrive:outbox": "tsx src/scripts/redrive-outbox.ts",
+     "typecheck": "tsc -p tsconfig.json --noEmit",
+     "test": "jest --config jest.config.js",
+diff --git a/backend/src/app.spec.ts b/backend/src/app.spec.ts
+index c3e1d8f..d487bf6 100644
+--- a/backend/src/app.spec.ts
++++ b/backend/src/app.spec.ts
+@@ -124,4 +124,26 @@ describe('createApp', () => {
+       expect(res.headers['x-request-id']).toBe('abc-1');
+     });
+   });
++  describe('webhookRouter', () => {
++    const webhookRouter = Router();
++    webhookRouter.post('/webhooks/probe', (req, res) => {
++      // Mounted before the JSON parser: the stream is still unread and `req.body` is not set.
++      res.json({ parsed: req.body !== undefined, hasStream: req.readable });
++    });
++    const app = createApp({ readinessChecks: [], webhookRouter });
++
++    it('is mounted at the root, ahead of the JSON body parser and its limit', async () => {
++      const res = await request(app)
++        .post('/webhooks/probe')
++        .set('Content-Type', 'application/json')
++        .send({ blob: 'x'.repeat(200 * 1024) });
++      expect(res.status).toBe(200);
++      expect(res.body).toEqual({ parsed: false, hasStream: true });
++    });
++
++    it('is optional', async () => {
++      const res = await request(createApp({ readinessChecks: [] })).post('/webhooks/probe');
++      expect(res.status).toBe(404);
++    });
++  });
+ });
+diff --git a/backend/src/app.ts b/backend/src/app.ts
+index 676e4d7..97dd349 100644
+--- a/backend/src/app.ts
++++ b/backend/src/app.ts
+@@ -10,13 +10,23 @@ export type AppOptions = {
+   readinessChecks: ReadinessCheck[];
+   /** Router mounted at `/api/v1`; feature slices register their routes on it. */
+   apiRouter?: Router;
++  /**
++   * Routes mounted at the root, before the JSON body parser: the alert webhook needs the raw
++   * request bytes and its own size limit.
++   */
++  webhookRouter?: Router;
+ };
+ 
+-export function createApp({ readinessChecks, apiRouter = Router() }: AppOptions): Express {
++export function createApp({
++  readinessChecks,
++  apiRouter = Router(),
++  webhookRouter,
++}: AppOptions): Express {
+   const app = express();
+ 
+   app.use(requestMiddleware);
+   app.use(httpLogger);
++  if (webhookRouter) app.use(webhookRouter);
+   app.use(express.json({ limit: JSON_BODY_LIMIT }));
+ 
+   app.use(createHealthRouter(readinessChecks));
+diff --git a/backend/src/main.ts b/backend/src/main.ts
+index 67d4246..eeb17b2 100644
+--- a/backend/src/main.ts
++++ b/backend/src/main.ts
+@@ -5,6 +5,7 @@ import { getConfig } from './config/env.js';
+ import { disconnectPrisma, pingDatabase } from './infra/db/prisma.js';
+ import { buildReadinessChecks } from './infra/readiness.js';
+ import { closeRedis, pingRedis } from './infra/redis/redis.js';
++import { createWebhookRouter } from './modules/alerts/index.js';
+ import { onShutdownSignal } from './shared/lifecycle/shutdown.js';
+ import { logger } from './shared/observability/logger.js';
+ 
+@@ -17,6 +18,7 @@ async function main(): Promise<void> {
+   const app = createApp({
+     readinessChecks: buildReadinessChecks(),
+     apiRouter: createApiRouter(),
++    webhookRouter: createWebhookRouter(),
+   });
+   // Express 5 passes a listen failure (e.g. EADDRINUSE) to this callback.
+   const server = await new Promise<Server>((resolve, reject) => {
+diff --git a/backend/src/modules/alerts/admin-notice.ts b/backend/src/modules/alerts/admin-notice.ts
+new file mode 100644
+index 0000000..4bfaacd
+--- /dev/null
++++ b/backend/src/modules/alerts/admin-notice.ts
+@@ -0,0 +1,32 @@
++import { runInTransaction } from '../../infra/db/prisma.js';
++import { enqueueOutbox, OUTBOX_EVENT_TYPES } from '../../infra/jobs/index.js';
++
++export const ALERT_SOURCE_BLOCKED = 'ALERT_SOURCE_BLOCKED';
++
++export type BlockedNotice = {
++  alertSourceId: string;
++  attemptCount: number;
++  requestId: string;
++};
++
++/**
++ * Final stage of the rate-limit ladder: asks (through the outbox, never a direct publish) for all
++ * active Admins to be told that the source is blocked. Own small transaction; the payload carries
++ * ids and the minimum facts only. Recipients are resolved at delivery (SLICE-09); nothing is
++ * written to any incident timeline.
++ */
++export function writeBlockedNotice(notice: BlockedNotice): Promise<void> {
++  return runInTransaction(async (tx) => {
++    await enqueueOutbox(tx, {
++      eventType: OUTBOX_EVENT_TYPES.NOTIFICATION_REQUESTED,
++      aggregateType: 'ALERT_SOURCE',
++      aggregateId: notice.alertSourceId,
++      payload: {
++        kind: ALERT_SOURCE_BLOCKED,
++        alertSourceId: notice.alertSourceId,
++        attemptCount: notice.attemptCount,
++        requestId: notice.requestId,
++      },
++    });
++  });
++}
+diff --git a/backend/src/modules/alerts/envelope.spec.ts b/backend/src/modules/alerts/envelope.spec.ts
+new file mode 100644
+index 0000000..ff419a7
+--- /dev/null
++++ b/backend/src/modules/alerts/envelope.spec.ts
+@@ -0,0 +1,87 @@
++import { countAlerts, parseJsonBody, validateEnvelope } from './envelope.js';
++
++const JSON_TYPE = 'application/json';
++const body = (value: unknown) => parseJsonBody(Buffer.from(JSON.stringify(value)));
++const alerts = (n: number) => Array.from({ length: n }, (_, i) => ({ i }));
++
++function failure(contentType: string | undefined, parsed: ReturnType<typeof parseJsonBody>) {
++  try {
++    validateEnvelope(contentType, parsed);
++  } catch (error) {
++    return error as { statusCode: number; code: string; details: unknown[] };
++  }
++  throw new Error('expected a failure');
++}
++
++describe('countAlerts', () => {
++  it('counts the elements of an alerts array', () => {
++    expect(countAlerts(body({ alerts: alerts(7) }))).toBe(7);
++  });
++
++  it.each([
++    ['malformed JSON', parseJsonBody(Buffer.from('{nope'))],
++    ['empty body', parseJsonBody(Buffer.alloc(0))],
++    ['non-object body', body([1, 2])],
++    ['missing alerts', body({})],
++    ['alerts not an array', body({ alerts: 'x' })],
++  ])('is 0 for %s', (_name, parsed) => {
++    expect(countAlerts(parsed)).toBe(0);
++  });
++});
++
++describe('validateEnvelope', () => {
++  it('returns the alerts in request order', () => {
++    expect(validateEnvelope(JSON_TYPE, body({ alerts: alerts(3) }))).toEqual(alerts(3));
++  });
++
++  it('accepts a charset parameter and any case, and 100 alerts', () => {
++    expect(
++      validateEnvelope('Application/JSON; charset=utf-8', body({ alerts: alerts(100) })),
++    ).toHaveLength(100);
++  });
++
++  it.each([undefined, '', 'text/plain', 'application/x-www-form-urlencoded'])(
++    'Content-Type %p → 400 BAD_REQUEST',
++    (contentType) => {
++      expect(failure(contentType, body({ alerts: alerts(1) }))).toMatchObject({
++        statusCode: 400,
++        code: 'BAD_REQUEST',
++      });
++    },
++  );
++
++  it('checks Content-Type before the body', () => {
++    expect(failure(undefined, parseJsonBody(Buffer.from('{nope')))).toMatchObject({
++      statusCode: 400,
++    });
++  });
++
++  it('101 alerts → 400 BAD_REQUEST', () => {
++    expect(failure(JSON_TYPE, body({ alerts: alerts(101) }))).toMatchObject({
++      statusCode: 400,
++      code: 'BAD_REQUEST',
++      details: [{ field: 'alerts', issue: 'At most 100 alerts per request' }],
++    });
++  });
++
++  it('an unknown top-level field → 400 BAD_REQUEST naming the field', () => {
++    expect(failure(JSON_TYPE, body({ alerts: alerts(1), extra: 1 }))).toMatchObject({
++      statusCode: 400,
++      details: [{ field: 'extra', issue: 'Unknown field' }],
++    });
++  });
++
++  it.each([
++    ['malformed JSON', parseJsonBody(Buffer.from('{nope')), 'body'],
++    ['a non-object body', body([]), 'body'],
++    ['a missing alerts', body({}), 'alerts'],
++    ['alerts that is not an array', body({ alerts: {} }), 'alerts'],
++    ['an empty alerts', body({ alerts: [] }), 'alerts'],
++  ])('%s → 422 VALIDATION_FAILED', (_name, parsed, field) => {
++    expect(failure(JSON_TYPE, parsed)).toMatchObject({
++      statusCode: 422,
++      code: 'VALIDATION_FAILED',
++      details: [{ field }],
++    });
++  });
++});
+diff --git a/backend/src/modules/alerts/envelope.ts b/backend/src/modules/alerts/envelope.ts
+new file mode 100644
+index 0000000..5fe123b
+--- /dev/null
++++ b/backend/src/modules/alerts/envelope.ts
+@@ -0,0 +1,67 @@
++import { BadRequestError, ValidationError } from '../../shared/errors/AppError.js';
++import { WEBHOOK } from './webhook.config.js';
++
++export type ParsedBody = { ok: true; value: unknown } | { ok: false };
++
++export function parseJsonBody(rawBody: Buffer): ParsedBody {
++  try {
++    return { ok: true, value: JSON.parse(rawBody.toString('utf8')) as unknown };
++  } catch {
++    return { ok: false };
++  }
++}
++
++function isPlainObject(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++/** The number of alerts to count against the rate limit; `0` when there is nothing to count. */
++export function countAlerts(body: ParsedBody): number {
++  if (!body.ok || !isPlainObject(body.value)) return 0;
++  const { alerts } = body.value;
++  return Array.isArray(alerts) ? alerts.length : 0;
++}
++
++function isJsonContentType(contentType: string): boolean {
++  return contentType.split(';')[0]?.trim().toLowerCase() === 'application/json';
++}
++
++function invalid(field: string, issue: string): ValidationError {
++  return new ValidationError('Request validation failed', 'VALIDATION_FAILED', [{ field, issue }]);
++}
++
++/**
++ * Step 6: the envelope `{ "alerts": [...] }`. A missing or non-JSON `Content-Type`, an unknown
++ * top-level field or more than 100 alerts is `400 BAD_REQUEST`; malformed JSON and a missing,
++ * non-array or empty `alerts` is `422 VALIDATION_FAILED`. Returns the alerts in request order.
++ */
++export function validateEnvelope(contentType: string | undefined, body: ParsedBody): unknown[] {
++  if (contentType === undefined || contentType.trim() === '') {
++    throw new BadRequestError('Content-Type header is required');
++  }
++  if (!isJsonContentType(contentType)) {
++    throw new BadRequestError('Content-Type must be application/json');
++  }
++  if (!body.ok) throw invalid('body', 'Body is not valid JSON');
++  if (!isPlainObject(body.value)) throw invalid('body', 'Body must be a JSON object');
++
++  const unknownFields = Object.keys(body.value).filter((key) => key !== 'alerts');
++  if (unknownFields.length > 0) {
++    throw new BadRequestError(
++      'Request contains unknown fields',
++      'BAD_REQUEST',
++      unknownFields.map((field) => ({ field, issue: 'Unknown field' })),
++    );
++  }
++
++  const { alerts } = body.value;
++  if (alerts === undefined) throw invalid('alerts', 'Required');
++  if (!Array.isArray(alerts)) throw invalid('alerts', 'Must be an array');
++  if (alerts.length === 0) throw invalid('alerts', 'Must contain at least one alert');
++  if (alerts.length > WEBHOOK.maxAlertsPerRequest) {
++    throw new BadRequestError('Too many alerts in one request', 'BAD_REQUEST', [
++      { field: 'alerts', issue: `At most ${WEBHOOK.maxAlertsPerRequest} alerts per request` },
++    ]);
++  }
++  return alerts as unknown[];
++}
+diff --git a/backend/src/modules/alerts/index.ts b/backend/src/modules/alerts/index.ts
+new file mode 100644
+index 0000000..da7064b
+--- /dev/null
++++ b/backend/src/modules/alerts/index.ts
+@@ -0,0 +1,10 @@
++export { createWebhookRouter } from './webhook.routes.js';
++export type { WebhookDeps } from './webhook.controller.js';
++export {
++  DEFAULT_SEVERITY_MAPPING,
++  seedAlertSource,
++  type SeedAlertSourceInput,
++  type SeedAlertSourceResult,
++  type SeverityMapping,
++} from './seed-alert-source.js';
++export type { IngestHandler, VerifiedAlertContext, VerifiedAlertSource } from './webhook.types.js';
+diff --git a/backend/src/modules/alerts/ingest.placeholder.ts b/backend/src/modules/alerts/ingest.placeholder.ts
+new file mode 100644
+index 0000000..904bc35
+--- /dev/null
++++ b/backend/src/modules/alerts/ingest.placeholder.ts
+@@ -0,0 +1,15 @@
++import { AppError } from '../../shared/errors/AppError.js';
++import type { IngestHandler } from './webhook.types.js';
++
++/**
++ * Used until SLICE-04 provides ingestion: a request that passed the trust gate is answered
++ * `501 NOT_IMPLEMENTED`, so a sender never believes alerts were accepted when nothing stored them.
++ */
++export const ingestNotImplemented: IngestHandler = () =>
++  Promise.reject(
++    new AppError({
++      statusCode: 501,
++      code: 'NOT_IMPLEMENTED',
++      message: 'Alert ingestion is not available yet',
++    }),
++  );
+diff --git a/backend/src/modules/alerts/rate-limiter.spec.ts b/backend/src/modules/alerts/rate-limiter.spec.ts
+new file mode 100644
+index 0000000..a8a8d16
+--- /dev/null
++++ b/backend/src/modules/alerts/rate-limiter.spec.ts
+@@ -0,0 +1,24 @@
++import { SOURCE_RATE_LIMIT } from './webhook.config.js';
++import { blockForViolation } from './rate-limiter.js';
++
++const MIN = 60_000;
++
++describe('blockForViolation', () => {
++  it('escalates 5 min → 20 min → 45 min → 2 h', () => {
++    expect([1, 2, 3, 4].map((n) => blockForViolation(n))).toEqual([
++      { durationMs: 5 * MIN, finalStage: false },
++      { durationMs: 20 * MIN, finalStage: false },
++      { durationMs: 45 * MIN, finalStage: false },
++      { durationMs: 120 * MIN, finalStage: false },
++    ]);
++  });
++
++  it('the fifth violation (and every later one) is the final stage', () => {
++    for (const n of [5, 6, 20]) {
++      expect(blockForViolation(n)).toEqual({
++        durationMs: SOURCE_RATE_LIMIT.finalBlockMs,
++        finalStage: true,
++      });
++    }
++  });
++});
+diff --git a/backend/src/modules/alerts/rate-limiter.ts b/backend/src/modules/alerts/rate-limiter.ts
+new file mode 100644
+index 0000000..0627e72
+--- /dev/null
++++ b/backend/src/modules/alerts/rate-limiter.ts
+@@ -0,0 +1,155 @@
++import type { Redis } from 'ioredis';
++import { getRedis } from '../../infra/redis/redis.js';
++import { logger } from '../../shared/observability/logger.js';
++import { SOURCE_RATE_LIMIT } from './webhook.config.js';
++import { dependencyUnavailable } from './webhook.errors.js';
++
++export type RateLimitOutcome =
++  /** `allowed` of the request's alerts fit in the window (`0` when there was nothing to count). */
++  | { kind: 'ALLOWED'; allowed: number }
++  /** The source is blocked; `retryAfterMs` is what is left of the block. */
++  | { kind: 'BLOCKED'; retryAfterMs: number }
++  /** No capacity was left: this request started a block (the ladder moved up one step). */
++  | { kind: 'VIOLATION'; retryAfterMs: number; attemptCount: number; finalStage: boolean };
++
++export interface RateLimiter {
++  /** Atomically checks the block, counts up to `alertCount` alerts and escalates on a violation. */
++  consume(alertSourceId: string, alertCount: number): Promise<RateLimitOutcome>;
++  /**
++   * Takes the right to write the Admin notice of the current block when it is still unwritten;
++   * returns the number of violations, or `null` when there is nothing to write or someone else is.
++   */
++  claimPendingNotice(alertSourceId: string): Promise<number | null>;
++  /** Records that the notice of the current block was written. */
++  acknowledgeNotice(alertSourceId: string): Promise<void>;
++}
++
++/** The block the n-th consecutive violation (1-based) starts, and whether it is the final stage. */
++export function blockForViolation(violation: number): { durationMs: number; finalStage: boolean } {
++  const step = SOURCE_RATE_LIMIT.blockStepsMs[violation - 1];
++  return step === undefined
++    ? { durationMs: SOURCE_RATE_LIMIT.finalBlockMs, finalStage: true }
++    : { durationMs: step, finalStage: false };
++}
++
++export function rateLimitKeys(alertSourceId: string) {
++  return {
++    block: `wh:rl:block:${alertSourceId}`,
++    count: `wh:rl:count:${alertSourceId}`,
++    level: `wh:rl:level:${alertSourceId}`,
++    notice: `wh:rl:notice:${alertSourceId}`,
++    noticeLock: `wh:rl:notice-lock:${alertSourceId}`,
++  };
++}
++
++/**
++ * KEYS: block, count, level, notice, notice lock.
++ * ARGV: alerts in the request, capacity, window ms, ladder memory ms, notice lock ms, final block
++ * ms, then the block of each ladder step in ms.
++ * Returns {status, allowed, retryAfterMs, level, finalStage}; status 0 = counted, 1 = new block,
++ * 2 = already blocked.
++ */
++const CONSUME_SCRIPT = `
++local blockTtl = redis.call('PTTL', KEYS[1])
++if blockTtl > 0 then return {2, 0, blockTtl, 0, 0} end
++local n = tonumber(ARGV[1])
++if n <= 0 then return {0, 0, 0, 0, 0} end
++local used = tonumber(redis.call('GET', KEYS[2]) or '0')
++local remaining = tonumber(ARGV[2]) - used
++if remaining <= 0 then
++  local level = redis.call('INCR', KEYS[3])
++  redis.call('PEXPIRE', KEYS[3], ARGV[4])
++  local steps = #ARGV - 6
++  local ms = tonumber(ARGV[6])
++  local final = 1
++  if level <= steps then
++    ms = tonumber(ARGV[6 + level])
++    final = 0
++  end
++  redis.call('SET', KEYS[1], tostring(level), 'PX', ms)
++  redis.call('DEL', KEYS[2])
++  if final == 1 then
++    redis.call('SET', KEYS[4], 'pending:' .. level, 'PX', ms)
++    redis.call('SET', KEYS[5], '1', 'PX', ARGV[5])
++  end
++  return {1, 0, ms, level, final}
++end
++local allowed = math.min(n, remaining)
++local count = redis.call('INCRBY', KEYS[2], allowed)
++if count == allowed then redis.call('PEXPIRE', KEYS[2], ARGV[3]) end
++return {0, allowed, 0, 0, 0}
++`;
++
++/** KEYS: notice, notice lock. ARGV: lock ms. */
++const CLAIM_SCRIPT = `
++local value = redis.call('GET', KEYS[1])
++if not value or string.sub(value, 1, 8) ~= 'pending:' then return false end
++if redis.call('SET', KEYS[2], '1', 'NX', 'PX', ARGV[1]) then
++  return tonumber(string.sub(value, 9))
++end
++return false
++`;
++
++/** KEYS: notice. */
++const ACKNOWLEDGE_SCRIPT = `
++local value = redis.call('GET', KEYS[1])
++if value and string.sub(value, 1, 8) == 'pending:' then
++  redis.call('SET', KEYS[1], 'sent:' .. string.sub(value, 9), 'KEEPTTL')
++end
++return 1
++`;
++
++export function createRateLimiter(redis?: Redis): RateLimiter {
++  const client = () => redis ?? getRedis();
++
++  return {
++    async consume(alertSourceId, alertCount) {
++      const keys = rateLimitKeys(alertSourceId);
++      let reply: number[];
++      try {
++        reply = (await client().eval(
++          CONSUME_SCRIPT,
++          5,
++          keys.block,
++          keys.count,
++          keys.level,
++          keys.notice,
++          keys.noticeLock,
++          alertCount,
++          SOURCE_RATE_LIMIT.alertsPerWindow,
++          SOURCE_RATE_LIMIT.windowMs,
++          SOURCE_RATE_LIMIT.ladderMemoryMs,
++          SOURCE_RATE_LIMIT.noticeLockMs,
++          SOURCE_RATE_LIMIT.finalBlockMs,
++          ...SOURCE_RATE_LIMIT.blockStepsMs,
++        )) as number[];
++      } catch (err) {
++        logger.warn({ err }, 'Source rate limiter unavailable');
++        throw dependencyUnavailable();
++      }
++
++      const [status, allowed = 0, retryAfterMs = 0, level = 0, final = 0] = reply;
++      if (status === 2) return { kind: 'BLOCKED', retryAfterMs };
++      if (status === 1) {
++        return { kind: 'VIOLATION', retryAfterMs, attemptCount: level, finalStage: final === 1 };
++      }
++      return { kind: 'ALLOWED', allowed };
++    },
++
++    async claimPendingNotice(alertSourceId) {
++      const keys = rateLimitKeys(alertSourceId);
++      const claimed = await client().eval(
++        CLAIM_SCRIPT,
++        2,
++        keys.notice,
++        keys.noticeLock,
++        SOURCE_RATE_LIMIT.noticeLockMs,
++      );
++      return typeof claimed === 'number' ? claimed : null;
++    },
++
++    async acknowledgeNotice(alertSourceId) {
++      await client().eval(ACKNOWLEDGE_SCRIPT, 1, rateLimitKeys(alertSourceId).notice);
++    },
++  };
++}
+diff --git a/backend/src/modules/alerts/raw-body.spec.ts b/backend/src/modules/alerts/raw-body.spec.ts
+new file mode 100644
+index 0000000..792bbf4
+--- /dev/null
++++ b/backend/src/modules/alerts/raw-body.spec.ts
+@@ -0,0 +1,75 @@
++import http from 'node:http';
++import type { AddressInfo } from 'node:net';
++import express from 'express';
++import request from 'supertest';
++import { errorMappingMiddleware } from '../../shared/middleware/error-mapping.js';
++import { logger } from '../../shared/observability/logger.js';
++import { captureRawBody, RAW_BODY_KEY } from './raw-body.js';
++
++logger.level = 'silent';
++
++const LIMIT = 1024;
++
++function buildApp() {
++  const app = express();
++  app.post('/raw', captureRawBody(LIMIT), (_req, res) => {
++    const raw = res.locals[RAW_BODY_KEY] as Buffer;
++    res.json({ length: raw.length, text: raw.toString('utf8') });
++  });
++  app.use(errorMappingMiddleware);
++  return app;
++}
++
++describe('captureRawBody', () => {
++  it('captures the exact bytes, whatever the content type', async () => {
++    const res = await request(buildApp())
++      .post('/raw')
++      .set('Content-Type', 'text/plain')
++      .send('{ "a" :  1 }');
++    expect(res.body).toEqual({ length: 12, text: '{ "a" :  1 }' });
++  });
++
++  it('accepts an empty body', async () => {
++    const res = await request(buildApp()).post('/raw');
++    expect(res.status).toBe(200);
++    expect(res.body.length).toBe(0);
++  });
++
++  it('accepts a body of exactly the limit', async () => {
++    const res = await request(buildApp()).post('/raw').send('x'.repeat(LIMIT));
++    expect(res.status).toBe(200);
++    expect(res.body.length).toBe(LIMIT);
++  });
++
++  it('rejects a body one byte over the limit with 413 PAYLOAD_TOO_LARGE', async () => {
++    const res = await request(buildApp())
++      .post('/raw')
++      .send('x'.repeat(LIMIT + 1));
++    expect(res.status).toBe(413);
++    expect(res.body.error).toMatchObject({ code: 'PAYLOAD_TOO_LARGE', details: [] });
++  });
++
++  it('stops a chunked body (no Content-Length) once it passes the limit', async () => {
++    const server = buildApp().listen(0);
++    try {
++      const { port } = server.address() as AddressInfo;
++      const status = await new Promise<number>((resolve, reject) => {
++        const req = http.request(
++          { port, method: 'POST', path: '/raw', headers: { 'Transfer-Encoding': 'chunked' } },
++          (res) => {
++            res.resume();
++            resolve(res.statusCode ?? 0);
++          },
++        );
++        req.on('error', reject);
++        req.write('x'.repeat(LIMIT));
++        req.write('y'); // one byte over
++        req.end();
++      });
++      expect(status).toBe(413);
++    } finally {
++      server.close();
++      server.closeAllConnections();
++    }
++  });
++});
+diff --git a/backend/src/modules/alerts/raw-body.ts b/backend/src/modules/alerts/raw-body.ts
+new file mode 100644
+index 0000000..2b62d6f
+--- /dev/null
++++ b/backend/src/modules/alerts/raw-body.ts
+@@ -0,0 +1,67 @@
++import type { Request, RequestHandler, Response, NextFunction } from 'express';
++import { PayloadTooLargeError } from '../../shared/errors/AppError.js';
++import { WEBHOOK } from './webhook.config.js';
++
++/** `res.locals` key under which the request's raw bytes are stored. */
++export const RAW_BODY_KEY = 'rawBody';
++
++function rejectOversize(req: Request, res: Response, next: NextFunction): void {
++  // Stop buffering: whatever is still arriving is read and discarded, then the connection closes.
++  res.setHeader('Connection', 'close');
++  req.resume();
++  next(new PayloadTooLargeError('The request body exceeds the 1 MB limit', 'PAYLOAD_TOO_LARGE'));
++}
++
++/**
++ * Captures the raw request bytes (the signature is computed over them, so the body must not be
++ * parsed or re-serialized) without ever holding more than `maxBytes`. Mounted before any JSON
++ * parser. An oversize body is `413 PAYLOAD_TOO_LARGE`, decided from `Content-Length` when present.
++ */
++export function captureRawBody(maxBytes: number = WEBHOOK.maxBodyBytes): RequestHandler {
++  return (req, res, next) => {
++    const declared = Number(req.headers['content-length']);
++    if (Number.isFinite(declared) && declared > maxBytes) {
++      rejectOversize(req, res, next);
++      return;
++    }
++
++    const chunks: Buffer[] = [];
++    let received = 0;
++    let finished = false;
++
++    const stopListening = () => {
++      finished = true;
++      req.off('data', onData);
++      req.off('end', onEnd);
++      req.off('error', onError);
++      req.off('close', onClose);
++    };
++    const onData = (chunk: Buffer) => {
++      received += chunk.length;
++      if (received > maxBytes) {
++        stopListening();
++        chunks.length = 0;
++        rejectOversize(req, res, next);
++        return;
++      }
++      chunks.push(chunk);
++    };
++    const onEnd = () => {
++      stopListening();
++      res.locals[RAW_BODY_KEY] = Buffer.concat(chunks, received);
++      next();
++    };
++    const onError = (error: Error) => {
++      stopListening();
++      next(error);
++    };
++    const onClose = () => {
++      if (!finished) stopListening(); // the client went away; nobody is left to answer
++    };
++
++    req.on('data', onData);
++    req.on('end', onEnd);
++    req.on('error', onError);
++    req.on('close', onClose);
++  };
++}
+diff --git a/backend/src/modules/alerts/replay.store.ts b/backend/src/modules/alerts/replay.store.ts
+new file mode 100644
+index 0000000..1702c46
+--- /dev/null
++++ b/backend/src/modules/alerts/replay.store.ts
+@@ -0,0 +1,37 @@
++import type { Redis } from 'ioredis';
++import { getRedis } from '../../infra/redis/redis.js';
++import { logger } from '../../shared/observability/logger.js';
++import { dependencyUnavailable } from './webhook.errors.js';
++import { WEBHOOK } from './webhook.config.js';
++
++export interface ReplayStore {
++  /**
++   * Atomically records the signature; `true` when it had not been seen. Fails closed
++   * (`503 DEPENDENCY_UNAVAILABLE`) when Redis cannot be reached.
++   */
++  markSeen(alertSourceId: string, signatureHex: string): Promise<boolean>;
++}
++
++export function replayKey(alertSourceId: string, signatureHex: string): string {
++  return `wh:replay:${alertSourceId}:${signatureHex}`;
++}
++
++export function createReplayStore(redis?: Redis): ReplayStore {
++  return {
++    async markSeen(alertSourceId, signatureHex) {
++      try {
++        const stored = await (redis ?? getRedis()).set(
++          replayKey(alertSourceId, signatureHex),
++          '1',
++          'EX',
++          WEBHOOK.replayTtlSeconds,
++          'NX',
++        );
++        return stored === 'OK';
++      } catch (err) {
++        logger.warn({ err }, 'Replay store unavailable');
++        throw dependencyUnavailable();
++      }
++    },
++  };
++}
+diff --git a/backend/src/modules/alerts/seed-alert-source.spec.ts b/backend/src/modules/alerts/seed-alert-source.spec.ts
+new file mode 100644
+index 0000000..4dba1e3
+--- /dev/null
++++ b/backend/src/modules/alerts/seed-alert-source.spec.ts
+@@ -0,0 +1,49 @@
++import { changedConfigurationKeys, DEFAULT_SEVERITY_MAPPING } from './seed-alert-source.js';
++
++describe('DEFAULT_SEVERITY_MAPPING', () => {
++  it('maps critical/high/warning/info to P0..P3', () => {
++    expect(DEFAULT_SEVERITY_MAPPING).toEqual({
++      critical: 'P0',
++      high: 'P1',
++      warning: 'P2',
++      info: 'P3',
++    });
++  });
++});
++
++describe('changedConfigurationKeys', () => {
++  const current = {
++    signingSecret: 's1',
++    severityMapping: { critical: 'P0', high: 'P1' },
++    extra: 1,
++  };
++
++  it('is empty when nothing changed, whatever the key order', () => {
++    expect(
++      changedConfigurationKeys(current, {
++        ...current,
++        severityMapping: { high: 'P1', critical: 'P0' },
++      }),
++    ).toEqual([]);
++  });
++
++  it('names a rotated secret without its value', () => {
++    const keys = changedConfigurationKeys(current, { ...current, signingSecret: 's2' });
++    expect(keys).toEqual(['signingSecret']);
++  });
++
++  it('names an edited mapping, and returns several keys sorted', () => {
++    expect(
++      changedConfigurationKeys(current, {
++        ...current,
++        signingSecret: 's2',
++        severityMapping: { critical: 'P1', high: 'P1' },
++      }),
++    ).toEqual(['severityMapping', 'signingSecret']);
++  });
++
++  it('counts an added or removed key as changed', () => {
++    expect(changedConfigurationKeys({ a: 1 }, { a: 1, b: 2 })).toEqual(['b']);
++    expect(changedConfigurationKeys({ a: 1, b: 2 }, { a: 1 })).toEqual(['b']);
++  });
++});
+diff --git a/backend/src/modules/alerts/seed-alert-source.ts b/backend/src/modules/alerts/seed-alert-source.ts
+new file mode 100644
+index 0000000..8e20e24
+--- /dev/null
++++ b/backend/src/modules/alerts/seed-alert-source.ts
+@@ -0,0 +1,110 @@
++import { isDeepStrictEqual } from 'node:util';
++import type { Prisma } from '../../generated/prisma/client.js';
++import { appendAuditEvent } from '../../infra/audit/append-audit-event.js';
++import { isUniqueViolation } from '../../infra/db/errors.js';
++import { getPrisma, lockRowForUpdate, runInTransaction } from '../../infra/db/prisma.js';
++
++export const GENERIC_SOURCE_TYPE = 'GENERIC';
++
++export type SeverityMapping = Record<string, 'P0' | 'P1' | 'P2' | 'P3'>;
++
++/** Read by SLICE-04; this slice only seeds it. */
++export const DEFAULT_SEVERITY_MAPPING: SeverityMapping = {
++  critical: 'P0',
++  high: 'P1',
++  warning: 'P2',
++  info: 'P3',
++};
++
++export type SeedAlertSourceInput = {
++  /** The seeded identifier: it is how the seed recognises an existing source. */
++  id: string;
++  name: string;
++  signingSecret: string;
++  severityMapping: SeverityMapping;
++};
++
++export type SeedAlertSourceResult = 'CREATED' | 'UPDATED' | 'UNCHANGED';
++
++function asRecord(value: unknown): Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : {};
++}
++
++/** Names (sorted) of the configuration keys whose values differ. Values are never returned. */
++export function changedConfigurationKeys(
++  current: Record<string, unknown>,
++  next: Record<string, unknown>,
++): string[] {
++  return [...new Set([...Object.keys(current), ...Object.keys(next)])]
++    .filter((key) => !isDeepStrictEqual(current[key], next[key]))
++    .sort();
++}
++
++async function updateExisting(input: SeedAlertSourceInput): Promise<SeedAlertSourceResult> {
++  return runInTransaction(async (tx) => {
++    if (!(await lockRowForUpdate(tx, 'AlertSource', input.id))) {
++      throw new Error('Alert source disappeared during the seed');
++    }
++    const row = await tx.alertSource.findUniqueOrThrow({
++      where: { id: input.id },
++      select: { configuration: true },
++    });
++
++    const current = asRecord(row.configuration);
++    const next = {
++      ...current,
++      signingSecret: input.signingSecret,
++      severityMapping: input.severityMapping,
++    };
++    const changedKeys = changedConfigurationKeys(current, next);
++    if (changedKeys.length === 0) return 'UNCHANGED';
++
++    await tx.alertSource.update({
++      where: { id: input.id },
++      data: { configuration: next as Prisma.InputJsonObject, updatedAt: new Date() },
++    });
++    await appendAuditEvent(tx, {
++      incidentId: null,
++      eventType: 'ALERT_SOURCE_UPDATED',
++      actorId: null,
++      metadata: { alertSourceId: input.id, changedKeys },
++    });
++    return 'UPDATED';
++  });
++}
++
++/**
++ * Creates the alert source, or updates the configuration of the existing one (identified by
++ * `input.id`). A changed configuration is audited in the same transaction as the update, with the
++ * names of the changed keys only; creating a source and an unchanged re-run write no audit event.
++ * The name is set on creation only, and the status is never touched.
++ */
++export async function seedAlertSource(input: SeedAlertSourceInput): Promise<SeedAlertSourceResult> {
++  const db = getPrisma();
++  const existing = await db.alertSource.findUnique({
++    where: { id: input.id },
++    select: { id: true },
++  });
++
++  if (!existing) {
++    try {
++      await db.alertSource.create({
++        data: {
++          id: input.id,
++          name: input.name,
++          sourceType: GENERIC_SOURCE_TYPE,
++          configuration: {
++            signingSecret: input.signingSecret,
++            severityMapping: input.severityMapping,
++          },
++        },
++      });
++      return 'CREATED';
++    } catch (error) {
++      if (!isUniqueViolation(error)) throw error; // a concurrent seed created it first
++    }
++  }
++  return updateExisting(input);
++}
+diff --git a/backend/src/modules/alerts/signature.spec.ts b/backend/src/modules/alerts/signature.spec.ts
+new file mode 100644
+index 0000000..1136373
+--- /dev/null
++++ b/backend/src/modules/alerts/signature.spec.ts
+@@ -0,0 +1,95 @@
++import { createHmac } from 'node:crypto';
++import {
++  computeSignature,
++  isTimestampFresh,
++  parseSignatureHeader,
++  verifySignature,
++} from './signature.js';
++
++const SECRET = 'unit-test-signing-secret-0123456789';
++const BODY = Buffer.from('{"alerts":[{"name":"a  b"}]}');
++const TS = '1800000000';
++
++function header(secret = SECRET, timestamp = TS, body = BODY): string {
++  return `sha256=${computeSignature(secret, timestamp, body).toString('hex')}`;
++}
++
++describe('computeSignature', () => {
++  it('is HMAC-SHA256 of "<timestamp>.<raw body>" with the secret', () => {
++    const expected = createHmac('sha256', SECRET).update(`${TS}.`).update(BODY).digest('hex');
++    expect(computeSignature(SECRET, TS, BODY).toString('hex')).toBe(expected);
++  });
++
++  it('covers the raw bytes, not a re-serialization', () => {
++    const spaced = Buffer.from('{ "alerts": [ { "name": "a  b" } ] }');
++    expect(computeSignature(SECRET, TS, spaced).equals(computeSignature(SECRET, TS, BODY))).toBe(
++      false,
++    );
++  });
++});
++
++describe('parseSignatureHeader', () => {
++  const hex = 'ab'.repeat(32);
++
++  it('accepts sha256=<64 hex> and normalizes the case', () => {
++    expect(parseSignatureHeader(`sha256=${hex.toUpperCase()}`)?.hex).toBe(hex);
++  });
++
++  it.each([
++    undefined,
++    '',
++    hex,
++    `sha1=${hex}`,
++    `sha256=${hex.slice(1)}`,
++    `sha256=${hex}00`,
++    `sha256=${'zz'.repeat(32)}`,
++    ` sha256=${hex}`,
++  ])('rejects %p', (value) => {
++    expect(parseSignatureHeader(value)).toBeNull();
++  });
++});
++
++describe('verifySignature', () => {
++  const base = { secret: SECRET, timestampHeader: TS, signatureHeader: header(), rawBody: BODY };
++
++  it('accepts a valid signature', () => {
++    expect(verifySignature(base)).toBe(true);
++  });
++
++  it('rejects a wrong secret', () => {
++    expect(verifySignature({ ...base, secret: 'another-secret-another-secret-1234' })).toBe(false);
++  });
++
++  it('rejects a tampered body and a different timestamp', () => {
++    expect(verifySignature({ ...base, rawBody: Buffer.from('{"alerts":[]}') })).toBe(false);
++    expect(verifySignature({ ...base, timestampHeader: '1800000001' })).toBe(false);
++  });
++
++  it('rejects when there is no secret (unknown, deactivated or misconfigured source)', () => {
++    expect(verifySignature({ ...base, secret: null })).toBe(false);
++  });
++
++  it.each([
++    ['missing signature', { signatureHeader: undefined }],
++    ['unparseable signature', { signatureHeader: 'nope' }],
++    ['missing timestamp', { timestampHeader: undefined }],
++    ['non-numeric timestamp', { timestampHeader: '17e8' }],
++    ['fractional timestamp', { timestampHeader: '1800000000.5' }],
++  ])('rejects %s', (_name, override) => {
++    expect(verifySignature({ ...base, ...override })).toBe(false);
++  });
++});
++
++describe('isTimestampFresh', () => {
++  const now = 1_800_000_000_500; // 500 ms into second 1800000000
++
++  it.each([
++    ['now', 1_800_000_000, true],
++    ['300 s in the past', 1_799_999_700, true],
++    ['301 s in the past', 1_799_999_699, false],
++    ['300 s in the future', 1_800_000_300, true],
++    ['301 s in the future', 1_800_000_301, false],
++  ])('%s', (_name, timestamp, fresh) => {
++    expect(isTimestampFresh(String(timestamp), now)).toBe(fresh);
++  });
++});
+diff --git a/backend/src/modules/alerts/signature.ts b/backend/src/modules/alerts/signature.ts
+new file mode 100644
+index 0000000..584ad79
+--- /dev/null
++++ b/backend/src/modules/alerts/signature.ts
+@@ -0,0 +1,62 @@
++import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
++import { WEBHOOK } from './webhook.config.js';
++
++const SIGNATURE_HEADER = /^sha256=([0-9a-fA-F]{64})$/;
++const TIMESTAMP_HEADER = /^\d{1,15}$/;
++
++/** Stands in for the secret of an unknown source, so its check costs the same as a real one. */
++const DUMMY_SECRET = randomBytes(32);
++const ZERO_DIGEST = Buffer.alloc(32);
++
++/** HMAC-SHA256 of `"<timestamp>.<raw body>"`, computed over the raw bytes. */
++export function computeSignature(
++  secret: string | Buffer,
++  timestamp: string,
++  rawBody: Buffer,
++): Buffer {
++  return createHmac('sha256', secret).update(timestamp).update('.').update(rawBody).digest();
++}
++
++export type ParsedSignature = { digest: Buffer; hex: string };
++
++/** Parses `sha256=<64 hex>`; anything else cannot be a valid signature. */
++export function parseSignatureHeader(value: string | undefined): ParsedSignature | null {
++  const match = value === undefined ? null : SIGNATURE_HEADER.exec(value);
++  if (!match?.[1]) return null;
++  const hex = match[1].toLowerCase();
++  return { digest: Buffer.from(hex, 'hex'), hex };
++}
++
++export type SignatureInput = {
++  /** The source's signing secret, or `null` when there is no usable source. */
++  secret: string | null;
++  timestampHeader: string | undefined;
++  signatureHeader: string | undefined;
++  rawBody: Buffer;
++};
++
++/**
++ * Verifies the signature in constant time. The HMAC is always computed (with a dummy secret when
++ * the source is unknown, deactivated or misconfigured) and the outcome is decided only at the end.
++ */
++export function verifySignature(input: SignatureInput): boolean {
++  const signature = parseSignatureHeader(input.signatureHeader);
++  const timestamp =
++    input.timestampHeader !== undefined && TIMESTAMP_HEADER.test(input.timestampHeader)
++      ? input.timestampHeader
++      : null;
++
++  const expected = computeSignature(input.secret ?? DUMMY_SECRET, timestamp ?? '', input.rawBody);
++  const digestsMatch = timingSafeEqual(expected, signature?.digest ?? ZERO_DIGEST);
++
++  return digestsMatch && input.secret !== null && signature !== null && timestamp !== null;
++}
++
++/** Whether a (verified, numeric) timestamp is within ±300 s of server time. */
++export function isTimestampFresh(
++  timestamp: string,
++  nowMs: number,
++  toleranceSeconds: number = WEBHOOK.timestampToleranceSeconds,
++): boolean {
++  return Math.abs(Math.floor(nowMs / 1000) - Number(timestamp)) <= toleranceSeconds;
++}
+diff --git a/backend/src/modules/alerts/source.repository.ts b/backend/src/modules/alerts/source.repository.ts
+new file mode 100644
+index 0000000..48509cc
+--- /dev/null
++++ b/backend/src/modules/alerts/source.repository.ts
+@@ -0,0 +1,16 @@
++import { getPrisma } from '../../infra/db/prisma.js';
++
++export type AlertSourceRecord = {
++  id: string;
++  name: string;
++  sourceType: string;
++  status: 'ACTIVE' | 'DEACTIVATED';
++  configuration: unknown;
++};
++
++export function findAlertSourceById(id: string): Promise<AlertSourceRecord | null> {
++  return getPrisma().alertSource.findUnique({
++    where: { id },
++    select: { id: true, name: true, sourceType: true, status: true, configuration: true },
++  });
++}
+diff --git a/backend/src/modules/alerts/trust-gate.spec.ts b/backend/src/modules/alerts/trust-gate.spec.ts
+new file mode 100644
+index 0000000..2a7a0eb
+--- /dev/null
++++ b/backend/src/modules/alerts/trust-gate.spec.ts
+@@ -0,0 +1,328 @@
++import { isDatabaseUnavailable } from '../../infra/db/errors.js';
++import { Prisma } from '../../generated/prisma/client.js';
++import { logger } from '../../shared/observability/logger.js';
++import type { RateLimiter } from './rate-limiter.js';
++import { computeSignature } from './signature.js';
++import type { AlertSourceRecord } from './source.repository.js';
++import { runTrustGate, type TrustGateDeps, type TrustGateInput } from './trust-gate.js';
++
++logger.level = 'silent';
++
++const SECRET = 'unit-test-signing-secret-0123456789';
++const SOURCE_ID = '0192b5e0-7c1a-7d2e-8f3b-4a5c6d7e8f90';
++const NOW_S = 1_800_000_000;
++const NOW_MS = NOW_S * 1000;
++const CONFIGURATION = { signingSecret: SECRET, severityMapping: { critical: 'P0' } };
++
++const SOURCE: AlertSourceRecord = {
++  id: SOURCE_ID,
++  name: 'Generic',
++  sourceType: 'GENERIC',
++  status: 'ACTIVE',
++  configuration: CONFIGURATION,
++};
++
++function input(overrides: Partial<TrustGateInput> & { body?: string; timestamp?: number } = {}) {
++  const body = overrides.body ?? JSON.stringify({ alerts: [{ n: 1 }, { n: 2 }, { n: 3 }] });
++  const rawBody = overrides.rawBody ?? Buffer.from(body);
++  const timestamp = String(overrides.timestamp ?? NOW_S);
++  const signature = `sha256=${computeSignature(SECRET, timestamp, rawBody).toString('hex')}`;
++  return {
++    alertSourceId: SOURCE_ID,
++    signatureHeader: signature,
++    timestampHeader: timestamp,
++    contentType: 'application/json',
++    requestId: 'req-1',
++    ...overrides,
++    rawBody,
++  } satisfies TrustGateInput;
++}
++
++function fakeDeps(overrides: Partial<TrustGateDeps> = {}) {
++  const rateLimiter: jest.Mocked<RateLimiter> = {
++    consume: jest
++      .fn()
++      .mockImplementation((_id: string, n: number) =>
++        Promise.resolve({ kind: 'ALLOWED', allowed: n }),
++      ),
++    claimPendingNotice: jest.fn().mockResolvedValue(null),
++    acknowledgeNotice: jest.fn().mockResolvedValue(undefined),
++  };
++  const deps: TrustGateDeps = {
++    findSource: jest.fn().mockResolvedValue(SOURCE),
++    replayStore: { markSeen: jest.fn().mockResolvedValue(true) },
++    rateLimiter,
++    notifyBlocked: jest.fn().mockResolvedValue(undefined),
++    now: () => NOW_MS,
++    ...overrides,
++  };
++  return { deps, rateLimiter };
++}
++
++const rejectsWith = (promise: Promise<unknown>, expected: object) =>
++  expect(promise).rejects.toMatchObject(expected);
++
++describe('runTrustGate', () => {
++  it('hands over the verified context in request order', async () => {
++    const { deps } = fakeDeps();
++    const context = await runTrustGate(input(), deps);
++    expect(context).toEqual({
++      alertSource: {
++        id: SOURCE_ID,
++        name: 'Generic',
++        sourceType: 'GENERIC',
++        configuration: CONFIGURATION,
++      },
++      items: [{ n: 1 }, { n: 2 }, { n: 3 }],
++      rateLimitedIndices: [],
++      requestId: 'req-1',
++    });
++    expect(deps.replayStore.markSeen).toHaveBeenCalledWith(
++      SOURCE_ID,
++      input().signatureHeader.slice('sha256='.length),
++    );
++  });
++
++  describe('step 2: source authentication', () => {
++    const failed = { statusCode: 401, code: 'SOURCE_AUTH_FAILED' };
++
++    it.each([
++      ['a wrong signature', { signatureHeader: `sha256=${'0'.repeat(64)}` }],
++      ['a missing signature', { signatureHeader: undefined }],
++      ['a missing timestamp', { timestampHeader: undefined }],
++      ['a malformed source id', { alertSourceId: 'not-a-uuid' }],
++    ])('%s', async (_name, override) => {
++      const { deps } = fakeDeps();
++      await rejectsWith(runTrustGate({ ...input(), ...override }, deps), failed);
++    });
++
++    it('a tampered body', async () => {
++      const { deps } = fakeDeps();
++      await rejectsWith(
++        runTrustGate({ ...input(), rawBody: Buffer.from('{"alerts":[]}') }, deps),
++        failed,
++      );
++    });
++
++    it.each([
++      ['an unknown source', null],
++      ['a deactivated source', { ...SOURCE, status: 'DEACTIVATED' as const }],
++      ['a source without a signing secret', { ...SOURCE, configuration: {} }],
++      ['a source whose configuration is not an object', { ...SOURCE, configuration: 'x' }],
++    ])('%s', async (_name, record) => {
++      const { deps } = fakeDeps({ findSource: jest.fn().mockResolvedValue(record) });
++      await rejectsWith(runTrustGate(input(), deps), failed);
++    });
++
++    it('does not look up a malformed source id', async () => {
++      const { deps } = fakeDeps();
++      await runTrustGate({ ...input(), alertSourceId: 'nope' }, deps).catch(() => undefined);
++      expect(deps.findSource).not.toHaveBeenCalled();
++    });
++
++    it('a database outage on the lookup is 503 DEPENDENCY_UNAVAILABLE with Retry-After', async () => {
++      const outage = new Prisma.PrismaClientKnownRequestError('down', {
++        code: 'P1001',
++        clientVersion: 'test',
++      });
++      expect(isDatabaseUnavailable(outage)).toBe(true);
++      const { deps } = fakeDeps({ findSource: jest.fn().mockRejectedValue(outage) });
++      await rejectsWith(runTrustGate(input(), deps), {
++        statusCode: 503,
++        code: 'DEPENDENCY_UNAVAILABLE',
++        retryAfterSeconds: 5,
++      });
++    });
++
++    it('any other lookup error is not hidden as an authentication failure', async () => {
++      const boom = new Error('boom');
++      const { deps } = fakeDeps({ findSource: jest.fn().mockRejectedValue(boom) });
++      await expect(runTrustGate(input(), deps)).rejects.toBe(boom);
++    });
++  });
++
++  describe('step 3: timestamp', () => {
++    it.each([
++      [NOW_S - 300, true],
++      [NOW_S - 301, false],
++      [NOW_S + 300, true],
++      [NOW_S + 301, false],
++    ])('timestamp %i accepted: %s', async (timestamp, accepted) => {
++      const { deps } = fakeDeps();
++      const run = runTrustGate(input({ timestamp }), deps);
++      if (accepted) await expect(run).resolves.toBeDefined();
++      else await rejectsWith(run, { statusCode: 401, code: 'REQUEST_STALE' });
++    });
++
++    it('a bad signature wins over a stale timestamp', async () => {
++      const { deps } = fakeDeps();
++      await rejectsWith(
++        runTrustGate(
++          { ...input({ timestamp: NOW_S - 1000 }), signatureHeader: `sha256=${'0'.repeat(64)}` },
++          deps,
++        ),
++        { code: 'SOURCE_AUTH_FAILED' },
++      );
++    });
++  });
++
++  describe('step 4: replay', () => {
++    it('a signature already seen is 409 REPLAY_DETECTED, before the rate limit is touched', async () => {
++      const { deps, rateLimiter } = fakeDeps({
++        replayStore: { markSeen: jest.fn().mockResolvedValue(false) },
++      });
++      await rejectsWith(runTrustGate(input(), deps), { statusCode: 409, code: 'REPLAY_DETECTED' });
++      expect(rateLimiter.consume).not.toHaveBeenCalled();
++    });
++
++    it('a replay store failure stops the request before the rate limit', async () => {
++      const failure = Object.assign(new Error('down'), { statusCode: 503 });
++      const { deps, rateLimiter } = fakeDeps({
++        replayStore: { markSeen: jest.fn().mockRejectedValue(failure) },
++      });
++      await expect(runTrustGate(input(), deps)).rejects.toBe(failure);
++      expect(rateLimiter.consume).not.toHaveBeenCalled();
++    });
++  });
++
++  describe('step 5: rate limit', () => {
++    it('counts the alerts of the request', async () => {
++      const { deps, rateLimiter } = fakeDeps();
++      await runTrustGate(input(), deps);
++      expect(rateLimiter.consume).toHaveBeenCalledWith(SOURCE_ID, 3);
++    });
++
++    it.each([
++      ['malformed JSON', 'not json'],
++      ['alerts that is not an array', '{"alerts":"x"}'],
++    ])('counts nothing for %s and lets step 6 decide', async (_name, body) => {
++      const { deps, rateLimiter } = fakeDeps();
++      await rejectsWith(runTrustGate(input({ body }), deps), { statusCode: 422 });
++      expect(rateLimiter.consume).toHaveBeenCalledWith(SOURCE_ID, 0);
++    });
++
++    it('partial capacity: the rest are marked for item-level rejection', async () => {
++      const { deps, rateLimiter } = fakeDeps();
++      rateLimiter.consume.mockResolvedValue({ kind: 'ALLOWED', allowed: 1 });
++      const context = await runTrustGate(input(), deps);
++      expect(context.items).toHaveLength(3);
++      expect(context.rateLimitedIndices).toEqual([1, 2]);
++    });
++
++    it('a violation is 429 RATE_LIMITED with the block as Retry-After (rounded up)', async () => {
++      const { deps, rateLimiter } = fakeDeps();
++      rateLimiter.consume.mockResolvedValue({
++        kind: 'VIOLATION',
++        retryAfterMs: 300_000,
++        attemptCount: 1,
++        finalStage: false,
++      });
++      await rejectsWith(runTrustGate(input(), deps), {
++        statusCode: 429,
++        code: 'RATE_LIMITED',
++        retryAfterSeconds: 300,
++      });
++      expect(deps.notifyBlocked).not.toHaveBeenCalled();
++    });
++
++    it('a blocked source is 429 with the remaining block', async () => {
++      const { deps, rateLimiter } = fakeDeps();
++      rateLimiter.consume.mockResolvedValue({ kind: 'BLOCKED', retryAfterMs: 1_500 });
++      await rejectsWith(runTrustGate(input(), deps), { statusCode: 429, retryAfterSeconds: 2 });
++      expect(deps.notifyBlocked).not.toHaveBeenCalled();
++    });
++
++    it('is decided before the envelope: a blocked source with a bad body is still 429', async () => {
++      const { deps, rateLimiter } = fakeDeps();
++      rateLimiter.consume.mockResolvedValue({ kind: 'BLOCKED', retryAfterMs: 5_000 });
++      await rejectsWith(runTrustGate(input({ body: 'not json' }), deps), { statusCode: 429 });
++    });
++
++    describe('final stage', () => {
++      const final = {
++        kind: 'VIOLATION',
++        retryAfterMs: 86_400_000,
++        attemptCount: 5,
++        finalStage: true,
++      } as const;
++
++      it('writes the Admin notice once, records it, and still answers 429', async () => {
++        const { deps, rateLimiter } = fakeDeps();
++        rateLimiter.consume.mockResolvedValue(final);
++        await rejectsWith(runTrustGate(input(), deps), {
++          statusCode: 429,
++          retryAfterSeconds: 86_400,
++        });
++        expect(deps.notifyBlocked).toHaveBeenCalledTimes(1);
++        expect(deps.notifyBlocked).toHaveBeenCalledWith({
++          alertSourceId: SOURCE_ID,
++          attemptCount: 5,
++          requestId: 'req-1',
++        });
++        expect(rateLimiter.acknowledgeNotice).toHaveBeenCalledWith(SOURCE_ID);
++      });
++
++      it('a failed write is not acknowledged (so it is retried) and does not change the answer', async () => {
++        const { deps, rateLimiter } = fakeDeps({
++          notifyBlocked: jest.fn().mockRejectedValue(new Error('db down')),
++        });
++        rateLimiter.consume.mockResolvedValue(final);
++        await rejectsWith(runTrustGate(input(), deps), { statusCode: 429 });
++        expect(rateLimiter.acknowledgeNotice).not.toHaveBeenCalled();
++      });
++
++      it('a blocked request retries a pending notice, claiming it first', async () => {
++        const { deps, rateLimiter } = fakeDeps();
++        rateLimiter.consume.mockResolvedValue({ kind: 'BLOCKED', retryAfterMs: 1_000 });
++        rateLimiter.claimPendingNotice.mockResolvedValue(5);
++        await rejectsWith(runTrustGate(input(), deps), { statusCode: 429 });
++        expect(deps.notifyBlocked).toHaveBeenCalledWith({
++          alertSourceId: SOURCE_ID,
++          attemptCount: 5,
++          requestId: 'req-1',
++        });
++        expect(rateLimiter.acknowledgeNotice).toHaveBeenCalledTimes(1);
++      });
++
++      it('a blocked request with nothing pending writes nothing', async () => {
++        const { deps, rateLimiter } = fakeDeps();
++        rateLimiter.consume.mockResolvedValue({ kind: 'BLOCKED', retryAfterMs: 1_000 });
++        await rejectsWith(runTrustGate(input(), deps), { statusCode: 429 });
++        expect(deps.notifyBlocked).not.toHaveBeenCalled();
++      });
++
++      it('a failure to check for a pending notice never changes the 429', async () => {
++        const { deps, rateLimiter } = fakeDeps();
++        rateLimiter.consume.mockResolvedValue({ kind: 'BLOCKED', retryAfterMs: 1_000 });
++        rateLimiter.claimPendingNotice.mockRejectedValue(new Error('redis down'));
++        await rejectsWith(runTrustGate(input(), deps), { statusCode: 429 });
++      });
++    });
++
++    it('a limiter failure stops the request (fail closed)', async () => {
++      const failure = Object.assign(new Error('down'), { statusCode: 503 });
++      const { deps, rateLimiter } = fakeDeps();
++      rateLimiter.consume.mockRejectedValue(failure);
++      await expect(runTrustGate(input(), deps)).rejects.toBe(failure);
++    });
++  });
++
++  describe('step 6: envelope', () => {
++    it('is checked after the rate limit', async () => {
++      const { deps, rateLimiter } = fakeDeps();
++      await rejectsWith(runTrustGate(input({ contentType: undefined }), deps), { statusCode: 400 });
++      expect(rateLimiter.consume).toHaveBeenCalled();
++    });
++
++    it.each([
++      ['an empty alerts array', '{"alerts":[]}'],
++      ['a missing alerts', '{}'],
++    ])('%s is 422', async (_name, body) => {
++      const { deps } = fakeDeps();
++      await rejectsWith(runTrustGate(input({ body }), deps), {
++        statusCode: 422,
++        code: 'VALIDATION_FAILED',
++      });
++    });
++  });
++});
+diff --git a/backend/src/modules/alerts/trust-gate.ts b/backend/src/modules/alerts/trust-gate.ts
+new file mode 100644
+index 0000000..313f47c
+--- /dev/null
++++ b/backend/src/modules/alerts/trust-gate.ts
+@@ -0,0 +1,192 @@
++import { isDatabaseUnavailable } from '../../infra/db/errors.js';
++import { TooManyRequestsError } from '../../shared/errors/AppError.js';
++import { childLogger } from '../../shared/observability/logger.js';
++import type { BlockedNotice } from './admin-notice.js';
++import { countAlerts, parseJsonBody, validateEnvelope } from './envelope.js';
++import type { RateLimiter } from './rate-limiter.js';
++import type { ReplayStore } from './replay.store.js';
++import { isTimestampFresh, parseSignatureHeader, verifySignature } from './signature.js';
++import type { AlertSourceRecord } from './source.repository.js';
++import {
++  dependencyUnavailable,
++  replayDetected,
++  requestStale,
++  sourceAuthFailed,
++} from './webhook.errors.js';
++import type { VerifiedAlertContext, VerifiedAlertSource } from './webhook.types.js';
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++
++export type TrustGateDeps = {
++  findSource: (id: string) => Promise<AlertSourceRecord | null>;
++  replayStore: ReplayStore;
++  rateLimiter: RateLimiter;
++  notifyBlocked: (notice: BlockedNotice) => Promise<void>;
++  now: () => number;
++};
++
++export type TrustGateInput = {
++  alertSourceId: string;
++  signatureHeader: string | undefined;
++  timestampHeader: string | undefined;
++  contentType: string | undefined;
++  /** Step 1 (the size limit) was already enforced while capturing these bytes. */
++  rawBody: Buffer;
++  requestId: string;
++};
++
++function asConfiguration(value: unknown): Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : {};
++}
++
++async function loadSource(deps: TrustGateDeps, id: string): Promise<AlertSourceRecord | null> {
++  try {
++    return await deps.findSource(id);
++  } catch (error) {
++    if (isDatabaseUnavailable(error)) throw dependencyUnavailable();
++    throw error;
++  }
++}
++
++/** Step 2: the source exists, is `ACTIVE` and the signature is valid: one failure for all of it. */
++async function authenticateSource(
++  deps: TrustGateDeps,
++  input: TrustGateInput,
++): Promise<{ source: VerifiedAlertSource; signatureHex: string }> {
++  const record = UUID.test(input.alertSourceId)
++    ? await loadSource(deps, input.alertSourceId)
++    : null;
++  const active = record?.status === 'ACTIVE' ? record : null;
++  const configuration = asConfiguration(active?.configuration);
++  const secret =
++    typeof configuration.signingSecret === 'string' && configuration.signingSecret !== ''
++      ? configuration.signingSecret
++      : null;
++
++  const valid = verifySignature({
++    secret,
++    timestampHeader: input.timestampHeader,
++    signatureHeader: input.signatureHeader,
++    rawBody: input.rawBody,
++  });
++  const signature = parseSignatureHeader(input.signatureHeader);
++  if (!valid || !active || !signature) throw sourceAuthFailed();
++
++  return {
++    source: {
++      id: active.id,
++      name: active.name,
++      sourceType: active.sourceType,
++      configuration,
++    },
++    signatureHex: signature.hex,
++  };
++}
++
++function retryAfterSeconds(ms: number): number {
++  return Math.max(1, Math.ceil(ms / 1000));
++}
++
++/** Writes the Admin notice of a block; a failure is logged and leaves the notice pending. */
++async function sendBlockedNotice(
++  deps: TrustGateDeps,
++  notice: BlockedNotice,
++  log: ReturnType<typeof childLogger>,
++): Promise<void> {
++  try {
++    await deps.notifyBlocked(notice);
++  } catch (err) {
++    log.error({ err, alertSourceId: notice.alertSourceId }, 'Blocked-source notice not written');
++    return;
++  }
++  try {
++    await deps.rateLimiter.acknowledgeNotice(notice.alertSourceId);
++  } catch (err) {
++    log.warn({ err, alertSourceId: notice.alertSourceId }, 'Blocked-source notice not recorded');
++  }
++}
++
++/** A block whose notice failed to be written is retried by the next request that meets it. */
++async function retryPendingNotice(
++  deps: TrustGateDeps,
++  alertSourceId: string,
++  requestId: string,
++  log: ReturnType<typeof childLogger>,
++): Promise<void> {
++  let attemptCount: number | null;
++  try {
++    attemptCount = await deps.rateLimiter.claimPendingNotice(alertSourceId);
++  } catch (err) {
++    log.warn({ err, alertSourceId }, 'Pending blocked-source notice could not be checked');
++    return;
++  }
++  if (attemptCount !== null) {
++    await sendBlockedNotice(deps, { alertSourceId, attemptCount, requestId }, log);
++  }
++}
++
++/** Step 5. Returns how many of the request's `alertCount` alerts fit; throws `429` when none do. */
++async function applyRateLimit(
++  deps: TrustGateDeps,
++  alertSourceId: string,
++  alertCount: number,
++  requestId: string,
++  log: ReturnType<typeof childLogger>,
++): Promise<number> {
++  const outcome = await deps.rateLimiter.consume(alertSourceId, alertCount);
++  if (outcome.kind === 'ALLOWED') return outcome.allowed;
++
++  if (outcome.kind === 'VIOLATION') {
++    log.warn(
++      { alertSourceId, attemptCount: outcome.attemptCount, finalStage: outcome.finalStage },
++      'Alert source rate limit exceeded; source blocked',
++    );
++    if (outcome.finalStage) {
++      await sendBlockedNotice(
++        deps,
++        { alertSourceId, attemptCount: outcome.attemptCount, requestId },
++        log,
++      );
++    }
++  } else {
++    await retryPendingNotice(deps, alertSourceId, requestId, log);
++  }
++
++  throw new TooManyRequestsError(
++    'The alert source is rate limited',
++    'RATE_LIMITED',
++    retryAfterSeconds(outcome.retryAfterMs),
++  );
++}
++
++/**
++ * Runs steps 2–6 of the webhook pipeline in order; the first failing step decides the response.
++ * Nothing here persists an alert. Redis-backed steps (4 and 5) fail closed.
++ */
++export async function runTrustGate(
++  input: TrustGateInput,
++  deps: TrustGateDeps,
++): Promise<VerifiedAlertContext> {
++  const log = childLogger({ requestId: input.requestId });
++
++  const { source, signatureHex } = await authenticateSource(deps, input);
++
++  if (!isTimestampFresh(input.timestampHeader ?? '', deps.now())) throw requestStale();
++
++  if (!(await deps.replayStore.markSeen(source.id, signatureHex))) throw replayDetected();
++
++  const body = parseJsonBody(input.rawBody);
++  const alertCount = countAlerts(body);
++  const allowed = await applyRateLimit(deps, source.id, alertCount, input.requestId, log);
++
++  const items = validateEnvelope(input.contentType, body);
++
++  return {
++    alertSource: source,
++    items,
++    rateLimitedIndices: Array.from({ length: items.length - allowed }, (_, i) => allowed + i),
++    requestId: input.requestId,
++  };
++}
+diff --git a/backend/src/modules/alerts/webhook.config.ts b/backend/src/modules/alerts/webhook.config.ts
+new file mode 100644
+index 0000000..49457c6
+--- /dev/null
++++ b/backend/src/modules/alerts/webhook.config.ts
+@@ -0,0 +1,27 @@
++const MINUTE_MS = 60_000;
++const HOUR_MS = 60 * MINUTE_MS;
++
++export const WEBHOOK = {
++  maxBodyBytes: 1024 * 1024,
++  maxAlertsPerRequest: 100,
++  timestampToleranceSeconds: 300,
++  /**
++   * A timestamp is accepted up to 300 s in the past and 300 s in the future, so a signed request
++   * stays acceptable for 600 s; the replay record outlives that by a small margin.
++   */
++  replayTtlSeconds: 610,
++  /** Seconds a sender is told to wait when Redis or the database cannot be reached. */
++  unavailableRetryAfterSeconds: 5,
++} as const;
++
++export const SOURCE_RATE_LIMIT = {
++  alertsPerWindow: 15,
++  windowMs: MINUTE_MS,
++  /** Block per violation: 5 min → 20 min → 45 min → 2 h; the next violation is the final stage. */
++  blockStepsMs: [5 * MINUTE_MS, 20 * MINUTE_MS, 45 * MINUTE_MS, 2 * HOUR_MS],
++  finalBlockMs: 24 * HOUR_MS,
++  /** How long violations are remembered; each violation refreshes it. */
++  ladderMemoryMs: 24 * HOUR_MS,
++  /** How long one request owns the right to write the Admin notice of a block. */
++  noticeLockMs: 10_000,
++} as const;
+diff --git a/backend/src/modules/alerts/webhook.controller.ts b/backend/src/modules/alerts/webhook.controller.ts
+new file mode 100644
+index 0000000..6f09612
+--- /dev/null
++++ b/backend/src/modules/alerts/webhook.controller.ts
+@@ -0,0 +1,24 @@
++import type { RequestHandler } from 'express';
++import { RAW_BODY_KEY } from './raw-body.js';
++import { runTrustGate, type TrustGateDeps } from './trust-gate.js';
++import type { IngestHandler } from './webhook.types.js';
++
++export type WebhookDeps = TrustGateDeps & { ingest: IngestHandler };
++
++/** W1: the trust gate (steps 1–6), then the verified context goes to ingestion (SLICE-04). */
++export function createWebhookHandler(deps: WebhookDeps): RequestHandler {
++  return async (req, res) => {
++    const context = await runTrustGate(
++      {
++        alertSourceId: String(req.params.alertSourceId),
++        signatureHeader: req.get('x-signature'),
++        timestampHeader: req.get('x-timestamp'),
++        contentType: req.get('content-type'),
++        rawBody: res.locals[RAW_BODY_KEY] as Buffer,
++        requestId: res.locals.requestId as string,
++      },
++      deps,
++    );
++    res.status(200).json(await deps.ingest(context));
++  };
++}
+diff --git a/backend/src/modules/alerts/webhook.errors.ts b/backend/src/modules/alerts/webhook.errors.ts
+new file mode 100644
+index 0000000..7d77c8c
+--- /dev/null
++++ b/backend/src/modules/alerts/webhook.errors.ts
+@@ -0,0 +1,30 @@
++import {
++  ConflictError,
++  ServiceUnavailableError,
++  UnauthorizedError,
++} from '../../shared/errors/AppError.js';
++import { WEBHOOK } from './webhook.config.js';
++
++/** One error for every authentication failure, so nothing reveals whether a source exists. */
++export function sourceAuthFailed(): UnauthorizedError {
++  return new UnauthorizedError('Source authentication failed', 'SOURCE_AUTH_FAILED');
++}
++
++export function requestStale(): UnauthorizedError {
++  return new UnauthorizedError(
++    'The request timestamp is outside the accepted window; sign the request again',
++    'REQUEST_STALE',
++  );
++}
++
++export function replayDetected(): ConflictError {
++  return new ConflictError('This signed request was already received', 'REPLAY_DETECTED');
++}
++
++export function dependencyUnavailable(): ServiceUnavailableError {
++  return new ServiceUnavailableError(
++    'Service temporarily unavailable',
++    'DEPENDENCY_UNAVAILABLE',
++    WEBHOOK.unavailableRetryAfterSeconds,
++  );
++}
+diff --git a/backend/src/modules/alerts/webhook.routes.ts b/backend/src/modules/alerts/webhook.routes.ts
+new file mode 100644
+index 0000000..e8348f6
+--- /dev/null
++++ b/backend/src/modules/alerts/webhook.routes.ts
+@@ -0,0 +1,29 @@
++import { Router } from 'express';
++import { writeBlockedNotice } from './admin-notice.js';
++import { ingestNotImplemented } from './ingest.placeholder.js';
++import { createRateLimiter } from './rate-limiter.js';
++import { captureRawBody } from './raw-body.js';
++import { createReplayStore } from './replay.store.js';
++import { findAlertSourceById } from './source.repository.js';
++import { createWebhookHandler, type WebhookDeps } from './webhook.controller.js';
++
++/**
++ * `POST /webhooks/alerts/:alertSourceId` (W1). Mounted at the application root, before the JSON
++ * body parser: the signature covers the raw bytes and the body limit is 1 MB. `overrides` replace
++ * individual collaborators (SLICE-04's ingestion, test doubles).
++ */
++export function createWebhookRouter(overrides: Partial<WebhookDeps> = {}): Router {
++  const deps: WebhookDeps = {
++    findSource: findAlertSourceById,
++    replayStore: createReplayStore(),
++    rateLimiter: createRateLimiter(),
++    notifyBlocked: writeBlockedNotice,
++    ingest: ingestNotImplemented,
++    now: Date.now,
++    ...overrides,
++  };
++
++  const router = Router();
++  router.post('/webhooks/alerts/:alertSourceId', captureRawBody(), createWebhookHandler(deps));
++  return router;
++}
+diff --git a/backend/src/modules/alerts/webhook.types.ts b/backend/src/modules/alerts/webhook.types.ts
+new file mode 100644
+index 0000000..01d3742
+--- /dev/null
++++ b/backend/src/modules/alerts/webhook.types.ts
+@@ -0,0 +1,24 @@
++/** The alert source a request was verified against; `configuration` is read by SLICE-04. */
++export type VerifiedAlertSource = {
++  id: string;
++  name: string;
++  sourceType: string;
++  configuration: Record<string, unknown>;
++};
++
++/** What the trust gate hands to ingestion (SLICE-04) once steps 1–6 passed. */
++export type VerifiedAlertContext = {
++  alertSource: VerifiedAlertSource;
++  /** Alert elements in request order, at most 100; validated per alert by ingestion. */
++  items: unknown[];
++  /** Indices of `items` the source's rate limit has no capacity for (reported as `RATE_LIMITED`). */
++  rateLimitedIndices: number[];
++  /** For log correlation and the payload of outbox events written by ingestion. */
++  requestId: string;
++};
++
++/**
++ * The seam SLICE-04 fills: processes a verified request and returns the success response body
++ * (sent with status 200).
++ */
++export type IngestHandler = (context: VerifiedAlertContext) => Promise<unknown>;
+diff --git a/backend/src/scripts/seed-alert-source.ts b/backend/src/scripts/seed-alert-source.ts
+new file mode 100644
+index 0000000..be850e3
+--- /dev/null
++++ b/backend/src/scripts/seed-alert-source.ts
+@@ -0,0 +1,59 @@
++import { z } from 'zod';
++import { getConfig } from '../config/env.js';
++import { disconnectPrisma } from '../infra/db/prisma.js';
++import {
++  DEFAULT_SEVERITY_MAPPING,
++  seedAlertSource,
++  type SeverityMapping,
++} from '../modules/alerts/index.js';
++import { logger } from '../shared/observability/logger.js';
++
++const seedEnvSchema = z.object({
++  SEED_ALERT_SOURCE_ID: z.uuid(),
++  SEED_ALERT_SOURCE_NAME: z.string().min(1).max(200),
++  SEED_ALERT_SOURCE_SIGNING_SECRET: z.string().min(32).max(256),
++  SEED_ALERT_SOURCE_SEVERITY_MAPPING: z.string().optional(),
++});
++
++const severityMappingSchema = z
++  .record(z.string().min(1), z.enum(['P0', 'P1', 'P2', 'P3']))
++  .refine((mapping) => Object.keys(mapping).length > 0);
++
++function parseSeverityMapping(raw: string | undefined): SeverityMapping {
++  if (raw === undefined || raw.trim() === '') return DEFAULT_SEVERITY_MAPPING;
++  let json: unknown;
++  try {
++    json = JSON.parse(raw);
++  } catch {
++    throw new Error('Invalid seed configuration: SEED_ALERT_SOURCE_SEVERITY_MAPPING');
++  }
++  const parsed = severityMappingSchema.safeParse(json);
++  if (!parsed.success) {
++    throw new Error('Invalid seed configuration: SEED_ALERT_SOURCE_SEVERITY_MAPPING');
++  }
++  return parsed.data;
++}
++
++async function main(): Promise<void> {
++  getConfig(); // loads `.env` and validates the application configuration
++  const parsed = seedEnvSchema.safeParse(process.env);
++  if (!parsed.success) {
++    const names = [...new Set(parsed.error.issues.map((issue) => String(issue.path[0])))];
++    throw new Error(`Invalid seed configuration: ${names.join(', ')}`);
++  }
++
++  const result = await seedAlertSource({
++    id: parsed.data.SEED_ALERT_SOURCE_ID,
++    name: parsed.data.SEED_ALERT_SOURCE_NAME,
++    signingSecret: parsed.data.SEED_ALERT_SOURCE_SIGNING_SECRET,
++    severityMapping: parseSeverityMapping(parsed.data.SEED_ALERT_SOURCE_SEVERITY_MAPPING),
++  });
++  logger.info({ result, alertSourceId: parsed.data.SEED_ALERT_SOURCE_ID }, 'Alert source seeded');
++}
++
++main()
++  .catch((err: unknown) => {
++    logger.fatal({ err }, 'Alert source seed failed');
++    process.exitCode = 1;
++  })
++  .finally(disconnectPrisma);
+diff --git a/backend/test/helpers/alert-source.ts b/backend/test/helpers/alert-source.ts
+new file mode 100644
+index 0000000..cdfda38
+--- /dev/null
++++ b/backend/test/helpers/alert-source.ts
+@@ -0,0 +1,86 @@
++import { randomUUID } from 'node:crypto';
++import type { Express } from 'express';
++import request from 'supertest';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { computeSignature } from '../../src/modules/alerts/signature';
++
++export const SIGNING_SECRET = 'integration-signing-secret-0123456789';
++export const SEVERITY_MAPPING = { critical: 'P0', high: 'P1', warning: 'P2', info: 'P3' };
++
++export async function createAlertSource(
++  overrides: {
++    id?: string;
++    name?: string;
++    status?: 'ACTIVE' | 'DEACTIVATED';
++    signingSecret?: string;
++  } = {},
++) {
++  return getPrisma().alertSource.create({
++    data: {
++      ...(overrides.id ? { id: overrides.id } : {}),
++      name: overrides.name ?? 'Test source',
++      sourceType: 'GENERIC',
++      status: overrides.status ?? 'ACTIVE',
++      configuration: {
++        signingSecret: overrides.signingSecret ?? SIGNING_SECRET,
++        severityMapping: SEVERITY_MAPPING,
++      },
++    },
++  });
++}
++
++/** `n` distinct alerts; the nonce keeps every request's signature unique. */
++export function makeAlerts(n: number): Record<string, unknown>[] {
++  return Array.from({ length: n }, (_, i) => ({
++    name: `alert-${i}`,
++    environment: 'production',
++    nonce: randomUUID(),
++  }));
++}
++
++export const nowSeconds = () => Math.floor(Date.now() / 1000);
++
++export function signBody(body: string | Buffer, timestamp: number, secret = SIGNING_SECRET) {
++  const raw = typeof body === 'string' ? Buffer.from(body) : body;
++  return `sha256=${computeSignature(secret, String(timestamp), raw).toString('hex')}`;
++}
++
++export type SendOptions = {
++  secret?: string;
++  timestamp?: number;
++  /** Sent instead of `{ alerts }` (the signature still covers it unless `signedBody` is given). */
++  body?: string | Buffer;
++  /** What the signature is computed over, when it differs from what is sent (tampering). */
++  signedBody?: string | Buffer;
++  contentType?: string | null;
++  headers?: Record<string, string | null>;
++  requestId?: string;
++};
++
++/** Signs and posts a webhook request like a well-behaved source would. */
++export function postWebhook(
++  app: Express,
++  alertSourceId: string,
++  alerts: unknown,
++  options: SendOptions = {},
++) {
++  const body = options.body ?? JSON.stringify({ alerts });
++  const timestamp = options.timestamp ?? nowSeconds();
++  const signature = signBody(options.signedBody ?? body, timestamp, options.secret);
++
++  const req = request(app).post(`/webhooks/alerts/${alertSourceId}`);
++  if (options.contentType !== null)
++    req.set('Content-Type', options.contentType ?? 'application/json');
++  req.set('X-Signature', signature).set('X-Timestamp', String(timestamp));
++  if (options.requestId) req.set('X-Request-Id', options.requestId);
++  for (const [name, value] of Object.entries(options.headers ?? {})) {
++    if (value === null) req.unset(name);
++    else req.set(name, value);
++  }
++  return req.send(body);
++}
++
++/** The error response without the per-request id, for comparing responses. */
++export function withoutRequestId(body: { error: Record<string, unknown> }) {
++  return Object.fromEntries(Object.entries(body.error).filter(([key]) => key !== 'requestId'));
++}
+diff --git a/backend/test/helpers/app.ts b/backend/test/helpers/app.ts
+index 9eeb61d..40e55dc 100644
+--- a/backend/test/helpers/app.ts
++++ b/backend/test/helpers/app.ts
+@@ -2,9 +2,20 @@ import type { Express } from 'express';
+ import { createApiRouter } from '../../src/api-router';
+ import { createApp } from '../../src/app';
+ import { buildReadinessChecks } from '../../src/infra/readiness';
++import { createWebhookRouter, type WebhookDeps } from '../../src/modules/alerts';
+ import type { ReadinessCheck } from '../../src/shared/http/health';
+ 
+-/** The real application wired to the real PostgreSQL and Redis from the test environment. */
+-export function buildTestApp(readinessChecks: ReadinessCheck[] = buildReadinessChecks()): Express {
+-  return createApp({ readinessChecks, apiRouter: createApiRouter() });
++/**
++ * The real application wired to the real PostgreSQL and Redis from the test environment.
++ * `webhook` replaces individual collaborators of the alert webhook (ingestion, clock, Redis stores).
++ */
++export function buildTestApp(
++  readinessChecks: ReadinessCheck[] = buildReadinessChecks(),
++  webhook: Partial<WebhookDeps> = {},
++): Express {
++  return createApp({
++    readinessChecks,
++    apiRouter: createApiRouter(),
++    webhookRouter: createWebhookRouter(webhook),
++  });
+ }
+diff --git a/backend/test/integration/alert-source-seed.int-spec.ts b/backend/test/integration/alert-source-seed.int-spec.ts
+new file mode 100644
+index 0000000..6ab3a19
+--- /dev/null
++++ b/backend/test/integration/alert-source-seed.int-spec.ts
+@@ -0,0 +1,203 @@
++import { spawnSync } from 'node:child_process';
++import path from 'node:path';
++import * as audit from '../../src/infra/audit/append-audit-event';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { getRedis } from '../../src/infra/redis/redis';
++import {
++  DEFAULT_SEVERITY_MAPPING,
++  seedAlertSource,
++  type SeedAlertSourceInput,
++} from '../../src/modules/alerts';
++import { resetState } from '../helpers/identity';
++import { testDatabaseUrl, testRedisUrl } from '../helpers/test-env';
++
++const ID = '0192b5e0-7c1a-7d2e-8f3b-4a5c6d7e8f90';
++const SECRET_1 = 'first-signing-secret-0123456789-abcdef';
++const SECRET_2 = 'second-signing-secret-0123456789-abcdef';
++
++const input = (overrides: Partial<SeedAlertSourceInput> = {}): SeedAlertSourceInput => ({
++  id: ID,
++  name: 'Generic source',
++  signingSecret: SECRET_1,
++  severityMapping: DEFAULT_SEVERITY_MAPPING,
++  ...overrides,
++});
++
++const db = () => getPrisma();
++const auditEvents = () => db().auditEvent.findMany({ orderBy: { createdAt: 'asc' } });
++const source = () => db().alertSource.findUniqueOrThrow({ where: { id: ID } });
++
++beforeEach(resetState);
++afterEach(() => jest.restoreAllMocks());
++afterAll(async () => {
++  await db().$disconnect();
++  getRedis().disconnect();
++});
++
++describe('seedAlertSource', () => {
++  it('creates a GENERIC, ACTIVE source with the secret and the four-value mapping, and no audit', async () => {
++    expect(await seedAlertSource(input())).toBe('CREATED');
++
++    expect(await source()).toMatchObject({
++      id: ID,
++      name: 'Generic source',
++      sourceType: 'GENERIC',
++      status: 'ACTIVE',
++      configuration: {
++        signingSecret: SECRET_1,
++        severityMapping: { critical: 'P0', high: 'P1', warning: 'P2', info: 'P3' },
++      },
++    });
++    expect(await auditEvents()).toHaveLength(0);
++  });
++
++  it('an unchanged re-run writes nothing', async () => {
++    await seedAlertSource(input());
++    const before = await source();
++
++    expect(await seedAlertSource(input())).toBe('UNCHANGED');
++    expect(await source()).toEqual(before);
++    expect(await auditEvents()).toHaveLength(0);
++  });
++
++  it('rotating the secret appends exactly one audit event naming the key, never a value', async () => {
++    await seedAlertSource(input());
++    expect(await seedAlertSource(input({ signingSecret: SECRET_2 }))).toBe('UPDATED');
++
++    expect((await source()).configuration).toMatchObject({ signingSecret: SECRET_2 });
++    const events = await auditEvents();
++    expect(events).toHaveLength(1);
++    expect(events[0]).toMatchObject({
++      eventType: 'ALERT_SOURCE_UPDATED',
++      actor: null,
++      incidentId: null,
++      metadata: { alertSourceId: ID, changedKeys: ['signingSecret'] },
++    });
++    const serialized = JSON.stringify(events);
++    expect(serialized).not.toContain(SECRET_1);
++    expect(serialized).not.toContain(SECRET_2);
++  });
++
++  it('editing the mapping is audited by key name only', async () => {
++    await seedAlertSource(input());
++    const severityMapping = { critical: 'P1', high: 'P1', warning: 'P3', info: 'P3' } as const;
++    expect(await seedAlertSource(input({ severityMapping }))).toBe('UPDATED');
++
++    expect((await source()).configuration).toMatchObject({ severityMapping });
++    const events = await auditEvents();
++    expect(events).toHaveLength(1);
++    expect(events[0]!.metadata).toEqual({ alertSourceId: ID, changedKeys: ['severityMapping'] });
++  });
++
++  it('changing both is still one event, with both keys', async () => {
++    await seedAlertSource(input());
++    await seedAlertSource(
++      input({ signingSecret: SECRET_2, severityMapping: { critical: 'P0', other: 'P3' } }),
++    );
++    const events = await auditEvents();
++    expect(events).toHaveLength(1);
++    expect(events[0]!.metadata).toEqual({
++      alertSourceId: ID,
++      changedKeys: ['severityMapping', 'signingSecret'],
++    });
++  });
++
++  it('keeps other configuration keys, the name and the status of an existing source', async () => {
++    await seedAlertSource(input());
++    const current = await source();
++    await db().alertSource.update({
++      where: { id: ID },
++      data: {
++        status: 'DEACTIVATED',
++        configuration: { ...(current.configuration as object), extra: { keep: true } },
++      },
++    });
++
++    expect(await seedAlertSource(input({ name: 'Renamed', signingSecret: SECRET_2 }))).toBe(
++      'UPDATED',
++    );
++    expect(await source()).toMatchObject({
++      name: 'Generic source',
++      status: 'DEACTIVATED',
++      configuration: { extra: { keep: true }, signingSecret: SECRET_2 },
++    });
++    expect((await auditEvents())[0]!.metadata).toMatchObject({ changedKeys: ['signingSecret'] });
++  });
++
++  it('is atomic: if the audit write fails the configuration is not changed', async () => {
++    await seedAlertSource(input());
++    jest.spyOn(audit, 'appendAuditEvent').mockRejectedValueOnce(new Error('audit failed'));
++
++    await expect(seedAlertSource(input({ signingSecret: SECRET_2 }))).rejects.toThrow(
++      'audit failed',
++    );
++    expect((await source()).configuration).toMatchObject({ signingSecret: SECRET_1 });
++    expect(await auditEvents()).toHaveLength(0);
++  });
++
++  it('seeded simultaneously, a new source is created once and nothing is audited', async () => {
++    const results = await Promise.all(Array.from({ length: 5 }, () => seedAlertSource(input())));
++    expect(results.filter((r) => r === 'CREATED')).toHaveLength(1);
++    expect(results.filter((r) => r === 'UNCHANGED')).toHaveLength(4);
++    expect(await db().alertSource.count()).toBe(1);
++    expect(await auditEvents()).toHaveLength(0);
++  });
++
++  it('two simultaneous rotations are serialized and each audited', async () => {
++    await seedAlertSource(input());
++    await Promise.all([
++      seedAlertSource(input({ signingSecret: SECRET_2 })),
++      seedAlertSource(input({ signingSecret: 'third-signing-secret-0123456789-abcdef' })),
++    ]);
++    expect(await auditEvents()).toHaveLength(2);
++  });
++});
++
++describe('npm run seed:alert-source (script)', () => {
++  const script = path.resolve(__dirname, '../../src/scripts/seed-alert-source.ts');
++  const run = (env: Record<string, string>) =>
++    spawnSync(process.execPath, ['--import', 'tsx', script], {
++      cwd: path.resolve(__dirname, '../..'),
++      env: {
++        ...process.env,
++        DATABASE_URL: testDatabaseUrl(),
++        REDIS_URL: testRedisUrl(),
++        SEED_ALERT_SOURCE_ID: ID,
++        SEED_ALERT_SOURCE_NAME: 'Scripted source',
++        SEED_ALERT_SOURCE_SIGNING_SECRET: SECRET_1,
++        ...env,
++      },
++      encoding: 'utf8',
++    });
++
++  it('seeds from the environment and never prints the secret', async () => {
++    const created = run({});
++    expect(created.status).toBe(0);
++    expect(created.stdout).toContain('CREATED');
++    expect((await source()).configuration).toMatchObject({
++      signingSecret: SECRET_1,
++      severityMapping: DEFAULT_SEVERITY_MAPPING,
++    });
++
++    const rotated = run({ SEED_ALERT_SOURCE_SIGNING_SECRET: SECRET_2 });
++    expect(rotated.status).toBe(0);
++    expect(rotated.stdout).toContain('UPDATED');
++    for (const output of [created, rotated]) {
++      expect(output.stdout + output.stderr).not.toContain(SECRET_1);
++      expect(output.stdout + output.stderr).not.toContain(SECRET_2);
++    }
++    expect(await auditEvents()).toHaveLength(1);
++  }, 60_000);
++
++  it('rejects a weak secret or a bad mapping, naming the variable only', async () => {
++    const weak = run({ SEED_ALERT_SOURCE_SIGNING_SECRET: 'short-secret' });
++    expect(weak.status).toBe(1);
++    expect(weak.stdout + weak.stderr).toContain('SEED_ALERT_SOURCE_SIGNING_SECRET');
++    expect(weak.stdout + weak.stderr).not.toContain('short-secret');
++
++    const bad = run({ SEED_ALERT_SOURCE_SEVERITY_MAPPING: '{"critical":"P9"}' });
++    expect(bad.status).toBe(1);
++    expect(bad.stdout + bad.stderr).toContain('SEED_ALERT_SOURCE_SEVERITY_MAPPING');
++    expect(await db().alertSource.count()).toBe(0);
++  }, 60_000);
++});
+diff --git a/backend/test/integration/webhook.int-spec.ts b/backend/test/integration/webhook.int-spec.ts
+new file mode 100644
+index 0000000..d15cc9d
+--- /dev/null
++++ b/backend/test/integration/webhook.int-spec.ts
+@@ -0,0 +1,526 @@
++import type { Express } from 'express';
++import request from 'supertest';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { createRedisConnection, getRedis } from '../../src/infra/redis/redis';
++import { writeBlockedNotice } from '../../src/modules/alerts/admin-notice';
++import { createRateLimiter, rateLimitKeys } from '../../src/modules/alerts/rate-limiter';
++import { createReplayStore, replayKey } from '../../src/modules/alerts/replay.store';
++import type { VerifiedAlertContext } from '../../src/modules/alerts';
++import { buildTestApp } from '../helpers/app';
++import {
++  createAlertSource,
++  makeAlerts,
++  nowSeconds,
++  postWebhook,
++  SEVERITY_MAPPING,
++  SIGNING_SECRET,
++  signBody,
++  withoutRequestId,
++} from '../helpers/alert-source';
++import { resetState } from '../helpers/identity';
++
++const ingest = jest.fn<Promise<unknown>, [VerifiedAlertContext]>();
++let app: Express;
++let sourceId: string;
++
++const OK_BODY = { data: { results: [] } };
++
++beforeEach(async () => {
++  await resetState();
++  ingest.mockReset().mockResolvedValue(OK_BODY);
++  app = buildTestApp(undefined, { ingest });
++  sourceId = (await createAlertSource()).id;
++});
++
++afterAll(async () => {
++  await getPrisma().$disconnect();
++  getRedis().disconnect();
++});
++
++const keys = () => rateLimitKeys(sourceId);
++const outboxRows = () => getPrisma().outboxEvent.findMany({ orderBy: { createdAt: 'asc' } });
++
++describe('W1 · POST /webhooks/alerts/:alertSourceId', () => {
++  describe('a valid request', () => {
++    it('is verified and handed to ingestion with the bounded context', async () => {
++      const alerts = makeAlerts(3);
++      const res = await postWebhook(app, sourceId, alerts, { requestId: 'req-ok-1' });
++
++      expect(res.status).toBe(200);
++      expect(res.body).toEqual(OK_BODY);
++      expect(res.headers['x-request-id']).toBe('req-ok-1');
++      expect(ingest).toHaveBeenCalledTimes(1);
++      expect(ingest.mock.calls[0]?.[0]).toEqual({
++        alertSource: {
++          id: sourceId,
++          name: 'Test source',
++          sourceType: 'GENERIC',
++          configuration: { signingSecret: SIGNING_SECRET, severityMapping: SEVERITY_MAPPING },
++        },
++        items: alerts,
++        rateLimitedIndices: [],
++        requestId: 'req-ok-1',
++      });
++    });
++
++    it('without ingestion wired (SLICE-04 pending) is answered 501 NOT_IMPLEMENTED', async () => {
++      const res = await postWebhook(buildTestApp(), sourceId, makeAlerts(1));
++      expect(res.status).toBe(501);
++      expect(res.body.error).toMatchObject({ code: 'NOT_IMPLEMENTED', details: [] });
++      expect(await getPrisma().alert.count()).toBe(0);
++    });
++  });
++
++  describe('step 2 · source authentication', () => {
++    it('every failure is the identical 401 SOURCE_AUTH_FAILED', async () => {
++      const deactivated = await createAlertSource({ status: 'DEACTIVATED' });
++      const alerts = makeAlerts(1);
++      const sent = JSON.stringify({ alerts });
++      const attempts = await Promise.all([
++        postWebhook(app, sourceId, alerts, { secret: 'a-completely-different-secret-value!' }),
++        postWebhook(app, sourceId, alerts, {
++          body: sent,
++          signedBody: sent.replace('alert-0', 'x'),
++        }),
++        postWebhook(app, '0192b5e0-7c1a-7d2e-8f3b-4a5c6d7e8f90', alerts),
++        postWebhook(app, deactivated.id, alerts),
++        postWebhook(app, 'not-a-uuid', alerts),
++        postWebhook(app, sourceId, alerts, { headers: { 'X-Signature': null } }),
++        postWebhook(app, sourceId, alerts, { headers: { 'X-Timestamp': null } }),
++        postWebhook(app, sourceId, alerts, { headers: { 'X-Signature': 'sha256=zz' } }),
++        postWebhook(app, sourceId, alerts, { headers: { 'X-Timestamp': 'yesterday' } }),
++      ]);
++
++      for (const res of attempts) {
++        expect(res.status).toBe(401);
++        expect(withoutRequestId(res.body)).toEqual(withoutRequestId(attempts[0]!.body));
++      }
++      expect(withoutRequestId(attempts[0]!.body)).toEqual({
++        code: 'SOURCE_AUTH_FAILED',
++        message: 'Source authentication failed',
++        details: [],
++      });
++      expect(JSON.stringify(attempts.map((r) => r.body))).not.toContain(SIGNING_SECRET);
++      expect(ingest).not.toHaveBeenCalled();
++    });
++
++    it('a failed authentication stores nothing in Redis', async () => {
++      await postWebhook(app, sourceId, makeAlerts(2), {
++        secret: 'wrong-secret-wrong-secret-wrong-secret',
++      });
++      expect(await getRedis().keys('wh:*')).toEqual([]);
++    });
++  });
++
++  describe('step 3 · timestamp', () => {
++    const NOW = 1_900_000_000;
++    let fixed: Express;
++    beforeEach(() => {
++      fixed = buildTestApp(undefined, { ingest, now: () => NOW * 1000 + 250 });
++    });
++
++    it.each([
++      ['300 s in the past', NOW - 300, 200],
++      ['301 s in the past', NOW - 301, 401],
++      ['300 s in the future', NOW + 300, 200],
++      ['301 s in the future', NOW + 301, 401],
++    ])('%s', async (_name, timestamp, status) => {
++      const res = await postWebhook(fixed, sourceId, makeAlerts(1), { timestamp });
++      expect(res.status).toBe(status);
++      if (status === 401) {
++        expect(res.body.error).toMatchObject({ code: 'REQUEST_STALE', details: [] });
++      }
++    });
++
++    it('a stale request is not remembered as seen', async () => {
++      await postWebhook(fixed, sourceId, makeAlerts(1), { timestamp: NOW - 400 });
++      expect(await getRedis().keys('wh:*')).toEqual([]);
++    });
++  });
++
++  describe('step 4 · replay protection', () => {
++    it('the identical signed request again is 409 REPLAY_DETECTED', async () => {
++      const body = JSON.stringify({ alerts: makeAlerts(1) });
++      const timestamp = nowSeconds();
++      expect((await postWebhook(app, sourceId, null, { body, timestamp })).status).toBe(200);
++
++      const again = await postWebhook(app, sourceId, null, { body, timestamp });
++      expect(again.status).toBe(409);
++      expect(again.body.error).toMatchObject({ code: 'REPLAY_DETECTED', details: [] });
++      expect(ingest).toHaveBeenCalledTimes(1);
++    });
++
++    it('the same alerts, freshly signed, are not a replay', async () => {
++      const NOW = 1_900_000_000;
++      const fixed = buildTestApp(undefined, { ingest, now: () => NOW * 1000 });
++      const body = JSON.stringify({ alerts: makeAlerts(1) });
++      expect((await postWebhook(fixed, sourceId, null, { body, timestamp: NOW })).status).toBe(200);
++      expect((await postWebhook(fixed, sourceId, null, { body, timestamp: NOW + 1 })).status).toBe(
++        200,
++      );
++      expect(ingest).toHaveBeenCalledTimes(2);
++    });
++
++    it('records the signature for the whole acceptance window', async () => {
++      const body = JSON.stringify({ alerts: makeAlerts(1) });
++      const timestamp = nowSeconds();
++      await postWebhook(app, sourceId, null, { body, timestamp });
++      const hex = signBody(body, timestamp).slice('sha256='.length);
++      const ttl = await getRedis().ttl(replayKey(sourceId, hex));
++      expect(ttl).toBeGreaterThanOrEqual(600);
++      expect(ttl).toBeLessThanOrEqual(610);
++    });
++
++    it('simultaneous identical requests: exactly one passes', async () => {
++      const body = JSON.stringify({ alerts: makeAlerts(1) });
++      const timestamp = nowSeconds();
++      const results = await Promise.all(
++        Array.from({ length: 12 }, () => postWebhook(app, sourceId, null, { body, timestamp })),
++      );
++      expect(results.filter((r) => r.status === 200)).toHaveLength(1);
++      expect(results.filter((r) => r.status === 409)).toHaveLength(11);
++      expect(ingest).toHaveBeenCalledTimes(1);
++    });
++
++    it('a rejected request still leaves its signature marked (retries must be re-signed)', async () => {
++      const body = JSON.stringify({ alerts: makeAlerts(1) });
++      const timestamp = nowSeconds();
++      expect(
++        (await postWebhook(app, sourceId, null, { body, timestamp, contentType: null })).status,
++      ).toBe(400);
++      expect((await postWebhook(app, sourceId, null, { body, timestamp })).status).toBe(409);
++    });
++  });
++
++  describe('step 5 · rate limiting (15 alerts/min per source, counted per alert)', () => {
++    it('accepts 15 alerts, then answers 429 RATE_LIMITED with Retry-After', async () => {
++      expect((await postWebhook(app, sourceId, makeAlerts(15))).status).toBe(200);
++      const res = await postWebhook(app, sourceId, makeAlerts(1));
++      expect(res.status).toBe(429);
++      expect(res.headers['retry-after']).toBe('300');
++      expect(res.body.error).toMatchObject({ code: 'RATE_LIMITED', details: [] });
++      expect(ingest).toHaveBeenCalledTimes(1);
++    });
++
++    it('counts alerts, not requests', async () => {
++      for (let i = 0; i < 3; i++) {
++        expect((await postWebhook(app, sourceId, makeAlerts(5))).status).toBe(200);
++      }
++      expect((await postWebhook(app, sourceId, makeAlerts(1))).status).toBe(429);
++    });
++
++    it('with partial capacity the first alerts pass and the rest are marked rate limited', async () => {
++      await postWebhook(app, sourceId, makeAlerts(10));
++      const alerts = makeAlerts(10);
++      const res = await postWebhook(app, sourceId, alerts);
++
++      expect(res.status).toBe(200);
++      const context = ingest.mock.calls[1]![0];
++      expect(context.items).toEqual(alerts);
++      expect(context.rateLimitedIndices).toEqual([5, 6, 7, 8, 9]);
++      expect((await postWebhook(app, sourceId, makeAlerts(1))).status).toBe(429);
++    });
++
++    it('limits sources independently', async () => {
++      const other = await createAlertSource({ name: 'Other' });
++      await postWebhook(app, sourceId, makeAlerts(15));
++      expect((await postWebhook(app, sourceId, makeAlerts(1))).status).toBe(429);
++      expect((await postWebhook(app, other.id, makeAlerts(1))).status).toBe(200);
++    });
++
++    it('a blocked source gets 429 with the remaining block, whatever the body', async () => {
++      await postWebhook(app, sourceId, makeAlerts(15));
++      await postWebhook(app, sourceId, makeAlerts(1));
++
++      const res = await postWebhook(app, sourceId, null, { body: 'not json' });
++      expect(res.status).toBe(429);
++      expect(Number(res.headers['retry-after'])).toBeGreaterThan(290);
++      expect(Number(res.headers['retry-after'])).toBeLessThanOrEqual(300);
++      expect(ingest).toHaveBeenCalledTimes(1);
++    });
++
++    it('a block ends by itself when its window passes', async () => {
++      await postWebhook(app, sourceId, makeAlerts(15));
++      await postWebhook(app, sourceId, makeAlerts(1));
++      await getRedis().del(keys().block); // the block's TTL elapsing
++      expect((await postWebhook(app, sourceId, makeAlerts(1))).status).toBe(200);
++    });
++
++    it('never lets concurrent requests exceed the capacity', async () => {
++      const results = await Promise.all(
++        Array.from({ length: 30 }, () => postWebhook(app, sourceId, makeAlerts(1))),
++      );
++      expect(results.filter((r) => r.status === 200)).toHaveLength(15);
++      expect(results.filter((r) => r.status === 429)).toHaveLength(15);
++      expect(ingest).toHaveBeenCalledTimes(15);
++      expect(await getRedis().get(keys().level)).toBe('1'); // one violation, not fifteen
++    });
++
++    it('a request with nothing to count is not rate limited', async () => {
++      const base = nowSeconds();
++      for (let i = 0; i < 20; i++) {
++        // distinct timestamps give distinct signatures: none of these is a replay
++        expect((await postWebhook(app, sourceId, [], { timestamp: base - i })).status).toBe(422);
++      }
++      expect(await getRedis().get(keys().count)).toBeNull();
++    });
++
++    describe('the ladder', () => {
++      const EXPECTED_SECONDS = [300, 1200, 2700, 7200, 86_400];
++
++      /** Fills the window, then violates; returns the violating response. */
++      async function violate(application: Express = app) {
++        expect((await postWebhook(application, sourceId, makeAlerts(15))).status).toBe(200);
++        return postWebhook(application, sourceId, makeAlerts(1));
++      }
++
++      it('escalates 5 min → 20 min → 45 min → 2 h → final block, notifying only at the end', async () => {
++        for (let violation = 1; violation <= 5; violation++) {
++          const res = await violate();
++          expect(res.status).toBe(429);
++          expect(res.headers['retry-after']).toBe(String(EXPECTED_SECONDS[violation - 1]));
++          if (violation < 5) {
++            expect(await outboxRows()).toHaveLength(0);
++            await getRedis().del(keys().block); // the block's window passes
++          }
++        }
++        expect(await getRedis().get(keys().level)).toBe('5');
++      });
++
++      it('writes one NOTIFICATION_REQUESTED outbox event per block and no timeline event', async () => {
++        for (let violation = 1; violation <= 5; violation++) {
++          await violate();
++          if (violation < 5) await getRedis().del(keys().block);
++        }
++        // Repeated attempts inside the final block, some at once.
++        await Promise.all(
++          Array.from({ length: 8 }, () => postWebhook(app, sourceId, makeAlerts(1))),
++        );
++        await postWebhook(app, sourceId, makeAlerts(1));
++
++        const rows = await outboxRows();
++        expect(rows).toHaveLength(1);
++        expect(rows[0]).toMatchObject({
++          eventType: 'NOTIFICATION_REQUESTED',
++          aggregateType: 'ALERT_SOURCE',
++          aggregateId: sourceId,
++          status: 'PENDING',
++        });
++        expect(rows[0]!.payload).toEqual({
++          kind: 'ALERT_SOURCE_BLOCKED',
++          alertSourceId: sourceId,
++          attemptCount: 5,
++          requestId: expect.any(String),
++        });
++        expect(await getPrisma().auditEvent.count()).toBe(0);
++        expect(await getPrisma().incident.count()).toBe(0);
++      });
++
++      it('a later block (the window passed, violated again) is a new block with its own notice', async () => {
++        for (let violation = 1; violation <= 5; violation++) {
++          await violate();
++          await getRedis().del(keys().block);
++        }
++        expect(await outboxRows()).toHaveLength(1);
++
++        const res = await violate();
++        expect(res.status).toBe(429);
++        expect(res.headers['retry-after']).toBe('86400');
++        const rows = await outboxRows();
++        expect(rows).toHaveLength(2);
++        expect(rows[1]!.payload).toMatchObject({ attemptCount: 6 });
++      });
++
++      it('retries a notice whose write failed on the next blocked request, then once only', async () => {
++        const flaky = jest
++          .fn<Promise<void>, Parameters<typeof writeBlockedNotice>>()
++          .mockRejectedValueOnce(new Error('database down'))
++          .mockImplementation(writeBlockedNotice);
++        const flakyApp = buildTestApp(undefined, { ingest, notifyBlocked: flaky });
++
++        for (let violation = 1; violation <= 5; violation++) {
++          const res = await violate(flakyApp);
++          expect(res.status).toBe(429); // the answer does not depend on the notice
++          if (violation < 5) await getRedis().del(keys().block);
++        }
++        expect(flaky).toHaveBeenCalledTimes(1);
++        expect(await outboxRows()).toHaveLength(0);
++
++        await getRedis().del(keys().noticeLock); // the writer's claim elapsing
++        expect((await postWebhook(flakyApp, sourceId, makeAlerts(1))).status).toBe(429);
++        expect(flaky).toHaveBeenCalledTimes(2);
++        expect(await outboxRows()).toHaveLength(1);
++
++        await getRedis().del(keys().noticeLock);
++        await postWebhook(flakyApp, sourceId, makeAlerts(1));
++        expect(flaky).toHaveBeenCalledTimes(2);
++        expect(await outboxRows()).toHaveLength(1);
++      });
++    });
++  });
++
++  describe('step 6 · envelope', () => {
++    const failure = async (res: request.Response, status: number, code: string) => {
++      expect(res.status).toBe(status);
++      expect(res.body.error).toMatchObject({ code });
++      expect(res.body.error.details).toEqual(expect.any(Array));
++      expect(ingest).not.toHaveBeenCalled();
++    };
++
++    it('a missing Content-Type is 400 BAD_REQUEST', async () => {
++      await failure(
++        await postWebhook(app, sourceId, makeAlerts(1), { contentType: null }),
++        400,
++        'BAD_REQUEST',
++      );
++    });
++
++    it('a Content-Type other than JSON is 400 BAD_REQUEST', async () => {
++      await failure(
++        await postWebhook(app, sourceId, makeAlerts(1), { contentType: 'text/plain' }),
++        400,
++        'BAD_REQUEST',
++      );
++    });
++
++    it('malformed JSON is 422 VALIDATION_FAILED', async () => {
++      await failure(
++        await postWebhook(app, sourceId, null, { body: '{"alerts": [' }),
++        422,
++        'VALIDATION_FAILED',
++      );
++    });
++
++    it.each([
++      ['a missing alerts', '{}'],
++      ['an empty alerts', '{"alerts":[]}'],
++      ['alerts that is not an array', '{"alerts":"x"}'],
++      ['a body that is not an object', '[]'],
++    ])('%s is 422 VALIDATION_FAILED', async (_name, body) => {
++      await failure(await postWebhook(app, sourceId, null, { body }), 422, 'VALIDATION_FAILED');
++    });
++
++    it('an unknown top-level field is 400 BAD_REQUEST', async () => {
++      const body = JSON.stringify({ alerts: makeAlerts(1), extra: true });
++      await failure(await postWebhook(app, sourceId, null, { body }), 400, 'BAD_REQUEST');
++    });
++
++    it('101 alerts is 400 BAD_REQUEST; 100 alerts pass, the rate-limited ones marked', async () => {
++      await failure(await postWebhook(app, sourceId, makeAlerts(101)), 400, 'BAD_REQUEST');
++
++      const other = await createAlertSource({ name: 'Other' });
++      const res = await postWebhook(app, other.id, makeAlerts(100));
++      expect(res.status).toBe(200);
++      const context = ingest.mock.calls[0]![0];
++      expect(context.items).toHaveLength(100);
++      expect(context.rateLimitedIndices).toEqual(Array.from({ length: 85 }, (_, i) => 15 + i));
++    });
++
++    it('a request that fails the envelope never reaches ingestion and persists nothing', async () => {
++      await postWebhook(app, sourceId, []);
++      expect(await getPrisma().alert.count()).toBe(0);
++      expect(await getPrisma().incident.count()).toBe(0);
++      expect(await outboxRows()).toHaveLength(0);
++    });
++  });
++
++  describe('step 1 · body size', () => {
++    const LIMIT = 1024 * 1024;
++    const padded = (bytes: number) => {
++      const shell = '{"alerts":[{"pad":""}]}';
++      return shell.replace('"pad":""', `"pad":"${'x'.repeat(bytes - shell.length)}"`);
++    };
++
++    it('accepts a body of exactly 1 MB', async () => {
++      const body = padded(LIMIT);
++      expect(Buffer.byteLength(body)).toBe(LIMIT);
++      const res = await postWebhook(app, sourceId, null, { body });
++      expect(res.status).toBe(200);
++      expect(ingest.mock.calls[0]![0].items).toHaveLength(1);
++    });
++
++    it('rejects a body of 1 MB + 1 byte with 413 PAYLOAD_TOO_LARGE', async () => {
++      const res = await postWebhook(app, sourceId, null, { body: padded(LIMIT + 1) });
++      expect(res.status).toBe(413);
++      expect(res.body.error).toMatchObject({ code: 'PAYLOAD_TOO_LARGE', details: [] });
++      expect(ingest).not.toHaveBeenCalled();
++    });
++
++    it('decides before authentication: an unsigned or unknown-source oversize body is 413', async () => {
++      const big = padded(LIMIT + 1);
++      const unknown = await request(app)
++        .post('/webhooks/alerts/0192b5e0-7c1a-7d2e-8f3b-4a5c6d7e8f90')
++        .set('Content-Type', 'application/json')
++        .send(big);
++      expect(unknown.status).toBe(413);
++      expect(await getRedis().keys('wh:*')).toEqual([]);
++    });
++  });
++
++  describe('Redis unavailable: fail closed', () => {
++    const dead = createRedisConnection('general', 'redis://127.0.0.1:1');
++    afterAll(() => {
++      if (dead.status !== 'end') dead.disconnect();
++    });
++
++    it('at step 4 (replay store): 503 DEPENDENCY_UNAVAILABLE with Retry-After, nothing processed', async () => {
++      const down = buildTestApp(undefined, { ingest, replayStore: createReplayStore(dead) });
++      const res = await postWebhook(down, sourceId, makeAlerts(1));
++
++      expect(res.status).toBe(503);
++      expect(res.headers['retry-after']).toBe('5');
++      expect(res.body.error).toMatchObject({ code: 'DEPENDENCY_UNAVAILABLE', details: [] });
++      expect(ingest).not.toHaveBeenCalled();
++      expect(await getRedis().keys('wh:*')).toEqual([]); // the rate limiter was not run either
++    });
++
++    it('at step 5 (rate limiter): 503 with Retry-After, nothing processed or stored', async () => {
++      const down = buildTestApp(undefined, { ingest, rateLimiter: createRateLimiter(dead) });
++      const res = await postWebhook(down, sourceId, makeAlerts(1));
++
++      expect(res.status).toBe(503);
++      expect(res.headers['retry-after']).toBe('5');
++      expect(res.body.error.code).toBe('DEPENDENCY_UNAVAILABLE');
++      expect(ingest).not.toHaveBeenCalled();
++      expect(await getPrisma().alert.count()).toBe(0);
++      expect(await getRedis().get(keys().count)).toBeNull();
++    });
++
++    it('steps that do not need Redis answer as specified', async () => {
++      const down = buildTestApp(undefined, {
++        ingest,
++        replayStore: createReplayStore(dead),
++        rateLimiter: createRateLimiter(dead),
++      });
++      const oversize = await request(down)
++        .post(`/webhooks/alerts/${sourceId}`)
++        .set('Content-Type', 'application/json')
++        .send('x'.repeat(1024 * 1024 + 1));
++      expect(oversize.status).toBe(413);
++
++      expect(
++        (
++          await postWebhook(down, sourceId, makeAlerts(1), {
++            secret: 'wrong-wrong-wrong-wrong-wrong-wrong',
++          })
++        ).status,
++      ).toBe(401);
++      expect(
++        (await postWebhook(down, sourceId, makeAlerts(1), { timestamp: nowSeconds() - 1000 })).body
++          .error.code,
++      ).toBe('REQUEST_STALE');
++    });
++
++    it('recovers when Redis is back, and a wiped Redis starts empty', async () => {
++      const body = JSON.stringify({ alerts: makeAlerts(15) });
++      const timestamp = nowSeconds();
++      expect((await postWebhook(app, sourceId, null, { body, timestamp })).status).toBe(200);
++      expect((await postWebhook(app, sourceId, null, { body, timestamp })).status).toBe(409);
++      expect((await postWebhook(app, sourceId, makeAlerts(1))).status).toBe(429);
++
++      await getRedis().flushdb(); // replay records, counters, ladder memory and blocks reset
++
++      expect((await postWebhook(app, sourceId, null, { body, timestamp })).status).toBe(200);
++    });
++  });
++});

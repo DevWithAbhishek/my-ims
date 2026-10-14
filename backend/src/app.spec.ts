@@ -124,4 +124,26 @@ describe('createApp', () => {
       expect(res.headers['x-request-id']).toBe('abc-1');
     });
   });
+  describe('webhookRouter', () => {
+    const webhookRouter = Router();
+    webhookRouter.post('/webhooks/probe', (req, res) => {
+      // Mounted before the JSON parser: the stream is still unread and `req.body` is not set.
+      res.json({ parsed: req.body !== undefined, hasStream: req.readable });
+    });
+    const app = createApp({ readinessChecks: [], webhookRouter });
+
+    it('is mounted at the root, ahead of the JSON body parser and its limit', async () => {
+      const res = await request(app)
+        .post('/webhooks/probe')
+        .set('Content-Type', 'application/json')
+        .send({ blob: 'x'.repeat(200 * 1024) });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ parsed: false, hasStream: true });
+    });
+
+    it('is optional', async () => {
+      const res = await request(createApp({ readinessChecks: [] })).post('/webhooks/probe');
+      expect(res.status).toBe(404);
+    });
+  });
 });
