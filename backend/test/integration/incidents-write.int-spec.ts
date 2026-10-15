@@ -143,7 +143,7 @@ describe('I10 PATCH /incidents/:incidentId — comment', () => {
     ['missing body', { comment: {} }, 422],
     ['comment that is not an object', { comment: 'hi' }, 422],
     ['empty body', {}, 422],
-    ['another action instead of a comment', { status: 'ACKNOWLEDGED' }, 422],
+    ['a body that matches no action instead of a comment', { status: 'OPEN' }, 422],
     ['a comment combined with another action', { comment: { body: 'x' }, severity: 'P1' }, 422],
     ['an unknown field', { comment: { body: 'x' }, extra: 1 }, 400],
     ['a client-sent author', { comment: { body: 'x', authorId: randomUUID() } }, 400],

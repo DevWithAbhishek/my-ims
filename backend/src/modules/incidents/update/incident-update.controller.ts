@@ -10,6 +10,11 @@ export const updateIncidentHandler: RequestHandler = async (req, res) => {
   const { incidentId } = parseOrThrow(incidentParamsSchema, req.params);
   const body = parseOrThrow(updateIncidentBodySchema, req.body);
   const row = selectRow(body);
-  const result = await row.handle({ auth: getAuth(req), incidentId, body });
+  const result = await row.handle({
+    auth: getAuth(req),
+    incidentId,
+    body,
+    requestId: res.locals.requestId as string,
+  });
   res.status(result.status).json({ data: result.data });
 };

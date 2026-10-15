@@ -12,11 +12,27 @@ export function isUniqueViolation(error: unknown): boolean {
   return sqlState(error) === '23505';
 }
 
-/** Deadlock, serialization failure or lock timeout (Prisma `P2034` or SQLSTATE 40001/40P01/55P03). */
+const CONCURRENCY_SQLSTATES = new Set(['40001', '40P01', '55P03']);
+
+/** The SQLSTATE a driver adapter reports inside a Prisma error (raw queries: `P2010`). */
+function adapterSqlState(error: Prisma.PrismaClientKnownRequestError): string | undefined {
+  const meta = error.meta as { driverAdapterError?: { cause?: { code?: unknown } } } | undefined;
+  const code = meta?.driverAdapterError?.cause?.code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+/**
+ * Deadlock, serialization failure or lock timeout (Prisma `P2034`, SQLSTATE 40001/40P01/55P03 on
+ * the error itself, or the same SQLSTATE in the driver adapter error of a failed raw query).
+ */
 export function isConcurrencyFailure(error: unknown): boolean {
-  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2034') return true;
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (error.code === 'P2034') return true;
+    const adapterState = adapterSqlState(error);
+    if (adapterState !== undefined && CONCURRENCY_SQLSTATES.has(adapterState)) return true;
+  }
   const state = sqlState(error);
-  return state === '40001' || state === '40P01' || state === '55P03';
+  return state !== undefined && CONCURRENCY_SQLSTATES.has(state);
 }
 
 const UNAVAILABLE_PRISMA_CODES = new Set(['P1001', 'P1002', 'P1008', 'P1017', 'P2024']);

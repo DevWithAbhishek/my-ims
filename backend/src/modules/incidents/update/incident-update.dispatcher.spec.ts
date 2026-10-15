@@ -58,8 +58,7 @@ describe('selectRow', () => {
 
   it.each([
     ['an empty body', {}],
-    ['an action owned by another slice', { status: 'ACKNOWLEDGED' }],
-    ['a null assignee (present, matches no row yet)', { currentAssignee: null }],
+    ['a null assignee without status OPEN', { currentAssignee: null }],
     ['a comment combined with another field', { comment: { body: 'x' }, severity: 'P1' }],
   ])('rejects %s with 422', (_name, body) => {
     expect(code(() => selectRow(parse(body)))).toEqual({ status: 422, code: 'VALIDATION_FAILED' });
@@ -80,6 +79,6 @@ describe('selectRow', () => {
       'currentAssignee',
       'severity',
     ]);
-    expect(UPDATE_ROWS.map((row) => row.id)).toEqual(['I10']);
+    expect(UPDATE_ROWS.map((row) => row.id)).toEqual(['I3', 'I4', 'I5', 'I6', 'I7', 'I8', 'I10']);
   });
 });

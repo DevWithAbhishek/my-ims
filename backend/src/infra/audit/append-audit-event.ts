@@ -27,10 +27,13 @@ function nextCreatedAt(tx: TransactionClient): Date {
 /**
  * Appends one audit event on the caller's transaction, so it commits or rolls back with the change
  * it describes. It never opens or commits a transaction and offers no update or delete path.
- * Events written by one command appear in the order written.
+ * Events written by one command appear in the order written. Returns the new event's id.
  */
-export async function appendAuditEvent(tx: TransactionClient, input: AuditEventInput) {
-  await tx.auditEvent.create({
+export async function appendAuditEvent(
+  tx: TransactionClient,
+  input: AuditEventInput,
+): Promise<string> {
+  const created = await tx.auditEvent.create({
     data: {
       eventType: input.eventType,
       actor: input.actorId,
@@ -38,5 +41,7 @@ export async function appendAuditEvent(tx: TransactionClient, input: AuditEventI
       metadata: input.metadata,
       createdAt: nextCreatedAt(tx),
     },
+    select: { id: true },
   });
+  return created.id;
 }

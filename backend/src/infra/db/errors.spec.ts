@@ -1,5 +1,5 @@
 import { Prisma } from '../../generated/prisma/client.js';
-import { isDatabaseUnavailable } from './errors.js';
+import { isConcurrencyFailure, isDatabaseUnavailable } from './errors.js';
 
 function known(code: string, meta?: Record<string, unknown>) {
   return new Prisma.PrismaClientKnownRequestError('boom', { code, clientVersion: 'test', meta });
@@ -36,5 +36,31 @@ describe('isDatabaseUnavailable', () => {
     ).toBe(false);
     expect(isDatabaseUnavailable(new Error('nope'))).toBe(false);
     expect(isDatabaseUnavailable(undefined)).toBe(false);
+  });
+});
+
+describe('isConcurrencyFailure', () => {
+  it('recognizes Prisma P2034 and a bare SQLSTATE', () => {
+    expect(isConcurrencyFailure(known('P2034'))).toBe(true);
+    for (const code of ['40001', '40P01', '55P03']) {
+      expect(isConcurrencyFailure(Object.assign(new Error('x'), { code }))).toBe(true);
+    }
+  });
+
+  it.each(['40001', '40P01', '55P03'])(
+    'recognizes SQLSTATE %s inside the driver adapter error of a failed raw query',
+    (code) => {
+      const error = known('P2010', { driverAdapterError: { cause: { kind: 'postgres', code } } });
+      expect(isConcurrencyFailure(error)).toBe(true);
+    },
+  );
+
+  it('does not treat other errors as a concurrency failure', () => {
+    expect(isConcurrencyFailure(known('P2002'))).toBe(false);
+    expect(
+      isConcurrencyFailure(known('P2010', { driverAdapterError: { cause: { code: '23505' } } })),
+    ).toBe(false);
+    expect(isConcurrencyFailure(new Error('nope'))).toBe(false);
+    expect(isConcurrencyFailure(undefined)).toBe(false);
   });
 });

@@ -75,6 +75,16 @@ export default tseslint.config(
               ],
             },
 
+            // incidents -> appService (escalation chain, SLICE-05), notifications (producer
+            // contract, SLICE-05 / SLICE-09)
+            {
+              from: [['module', { moduleName: 'incidents' }]],
+              allow: [
+                ['module', { moduleName: 'appService' }],
+                ['module', { moduleName: 'notifications' }],
+              ],
+            },
+
             // Workers are composition code: they may use modules, shared and infra
             {
               from: 'workers',

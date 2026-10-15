@@ -1,0 +1,2472 @@
+diff --git a/backend/eslint.config.mjs b/backend/eslint.config.mjs
+index 0e34518..5e8515d 100644
+--- a/backend/eslint.config.mjs
++++ b/backend/eslint.config.mjs
+@@ -75,6 +75,16 @@ export default tseslint.config(
+               ],
+             },
+ 
++            // incidents -> appService (escalation chain, SLICE-05), notifications (producer
++            // contract, SLICE-05 / SLICE-09)
++            {
++              from: [['module', { moduleName: 'incidents' }]],
++              allow: [
++                ['module', { moduleName: 'appService' }],
++                ['module', { moduleName: 'notifications' }],
++              ],
++            },
++
+             // Workers are composition code: they may use modules, shared and infra
+             {
+               from: 'workers',
+diff --git a/backend/src/infra/audit/append-audit-event.spec.ts b/backend/src/infra/audit/append-audit-event.spec.ts
+index df99486..532ea50 100644
+--- a/backend/src/infra/audit/append-audit-event.spec.ts
++++ b/backend/src/infra/audit/append-audit-event.spec.ts
+@@ -8,7 +8,7 @@ function fakeTx() {
+     auditEvent: {
+       create: ({ data }: { data: { eventType: string; createdAt: Date } }) => {
+         created.push(data);
+-        return Promise.resolve(data);
++        return Promise.resolve({ ...data, id: `id-${created.length}` });
+       },
+     },
+   } as unknown as TransactionClient;
+@@ -18,6 +18,11 @@ function fakeTx() {
+ const input = { incidentId: null, actorId: null, metadata: {} } as const;
+ 
+ describe('appendAuditEvent', () => {
++  it('returns the id of the stored event', async () => {
++    const { tx } = fakeTx();
++    await expect(appendAuditEvent(tx, { ...input, eventType: 'ASSIGNED' })).resolves.toBe('id-1');
++  });
++
+   it('stamps each event on one transaction strictly later than the previous one', async () => {
+     jest.useFakeTimers().setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+     const { tx, created } = fakeTx();
+diff --git a/backend/src/infra/audit/append-audit-event.ts b/backend/src/infra/audit/append-audit-event.ts
+index 02883a4..0c7dc6a 100644
+--- a/backend/src/infra/audit/append-audit-event.ts
++++ b/backend/src/infra/audit/append-audit-event.ts
+@@ -27,10 +27,13 @@ function nextCreatedAt(tx: TransactionClient): Date {
+ /**
+  * Appends one audit event on the caller's transaction, so it commits or rolls back with the change
+  * it describes. It never opens or commits a transaction and offers no update or delete path.
+- * Events written by one command appear in the order written.
++ * Events written by one command appear in the order written. Returns the new event's id.
+  */
+-export async function appendAuditEvent(tx: TransactionClient, input: AuditEventInput) {
+-  await tx.auditEvent.create({
++export async function appendAuditEvent(
++  tx: TransactionClient,
++  input: AuditEventInput,
++): Promise<string> {
++  const created = await tx.auditEvent.create({
+     data: {
+       eventType: input.eventType,
+       actor: input.actorId,
+@@ -38,5 +41,7 @@ export async function appendAuditEvent(tx: TransactionClient, input: AuditEventI
+       metadata: input.metadata,
+       createdAt: nextCreatedAt(tx),
+     },
++    select: { id: true },
+   });
++  return created.id;
+ }
+diff --git a/backend/src/infra/db/errors.spec.ts b/backend/src/infra/db/errors.spec.ts
+index cbeae44..2af1318 100644
+--- a/backend/src/infra/db/errors.spec.ts
++++ b/backend/src/infra/db/errors.spec.ts
+@@ -1,5 +1,5 @@
+ import { Prisma } from '../../generated/prisma/client.js';
+-import { isDatabaseUnavailable } from './errors.js';
++import { isConcurrencyFailure, isDatabaseUnavailable } from './errors.js';
+ 
+ function known(code: string, meta?: Record<string, unknown>) {
+   return new Prisma.PrismaClientKnownRequestError('boom', { code, clientVersion: 'test', meta });
+@@ -38,3 +38,29 @@ describe('isDatabaseUnavailable', () => {
+     expect(isDatabaseUnavailable(undefined)).toBe(false);
+   });
+ });
++
++describe('isConcurrencyFailure', () => {
++  it('recognizes Prisma P2034 and a bare SQLSTATE', () => {
++    expect(isConcurrencyFailure(known('P2034'))).toBe(true);
++    for (const code of ['40001', '40P01', '55P03']) {
++      expect(isConcurrencyFailure(Object.assign(new Error('x'), { code }))).toBe(true);
++    }
++  });
++
++  it.each(['40001', '40P01', '55P03'])(
++    'recognizes SQLSTATE %s inside the driver adapter error of a failed raw query',
++    (code) => {
++      const error = known('P2010', { driverAdapterError: { cause: { kind: 'postgres', code } } });
++      expect(isConcurrencyFailure(error)).toBe(true);
++    },
++  );
++
++  it('does not treat other errors as a concurrency failure', () => {
++    expect(isConcurrencyFailure(known('P2002'))).toBe(false);
++    expect(
++      isConcurrencyFailure(known('P2010', { driverAdapterError: { cause: { code: '23505' } } })),
++    ).toBe(false);
++    expect(isConcurrencyFailure(new Error('nope'))).toBe(false);
++    expect(isConcurrencyFailure(undefined)).toBe(false);
++  });
++});
+diff --git a/backend/src/infra/db/errors.ts b/backend/src/infra/db/errors.ts
+index 0b6127f..1df3e71 100644
+--- a/backend/src/infra/db/errors.ts
++++ b/backend/src/infra/db/errors.ts
+@@ -12,11 +12,27 @@ export function isUniqueViolation(error: unknown): boolean {
+   return sqlState(error) === '23505';
+ }
+ 
+-/** Deadlock, serialization failure or lock timeout (Prisma `P2034` or SQLSTATE 40001/40P01/55P03). */
++const CONCURRENCY_SQLSTATES = new Set(['40001', '40P01', '55P03']);
++
++/** The SQLSTATE a driver adapter reports inside a Prisma error (raw queries: `P2010`). */
++function adapterSqlState(error: Prisma.PrismaClientKnownRequestError): string | undefined {
++  const meta = error.meta as { driverAdapterError?: { cause?: { code?: unknown } } } | undefined;
++  const code = meta?.driverAdapterError?.cause?.code;
++  return typeof code === 'string' ? code : undefined;
++}
++
++/**
++ * Deadlock, serialization failure or lock timeout (Prisma `P2034`, SQLSTATE 40001/40P01/55P03 on
++ * the error itself, or the same SQLSTATE in the driver adapter error of a failed raw query).
++ */
+ export function isConcurrencyFailure(error: unknown): boolean {
+-  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2034') return true;
++  if (error instanceof Prisma.PrismaClientKnownRequestError) {
++    if (error.code === 'P2034') return true;
++    const adapterState = adapterSqlState(error);
++    if (adapterState !== undefined && CONCURRENCY_SQLSTATES.has(adapterState)) return true;
++  }
+   const state = sqlState(error);
+-  return state === '40001' || state === '40P01' || state === '55P03';
++  return state !== undefined && CONCURRENCY_SQLSTATES.has(state);
+ }
+ 
+ const UNAVAILABLE_PRISMA_CODES = new Set(['P1001', 'P1002', 'P1008', 'P1017', 'P2024']);
+diff --git a/backend/src/modules/incidents/lifecycle/lifecycle.config.ts b/backend/src/modules/incidents/lifecycle/lifecycle.config.ts
+new file mode 100644
+index 0000000..47670f6
+--- /dev/null
++++ b/backend/src/modules/incidents/lifecycle/lifecycle.config.ts
+@@ -0,0 +1,6 @@
++/**
++ * How long a lifecycle transition waits for the incident row lock before it gives up with
++ * `409 CONCURRENCY_CONFLICT`. Kept below Prisma's 5 s interactive-transaction timeout, so the
++ * lock timeout fires first and the transaction is not aborted for exceeding its own limit.
++ */
++export const INCIDENT_LOCK_TIMEOUT_MS = 2_000;
+diff --git a/backend/src/modules/incidents/lifecycle/lifecycle.plans.spec.ts b/backend/src/modules/incidents/lifecycle/lifecycle.plans.spec.ts
+new file mode 100644
+index 0000000..1a9ed1f
+--- /dev/null
++++ b/backend/src/modules/incidents/lifecycle/lifecycle.plans.spec.ts
+@@ -0,0 +1,266 @@
++import type { AppError } from '../../../shared/errors/AppError.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import {
++  planAcknowledge,
++  planAssign,
++  planChangeSeverity,
++  planConfirmSeverity,
++  planResolve,
++  planUnassign,
++} from './lifecycle.plans.js';
++import type { LockedIncident } from './lifecycle.types.js';
++
++const NOW = new Date('2026-10-15T10:00:00.000Z');
++const incident = (overrides: Partial<LockedIncident> = {}): LockedIncident => ({
++  id: 'i1',
++  teamId: 't1',
++  affectedServiceId: 's1',
++  status: 'OPEN',
++  severity: 'P2',
++  currentAssigneeId: null,
++  acknowledgedById: null,
++  ...overrides,
++});
++const auth = (role: AuthContext['role'] = 'TEAM_LEAD', userId = 'caller'): AuthContext => ({
++  userId,
++  email: 'a@example.com',
++  role,
++  teamId: 't1',
++  sessionId: 's',
++});
++const events = (plan: { events: { eventType: string }[] }) => plan.events.map((e) => e.eventType);
++const failure = (fn: () => unknown) => {
++  try {
++    fn();
++  } catch (error) {
++    const { statusCode, code } = error as AppError;
++    return { statusCode, code };
++  }
++  throw new Error('did not throw');
++};
++
++describe('planAcknowledge (I3)', () => {
++  it('auto-assigns an unassigned incident: ASSIGNED then ACKNOWLEDGED', () => {
++    const plan = planAcknowledge(incident(), 'caller', NOW);
++    expect(plan.changes).toEqual({
++      status: 'ACKNOWLEDGED',
++      acknowledgedById: 'caller',
++      acknowledgedTimestamp: NOW,
++      currentAssigneeId: 'caller',
++    });
++    expect(plan.events).toEqual([
++      {
++        eventType: 'ASSIGNED',
++        metadata: { from: null, to: 'caller', auto: true },
++        subjectUserId: 'caller',
++      },
++      {
++        eventType: 'ACKNOWLEDGED',
++        metadata: { acknowledgedBy: 'caller', autoAssigned: true },
++        subjectUserId: 'caller',
++      },
++    ]);
++    expect(plan.outbox).toEqual([]);
++  });
++
++  it('keeps the assignee of an assigned incident and writes only ACKNOWLEDGED', () => {
++    const plan = planAcknowledge(incident({ currentAssigneeId: 'other' }), 'caller', NOW);
++    expect(plan.changes).not.toHaveProperty('currentAssigneeId');
++    expect(events(plan)).toEqual(['ACKNOWLEDGED']);
++    expect(plan.events[0].metadata).toEqual({ acknowledgedBy: 'caller', autoAssigned: false });
++  });
++
++  it.each(['ACKNOWLEDGED', 'MITIGATING', 'RESOLVED', 'CLOSED'] as const)('%s → 409', (status) => {
++    expect(failure(() => planAcknowledge(incident({ status }), 'caller', NOW))).toEqual({
++      statusCode: 409,
++      code: 'INVALID_STATE_TRANSITION',
++    });
++  });
++});
++
++describe('planConfirmSeverity (I4)', () => {
++  it('moves ACKNOWLEDGED to MITIGATING and requests an SLA evaluation', () => {
++    const plan = planConfirmSeverity(incident({ status: 'ACKNOWLEDGED' }), 'P0', 'caller', NOW);
++    expect(plan.changes).toEqual({
++      severity: 'P0',
++      severityConfirmedById: 'caller',
++      severityConfirmTimestamp: NOW,
++      status: 'MITIGATING',
++    });
++    expect(plan.events[0]).toEqual({
++      eventType: 'SEVERITY_CONFIRMED',
++      metadata: { from: 'P2', to: 'P0', statusFrom: 'ACKNOWLEDGED', statusTo: 'MITIGATING' },
++    });
++    expect(plan.outbox).toEqual([
++      {
++        eventType: 'SLA_EVALUATION_REQUESTED',
++        aggregateType: 'INCIDENT',
++        aggregateId: 'i1',
++        payload: { incidentId: 'i1' },
++      },
++    ]);
++  });
++
++  it('writes the event even when the severity is confirmed unchanged', () => {
++    const plan = planConfirmSeverity(incident({ status: 'ACKNOWLEDGED' }), 'P2', 'caller', NOW);
++    expect(plan.events[0].metadata).toMatchObject({ from: 'P2', to: 'P2' });
++  });
++
++  it.each(['OPEN', 'MITIGATING', 'RESOLVED', 'CLOSED'] as const)('%s → 409', (status) => {
++    expect(failure(() => planConfirmSeverity(incident({ status }), 'P1', 'caller', NOW))).toEqual({
++      statusCode: 409,
++      code: 'INVALID_STATE_TRANSITION',
++    });
++  });
++});
++
++describe('planChangeSeverity (I5)', () => {
++  it('changes the severity and keeps the status in the event', () => {
++    const plan = planChangeSeverity(incident({ status: 'MITIGATING' }), 'P0', auth());
++    expect(plan.changes).toEqual({ severity: 'P0' });
++    expect(plan.events[0].metadata).toEqual({
++      from: 'P2',
++      to: 'P0',
++      statusFrom: 'MITIGATING',
++      statusTo: 'MITIGATING',
++    });
++    expect(plan.outbox).toHaveLength(1);
++  });
++
++  it('is a complete no-op for the same value', () => {
++    expect(planChangeSeverity(incident({ status: 'OPEN' }), 'P2', auth())).toEqual({
++      changes: {},
++      events: [],
++      outbox: [],
++    });
++  });
++
++  it('refuses an Engineer on an OPEN incident but not once acknowledged', () => {
++    expect(failure(() => planChangeSeverity(incident(), 'P0', auth('ENGINEER')))).toEqual({
++      statusCode: 403,
++      code: 'FORBIDDEN_ROLE',
++    });
++    expect(() =>
++      planChangeSeverity(incident({ status: 'ACKNOWLEDGED' }), 'P0', auth('ENGINEER')),
++    ).not.toThrow();
++  });
++
++  it.each(['RESOLVED', 'CLOSED'] as const)('%s → 409 (before the role rule)', (status) => {
++    expect(failure(() => planChangeSeverity(incident({ status }), 'P0', auth('ENGINEER')))).toEqual(
++      {
++        statusCode: 409,
++        code: 'INVALID_STATE_TRANSITION',
++      },
++    );
++  });
++});
++
++describe('planAssign (I6)', () => {
++  it('first assignment: ASSIGNED { from: null, auto: false }', () => {
++    const plan = planAssign(incident(), 'b');
++    expect(plan.changes).toEqual({ currentAssigneeId: 'b' });
++    expect(plan.events).toEqual([
++      {
++        eventType: 'ASSIGNED',
++        metadata: { from: null, to: 'b', auto: false },
++        subjectUserId: 'b',
++      },
++    ]);
++  });
++
++  it('reassignment: REASSIGNED { from, to }', () => {
++    const plan = planAssign(incident({ currentAssigneeId: 'a' }), 'b');
++    expect(plan.events).toEqual([
++      { eventType: 'REASSIGNED', metadata: { from: 'a', to: 'b' }, subjectUserId: 'b' },
++    ]);
++  });
++
++  it('never touches the acknowledgement or the status', () => {
++    const { changes } = planAssign(
++      incident({ status: 'ACKNOWLEDGED', currentAssigneeId: 'a' }),
++      'b',
++    );
++    expect(Object.keys(changes)).toEqual(['currentAssigneeId']);
++  });
++
++  it('the current assignee again is a no-op', () => {
++    expect(planAssign(incident({ currentAssigneeId: 'a' }), 'a').events).toEqual([]);
++  });
++
++  it.each(['RESOLVED', 'CLOSED'] as const)('%s → 409', (status) => {
++    expect(failure(() => planAssign(incident({ status }), 'b')).statusCode).toBe(409);
++  });
++});
++
++describe('planUnassign (I7)', () => {
++  it('assigned and acknowledged: REASSIGNED then OPEN, acknowledgement cleared, SLA evaluation', () => {
++    const plan = planUnassign(
++      incident({ status: 'MITIGATING', currentAssigneeId: 'a', acknowledgedById: 'a' }),
++    );
++    expect(plan.changes).toEqual({
++      currentAssigneeId: null,
++      status: 'OPEN',
++      acknowledgedById: null,
++      acknowledgedTimestamp: null,
++    });
++    expect(plan.events).toEqual([
++      { eventType: 'REASSIGNED', metadata: { from: 'a', to: null }, subjectUserId: 'a' },
++      { eventType: 'OPEN', metadata: { statusFrom: 'MITIGATING' } },
++    ]);
++    expect(plan.outbox).toHaveLength(1);
++  });
++
++  it('assigned but still OPEN: only REASSIGNED, no SLA evaluation', () => {
++    const plan = planUnassign(incident({ currentAssigneeId: 'a' }));
++    expect(events(plan)).toEqual(['REASSIGNED']);
++    expect(plan.outbox).toEqual([]);
++  });
++
++  it('unassigned but acknowledged: only OPEN', () => {
++    const plan = planUnassign(incident({ status: 'ACKNOWLEDGED' }));
++    expect(events(plan)).toEqual(['OPEN']);
++    expect(plan.outbox).toHaveLength(1);
++  });
++
++  it('already unassigned and OPEN: nothing', () => {
++    expect(planUnassign(incident())).toEqual({ changes: {}, events: [], outbox: [] });
++  });
++
++  it.each(['RESOLVED', 'CLOSED'] as const)('%s → 409', (status) => {
++    expect(failure(() => planUnassign(incident({ status }))).statusCode).toBe(409);
++  });
++});
++
++describe('planResolve (I8)', () => {
++  const mitigating = incident({ status: 'MITIGATING', currentAssigneeId: 'caller' });
++
++  it('resolves and writes RESOLVED with the summary', () => {
++    const plan = planResolve(mitigating, auth('ENGINEER'), 'rolled back', NOW);
++    expect(plan.changes).toEqual({
++      status: 'RESOLVED',
++      resolvedById: 'caller',
++      resolvedTimestamp: NOW,
++      resolutionSummary: 'rolled back',
++    });
++    expect(plan.events).toEqual([
++      {
++        eventType: 'RESOLVED',
++        metadata: { resolutionSummary: 'rolled back', serviceConfirmedWorking: true },
++      },
++    ]);
++  });
++
++  it.each(['OPEN', 'ACKNOWLEDGED', 'RESOLVED', 'CLOSED'] as const)('%s → 409', (status) => {
++    expect(failure(() => planResolve(incident({ status }), auth(), 's', NOW)).code).toBe(
++      'INVALID_STATE_TRANSITION',
++    );
++  });
++
++  it('an Engineer who is not the assignee gets NOT_CURRENT_ASSIGNEE; a Team Lead does not', () => {
++    const other = incident({ status: 'MITIGATING', currentAssigneeId: 'someone' });
++    expect(failure(() => planResolve(other, auth('ENGINEER'), 's', NOW)).code).toBe(
++      'NOT_CURRENT_ASSIGNEE',
++    );
++    expect(() => planResolve(other, auth('TEAM_LEAD'), 's', NOW)).not.toThrow();
++  });
++});
+diff --git a/backend/src/modules/incidents/lifecycle/lifecycle.plans.ts b/backend/src/modules/incidents/lifecycle/lifecycle.plans.ts
+new file mode 100644
+index 0000000..31046ce
+--- /dev/null
++++ b/backend/src/modules/incidents/lifecycle/lifecycle.plans.ts
+@@ -0,0 +1,187 @@
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import type { Severity } from '../incidents.types.js';
++import {
++  assertMayResolve,
++  assertMaySetSeverity,
++  assertRequiredState,
++  UNRESOLVED_STATUSES,
++} from './lifecycle.rules.js';
++import { NO_CHANGE, type LockedIncident, type OutboxStep, type Plan } from './lifecycle.types.js';
++
++const slaEvaluation = (incident: LockedIncident): OutboxStep => ({
++  eventType: 'SLA_EVALUATION_REQUESTED',
++  aggregateType: 'INCIDENT',
++  aggregateId: incident.id,
++  payload: { incidentId: incident.id },
++});
++
++/** I3: `OPEN → ACKNOWLEDGED`; an unassigned incident is auto-assigned to the caller. */
++export function planAcknowledge(incident: LockedIncident, callerId: string, now: Date): Plan {
++  assertRequiredState(incident.status, ['OPEN']);
++  const autoAssigned = incident.currentAssigneeId === null;
++  return {
++    changes: {
++      status: 'ACKNOWLEDGED',
++      acknowledgedById: callerId,
++      acknowledgedTimestamp: now,
++      ...(autoAssigned ? { currentAssigneeId: callerId } : {}),
++    },
++    events: [
++      ...(autoAssigned
++        ? [
++            {
++              eventType: 'ASSIGNED' as const,
++              metadata: { from: null, to: callerId, auto: true },
++              subjectUserId: callerId,
++            },
++          ]
++        : []),
++      {
++        eventType: 'ACKNOWLEDGED',
++        metadata: { acknowledgedBy: callerId, autoAssigned },
++        subjectUserId: callerId,
++      },
++    ],
++    outbox: [],
++  };
++}
++
++/** I4: `ACKNOWLEDGED → MITIGATING` with the confirmed severity (written even when unchanged). */
++export function planConfirmSeverity(
++  incident: LockedIncident,
++  severity: Severity,
++  callerId: string,
++  now: Date,
++): Plan {
++  assertRequiredState(incident.status, ['ACKNOWLEDGED']);
++  return {
++    changes: {
++      severity,
++      severityConfirmedById: callerId,
++      severityConfirmTimestamp: now,
++      status: 'MITIGATING',
++    },
++    events: [
++      {
++        eventType: 'SEVERITY_CONFIRMED',
++        metadata: {
++          from: incident.severity,
++          to: severity,
++          statusFrom: 'ACKNOWLEDGED',
++          statusTo: 'MITIGATING',
++        },
++      },
++    ],
++    outbox: [slaEvaluation(incident)],
++  };
++}
++
++/** I5: severity change in any unresolved status; the same value is a no-op. */
++export function planChangeSeverity(
++  incident: LockedIncident,
++  severity: Severity,
++  auth: AuthContext,
++): Plan {
++  assertRequiredState(incident.status, UNRESOLVED_STATUSES);
++  assertMaySetSeverity(auth, incident.status);
++  if (incident.severity === severity) return NO_CHANGE;
++  return {
++    changes: { severity },
++    events: [
++      {
++        eventType: 'SEVERITY_CONFIRMED',
++        metadata: {
++          from: incident.severity,
++          to: severity,
++          statusFrom: incident.status,
++          statusTo: incident.status,
++        },
++      },
++    ],
++    outbox: [slaEvaluation(incident)],
++  };
++}
++
++/** I6: (re)assign in any unresolved status; the current assignee again is a no-op. */
++export function planAssign(incident: LockedIncident, assigneeId: string): Plan {
++  assertRequiredState(incident.status, UNRESOLVED_STATUSES);
++  const previous = incident.currentAssigneeId;
++  if (previous === assigneeId) return NO_CHANGE;
++  return {
++    changes: { currentAssigneeId: assigneeId },
++    events: [
++      previous === null
++        ? {
++            eventType: 'ASSIGNED',
++            metadata: { from: null, to: assigneeId, auto: false },
++            subjectUserId: assigneeId,
++          }
++        : {
++            eventType: 'REASSIGNED',
++            metadata: { from: previous, to: assigneeId },
++            subjectUserId: assigneeId,
++          },
++    ],
++    outbox: [],
++  };
++}
++
++/** I7: drop the assignee and the acknowledgement and return to `OPEN`. */
++export function planUnassign(incident: LockedIncident): Plan {
++  assertRequiredState(incident.status, UNRESOLVED_STATUSES);
++  const previous = incident.currentAssigneeId;
++  const returnsToOpen = incident.status !== 'OPEN';
++  if (previous === null && !returnsToOpen) return NO_CHANGE;
++  return {
++    changes: {
++      currentAssigneeId: null,
++      status: 'OPEN',
++      acknowledgedById: null,
++      acknowledgedTimestamp: null,
++    },
++    events: [
++      ...(previous === null
++        ? []
++        : [
++            {
++              eventType: 'REASSIGNED' as const,
++              metadata: { from: previous, to: null },
++              subjectUserId: previous,
++            },
++          ]),
++      ...(returnsToOpen
++        ? [{ eventType: 'OPEN' as const, metadata: { statusFrom: incident.status } }]
++        : []),
++    ],
++    outbox: returnsToOpen ? [slaEvaluation(incident)] : [],
++  };
++}
++
++/**
++ * I8: `MITIGATING → RESOLVED`. The postmortem row, the cleared alert keys and the generation
++ * outbox event are added by the action, which knows the postmortem id.
++ */
++export function planResolve(
++  incident: LockedIncident,
++  auth: AuthContext,
++  resolutionSummary: string,
++  now: Date,
++): Plan {
++  assertRequiredState(incident.status, ['MITIGATING']);
++  assertMayResolve(auth, incident.currentAssigneeId);
++  return {
++    changes: {
++      status: 'RESOLVED',
++      resolvedById: auth.userId,
++      resolvedTimestamp: now,
++      resolutionSummary,
++    },
++    events: [
++      {
++        eventType: 'RESOLVED',
++        metadata: { resolutionSummary, serviceConfirmedWorking: true },
++      },
++    ],
++    outbox: [],
++  };
++}
+diff --git a/backend/src/modules/incidents/lifecycle/lifecycle.repository.ts b/backend/src/modules/incidents/lifecycle/lifecycle.repository.ts
+new file mode 100644
+index 0000000..4ce80d1
+--- /dev/null
++++ b/backend/src/modules/incidents/lifecycle/lifecycle.repository.ts
+@@ -0,0 +1,69 @@
++import { Prisma } from '../../../generated/prisma/client.js';
++import type { Db } from '../incidents.common.js';
++import type { IncidentStatus, Severity } from '../incidents.types.js';
++import type { IncidentChanges, LockedIncident, TransitionScope } from './lifecycle.types.js';
++import type { AssigneeCandidate } from './lifecycle.rules.js';
++
++/** Read before the transaction opens: the team gate and the pre-lock gates use it. */
++export function findTransitionScope(db: Db, id: string): Promise<TransitionScope | null> {
++  return db.incident.findUnique({
++    where: { id },
++    select: { teamId: true, affectedServiceId: true, status: true },
++  });
++}
++
++/** Bounds the wait for any lock taken in this transaction (`SET LOCAL`, gone at commit). */
++export async function setLockTimeout(db: Db, milliseconds: number): Promise<void> {
++  await db.$queryRaw(Prisma.sql`SELECT set_config('lock_timeout', ${`${milliseconds}ms`}, true)`);
++}
++
++/** `SELECT … FOR UPDATE` on the incident: the state is read under the lock. `null` if missing. */
++export async function lockIncidentForUpdate(db: Db, id: string): Promise<LockedIncident | null> {
++  const rows = await db.$queryRaw<
++    {
++      id: string;
++      teamId: string;
++      affectedServiceId: string;
++      status: IncidentStatus;
++      severity: Severity;
++      currentAssigneeId: string | null;
++      acknowledgedById: string | null;
++    }[]
++  >(Prisma.sql`
++    SELECT "id", "teamId", "affectedServiceId", "status"::text AS "status",
++           "severity"::text AS "severity", "currentAssigneeId", "acknowledgedById"
++    FROM "Incident" WHERE "id" = ${id}::uuid FOR UPDATE`);
++  return rows[0] ?? null;
++}
++
++/**
++ * `FOR SHARE` on a user row, returning what assignment eligibility needs (`null` if missing). A
++ * concurrent U4 (which locks the user `FOR UPDATE` before checking `acknowledgedBy`) waits for
++ * this transaction, so a user cannot be deactivated or moved between this check and the commit.
++ */
++export async function lockUserForShare(db: Db, id: string): Promise<AssigneeCandidate | null> {
++  const rows = await db.$queryRaw<AssigneeCandidate[]>(Prisma.sql`
++    SELECT "role"::text AS "role", "status"::text AS "status", "teamId"
++    FROM "User" WHERE "id" = ${id}::uuid FOR SHARE`);
++  return rows[0] ?? null;
++}
++
++export async function updateIncident(db: Db, id: string, changes: IncidentChanges): Promise<void> {
++  await db.incident.update({ where: { id }, data: { ...changes, updatedAt: new Date() } });
++}
++
++/** Resolve frees the identity of every alert of the incident, so a new firing opens a new incident. */
++export async function clearActiveIdentityKeys(db: Db, incidentId: string): Promise<void> {
++  await db.alert.updateMany({
++    where: { incidentId, activeIdentityKey: { not: null } },
++    data: { activeIdentityKey: null, updatedAt: new Date() },
++  });
++}
++
++/** `Postmortem.incidentId` is unique: a second postmortem for the incident cannot exist. */
++export function insertGeneratingPostmortem(db: Db, incidentId: string): Promise<{ id: string }> {
++  return db.postmortem.create({
++    data: { incidentId, generationStatus: 'GENERATING', reviewStatus: 'PENDING' },
++    select: { id: true },
++  });
++}
+diff --git a/backend/src/modules/incidents/lifecycle/lifecycle.rules.spec.ts b/backend/src/modules/incidents/lifecycle/lifecycle.rules.spec.ts
+new file mode 100644
+index 0000000..53f2df9
+--- /dev/null
++++ b/backend/src/modules/incidents/lifecycle/lifecycle.rules.spec.ts
+@@ -0,0 +1,110 @@
++import type { AppError } from '../../../shared/errors/AppError.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import {
++  assertChainMember,
++  assertMayResolve,
++  assertMaySetSeverity,
++  assertRequiredState,
++  isChainMember,
++  isEligibleAssignee,
++  requireManagerRole,
++} from './lifecycle.rules.js';
++
++const auth = (role: AuthContext['role'], userId = 'u1'): AuthContext => ({
++  userId,
++  email: 'a@example.com',
++  role,
++  teamId: 't1',
++  sessionId: 's1',
++});
++const thrown = (fn: () => void): AppError => {
++  try {
++    fn();
++  } catch (error) {
++    return error as AppError;
++  }
++  throw new Error('did not throw');
++};
++
++describe('assertRequiredState', () => {
++  it('passes inside the allowed set', () => {
++    expect(() => assertRequiredState('OPEN', ['OPEN', 'ACKNOWLEDGED'])).not.toThrow();
++  });
++
++  it('reports a single required status as a string', () => {
++    const error = thrown(() => assertRequiredState('OPEN', ['MITIGATING']));
++    expect([error.statusCode, error.code]).toEqual([409, 'INVALID_STATE_TRANSITION']);
++    expect(error.details).toEqual([{ currentStatus: 'OPEN', requiredStatus: 'MITIGATING' }]);
++  });
++
++  it('reports the allowed set for multi-state actions', () => {
++    const error = thrown(() => assertRequiredState('RESOLVED', ['OPEN', 'ACKNOWLEDGED']));
++    expect(error.details).toEqual([
++      { currentStatus: 'RESOLVED', requiredStatus: ['OPEN', 'ACKNOWLEDGED'] },
++    ]);
++  });
++});
++
++describe('role rules', () => {
++  it('requireManagerRole: Team Lead and Admin pass, Engineer is FORBIDDEN_ROLE', () => {
++    expect(() => requireManagerRole(auth('TEAM_LEAD'))).not.toThrow();
++    expect(() => requireManagerRole(auth('ADMIN'))).not.toThrow();
++    expect(thrown(() => requireManagerRole(auth('ENGINEER'))).code).toBe('FORBIDDEN_ROLE');
++  });
++
++  it('assertMaySetSeverity: only an Engineer on an OPEN incident is refused', () => {
++    expect(thrown(() => assertMaySetSeverity(auth('ENGINEER'), 'OPEN')).code).toBe(
++      'FORBIDDEN_ROLE',
++    );
++    expect(() => assertMaySetSeverity(auth('ENGINEER'), 'ACKNOWLEDGED')).not.toThrow();
++    expect(() => assertMaySetSeverity(auth('TEAM_LEAD'), 'OPEN')).not.toThrow();
++    expect(() => assertMaySetSeverity(auth('ADMIN'), 'OPEN')).not.toThrow();
++  });
++
++  it('assertMayResolve: an Engineer must be the current assignee', () => {
++    expect(() => assertMayResolve(auth('ENGINEER', 'u1'), 'u1')).not.toThrow();
++    expect(thrown(() => assertMayResolve(auth('ENGINEER', 'u1'), 'u2')).code).toBe(
++      'NOT_CURRENT_ASSIGNEE',
++    );
++    expect(thrown(() => assertMayResolve(auth('ENGINEER', 'u1'), null)).code).toBe(
++      'NOT_CURRENT_ASSIGNEE',
++    );
++    expect(() => assertMayResolve(auth('TEAM_LEAD'), 'u2')).not.toThrow();
++    expect(() => assertMayResolve(auth('ADMIN'), null)).not.toThrow();
++  });
++});
++
++describe('escalation chain', () => {
++  const chain = { level1: 'a', level2: 'b', level3: 'c', fallbackAdmin: 'd' };
++
++  it.each(['a', 'b', 'c', 'd'])('%s is a member', (id) => {
++    expect(isChainMember(chain, id)).toBe(true);
++  });
++
++  it('refuses a user outside the chain, and every user when there is no policy', () => {
++    expect(thrown(() => assertChainMember(chain, 'x'))).toMatchObject({
++      statusCode: 403,
++      code: 'FORBIDDEN',
++    });
++    expect(isChainMember(null, 'a')).toBe(false);
++  });
++});
++
++describe('isEligibleAssignee', () => {
++  const ok = { role: 'ENGINEER', status: 'ACTIVE', teamId: 't1' } as const;
++
++  it('accepts an active Engineer or Team Lead of the incident team', () => {
++    expect(isEligibleAssignee(ok, 't1')).toBe(true);
++    expect(isEligibleAssignee({ ...ok, role: 'TEAM_LEAD' }, 't1')).toBe(true);
++  });
++
++  it.each([
++    ['a user that does not exist', null],
++    ['a user of another team', { ...ok, teamId: 't2' }],
++    ['a user without a team', { ...ok, teamId: null }],
++    ['a deactivated user', { ...ok, status: 'DEACTIVATED' as const }],
++    ['an Admin', { ...ok, role: 'ADMIN' as const }],
++  ])('rejects %s', (_name, candidate) => {
++    expect(isEligibleAssignee(candidate, 't1')).toBe(false);
++  });
++});
+diff --git a/backend/src/modules/incidents/lifecycle/lifecycle.rules.ts b/backend/src/modules/incidents/lifecycle/lifecycle.rules.ts
+new file mode 100644
+index 0000000..6b7c270
+--- /dev/null
++++ b/backend/src/modules/incidents/lifecycle/lifecycle.rules.ts
+@@ -0,0 +1,92 @@
++import { ConflictError, ForbiddenError } from '../../../shared/errors/AppError.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import type { IncidentStatus } from '../incidents.types.js';
++
++/** Statuses in which severity and assignment may still change. */
++export const UNRESOLVED_STATUSES: readonly IncidentStatus[] = [
++  'OPEN',
++  'ACKNOWLEDGED',
++  'MITIGATING',
++];
++
++/** Gate 3: `409 INVALID_STATE_TRANSITION`; `requiredStatus` is one status or the allowed set. */
++export function assertRequiredState(
++  current: IncidentStatus,
++  required: readonly IncidentStatus[],
++): void {
++  if (required.includes(current)) return;
++  throw new ConflictError(
++    'The incident is not in a state that allows this action',
++    'INVALID_STATE_TRANSITION',
++    [
++      {
++        currentStatus: current,
++        requiredStatus: required.length === 1 ? required[0] : [...required],
++      },
++    ],
++  );
++}
++
++/** Gate 1 for I6 and I7. */
++export function requireManagerRole(auth: AuthContext): void {
++  if (auth.role === 'ENGINEER') {
++    throw new ForbiddenError('Role is not allowed to perform this action', 'FORBIDDEN_ROLE');
++  }
++}
++
++/** I5: an Engineer may not change the severity of an `OPEN` incident. */
++export function assertMaySetSeverity(auth: AuthContext, status: IncidentStatus): void {
++  if (auth.role === 'ENGINEER' && status === 'OPEN') {
++    throw new ForbiddenError('Role is not allowed to perform this action', 'FORBIDDEN_ROLE');
++  }
++}
++
++/** I8: Team Leads and Admins resolve any incident, an Engineer only as the current assignee. */
++export function assertMayResolve(auth: AuthContext, currentAssigneeId: string | null): void {
++  if (auth.role === 'ENGINEER' && currentAssigneeId !== auth.userId) {
++    throw new ForbiddenError('Only the current assignee may resolve', 'NOT_CURRENT_ASSIGNEE');
++  }
++}
++
++export type EscalationChain = {
++  level1: string;
++  level2: string;
++  level3: string;
++  fallbackAdmin: string;
++};
++
++/** The four users of the service's escalation policy. */
++export function isChainMember(chain: EscalationChain | null, userId: string): boolean {
++  if (chain === null) return false;
++  return [chain.level1, chain.level2, chain.level3, chain.fallbackAdmin].includes(userId);
++}
++
++export function assertChainMember(chain: EscalationChain | null, userId: string): void {
++  if (!isChainMember(chain, userId)) {
++    throw new ForbiddenError('Caller is not in the escalation chain of the service', 'FORBIDDEN');
++  }
++}
++
++export type AssigneeCandidate = {
++  role: 'ENGINEER' | 'TEAM_LEAD' | 'ADMIN';
++  status: 'ACTIVE' | 'DEACTIVATED';
++  teamId: string | null;
++};
++
++/** I6: an `ACTIVE` Engineer or Team Lead of the incident's team (a missing user is `null`). */
++export function isEligibleAssignee(candidate: AssigneeCandidate | null, teamId: string): boolean {
++  return (
++    candidate !== null &&
++    candidate.status === 'ACTIVE' &&
++    candidate.teamId === teamId &&
++    (candidate.role === 'ENGINEER' || candidate.role === 'TEAM_LEAD')
++  );
++}
++
++/** One generic error for every ineligible assignee: it never reveals whether the user exists. */
++export function assigneeNotEligible(): ForbiddenError {
++  return new ForbiddenError(
++    'The user cannot be assigned to this incident',
++    'ASSIGNEE_NOT_ELIGIBLE',
++  );
++}
+diff --git a/backend/src/modules/incidents/lifecycle/lifecycle.service.ts b/backend/src/modules/incidents/lifecycle/lifecycle.service.ts
+new file mode 100644
+index 0000000..860b685
+--- /dev/null
++++ b/backend/src/modules/incidents/lifecycle/lifecycle.service.ts
+@@ -0,0 +1,176 @@
++import { getEscalationPolicyByService } from '../../appService/index.js';
++import { ValidationError, BadRequestError } from '../../../shared/errors/AppError.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import { findIncidentDetail } from '../incident.repository.js';
++import { toIncidentResponse } from '../incident.mapper.js';
++import { incidentNotFound, type Db } from '../incidents.common.js';
++import type { IncidentResponse, Severity } from '../incidents.types.js';
++import {
++  clearActiveIdentityKeys,
++  insertGeneratingPostmortem,
++  lockUserForShare,
++} from './lifecycle.repository.js';
++import {
++  planAcknowledge,
++  planAssign,
++  planChangeSeverity,
++  planConfirmSeverity,
++  planResolve,
++  planUnassign,
++} from './lifecycle.plans.js';
++import {
++  assertChainMember,
++  assigneeNotEligible,
++  isEligibleAssignee,
++  requireManagerRole,
++} from './lifecycle.rules.js';
++import type { Plan } from './lifecycle.types.js';
++import { runTransition } from './transition.kernel.js';
++
++async function respondWith(tx: Db, incidentId: string): Promise<IncidentResponse> {
++  const row = await findIncidentDetail(tx, incidentId);
++  if (row === null) throw incidentNotFound();
++  return toIncidentResponse(row, new Date());
++}
++
++const chainGate = (auth: AuthContext) => async (scope: { affectedServiceId: string }) =>
++  assertChainMember(await getEscalationPolicyByService(scope.affectedServiceId), auth.userId);
++
++/** I3 acknowledge. Any role of the incident's team. */
++export function acknowledgeIncident(auth: AuthContext, incidentId: string, requestId: string) {
++  return runTransition({
++    auth,
++    incidentId,
++    requestId,
++    decide: async (tx, incident) => {
++      // The acknowledging user is read by U4's conflict check under a user row lock (known issue 8).
++      await lockUserForShare(tx, auth.userId);
++      return planAcknowledge(incident, auth.userId, new Date());
++    },
++    respond: (tx) => respondWith(tx, incidentId),
++  });
++}
++
++/** I4 confirm severity. Chain members only. */
++export function confirmSeverity(
++  auth: AuthContext,
++  incidentId: string,
++  severity: Severity,
++  requestId: string,
++) {
++  return runTransition({
++    auth,
++    incidentId,
++    requestId,
++    gate: chainGate(auth),
++    decide: (_tx, incident) => planConfirmSeverity(incident, severity, auth.userId, new Date()),
++    respond: (tx) => respondWith(tx, incidentId),
++  });
++}
++
++/** I5 change severity. Chain members; an Engineer not while the incident is `OPEN`. */
++export function changeSeverity(
++  auth: AuthContext,
++  incidentId: string,
++  severity: Severity,
++  requestId: string,
++) {
++  return runTransition({
++    auth,
++    incidentId,
++    requestId,
++    gate: chainGate(auth),
++    decide: (_tx, incident) => planChangeSeverity(incident, severity, auth),
++    respond: (tx) => respondWith(tx, incidentId),
++  });
++}
++
++/** I6 assign / reassign. Team Lead or Admin. */
++export function assignIncident(
++  auth: AuthContext,
++  incidentId: string,
++  assigneeId: string,
++  requestId: string,
++) {
++  requireManagerRole(auth);
++  return runTransition({
++    auth,
++    incidentId,
++    requestId,
++    decide: async (tx, incident) => {
++      const candidate = await lockUserForShare(tx, assigneeId);
++      if (!isEligibleAssignee(candidate, incident.teamId)) throw assigneeNotEligible();
++      return planAssign(incident, assigneeId);
++    },
++    respond: (tx) => respondWith(tx, incidentId),
++  });
++}
++
++/** I7 unassign. Team Lead or Admin. */
++export function unassignIncident(auth: AuthContext, incidentId: string, requestId: string) {
++  requireManagerRole(auth);
++  return runTransition({
++    auth,
++    incidentId,
++    requestId,
++    decide: (_tx, incident) => planUnassign(incident),
++    respond: (tx) => respondWith(tx, incidentId),
++  });
++}
++
++export type ResolveInput = { resolutionSummary?: string; serviceConfirmedWorking?: boolean };
++
++/**
++ * Body validation of I8, after Gate 2 and before the lock: the summary is required (`422`) and
++ * `serviceConfirmedWorking` must be `true` (`400`).
++ */
++function validateResolveInput(input: ResolveInput): string {
++  if (input.resolutionSummary === undefined) {
++    throw new ValidationError('resolutionSummary is required', 'VALIDATION_FAILED', [
++      { field: 'resolutionSummary', issue: 'Required' },
++    ]);
++  }
++  if (input.serviceConfirmedWorking !== true) {
++    throw new BadRequestError('serviceConfirmedWorking must be true to resolve an incident');
++  }
++  return input.resolutionSummary;
++}
++
++/**
++ * I8 resolve. In the same transaction: the `Postmortem` row (`GENERATING` / `PENDING`), the
++ * identity keys of every alert cleared, and the generation request in the outbox.
++ */
++export function resolveIncident(
++  auth: AuthContext,
++  incidentId: string,
++  input: ResolveInput,
++  requestId: string,
++) {
++  let resolutionSummary = '';
++  return runTransition({
++    auth,
++    incidentId,
++    requestId,
++    gate: () => {
++      resolutionSummary = validateResolveInput(input);
++    },
++    decide: async (tx, incident): Promise<Plan> => {
++      const plan = planResolve(incident, auth, resolutionSummary, new Date());
++      const postmortem = await insertGeneratingPostmortem(tx, incidentId);
++      await clearActiveIdentityKeys(tx, incidentId);
++      return {
++        ...plan,
++        outbox: [
++          ...plan.outbox,
++          {
++            eventType: 'POSTMORTEM_GENERATION_REQUESTED',
++            aggregateType: 'POSTMORTEM',
++            aggregateId: postmortem.id,
++            payload: { postmortemId: postmortem.id, incidentId },
++          },
++        ],
++      };
++    },
++    respond: (tx) => respondWith(tx, incidentId),
++  });
++}
+diff --git a/backend/src/modules/incidents/lifecycle/lifecycle.types.ts b/backend/src/modules/incidents/lifecycle/lifecycle.types.ts
+new file mode 100644
+index 0000000..f5dfe8f
+--- /dev/null
++++ b/backend/src/modules/incidents/lifecycle/lifecycle.types.ts
+@@ -0,0 +1,51 @@
++import type { Prisma } from '../../../generated/prisma/client.js';
++import type { AuditEventType } from '../../../generated/prisma/enums.js';
++import type { IncidentStatus, Severity } from '../incidents.types.js';
++
++/** The incident row as read under `FOR UPDATE`. */
++export type LockedIncident = {
++  id: string;
++  teamId: string;
++  affectedServiceId: string;
++  status: IncidentStatus;
++  severity: Severity;
++  currentAssigneeId: string | null;
++  acknowledgedById: string | null;
++};
++
++/** What the team gate and the pre-lock gates need to know; read before the transaction opens. */
++export type TransitionScope = { teamId: string; affectedServiceId: string; status: IncidentStatus };
++
++/** The scalar columns a lifecycle action may change (API names are mapped in the repository). */
++export type IncidentChanges = Pick<
++  Prisma.IncidentUncheckedUpdateInput,
++  | 'status'
++  | 'severity'
++  | 'currentAssigneeId'
++  | 'acknowledgedById'
++  | 'acknowledgedTimestamp'
++  | 'severityConfirmedById'
++  | 'severityConfirmTimestamp'
++  | 'resolvedById'
++  | 'resolvedTimestamp'
++  | 'resolutionSummary'
++>;
++
++/** One audit event; the caller is its actor. Every event written also gets one notification. */
++export type AuditStep = {
++  eventType: AuditEventType;
++  metadata: Prisma.InputJsonObject;
++  subjectUserId?: string;
++};
++
++export type OutboxStep = {
++  eventType: 'SLA_EVALUATION_REQUESTED' | 'POSTMORTEM_GENERATION_REQUESTED';
++  aggregateType: string;
++  aggregateId: string;
++  payload: Record<string, unknown>;
++};
++
++/** A transition decided under the lock: nothing at all (a no-op) or changes with their events. */
++export type Plan = { changes: IncidentChanges; events: AuditStep[]; outbox: OutboxStep[] };
++
++export const NO_CHANGE: Plan = { changes: {}, events: [], outbox: [] };
+diff --git a/backend/src/modules/incidents/lifecycle/transition.kernel.ts b/backend/src/modules/incidents/lifecycle/transition.kernel.ts
+new file mode 100644
+index 0000000..4b8e871
+--- /dev/null
++++ b/backend/src/modules/incidents/lifecycle/transition.kernel.ts
+@@ -0,0 +1,99 @@
++import { appendAuditEvent } from '../../../infra/audit/append-audit-event.js';
++import { getPrisma } from '../../../infra/db/prisma.js';
++import { enqueueOutbox } from '../../../infra/jobs/index.js';
++import type { AuthContext } from '../../../shared/types/auth-context.js';
++import { requireTeam } from '../../identity/index.js';
++import { enqueueNotification } from '../../notifications/index.js';
++import {
++  assertIncidentAccess,
++  runIncidentTransaction,
++  withDatabaseOutageMapping,
++  type Db,
++} from '../incidents.common.js';
++import { INCIDENT_LOCK_TIMEOUT_MS } from './lifecycle.config.js';
++import {
++  findTransitionScope,
++  lockIncidentForUpdate,
++  setLockTimeout,
++  updateIncident,
++} from './lifecycle.repository.js';
++import type { LockedIncident, Plan, TransitionScope } from './lifecycle.types.js';
++
++export type TransitionRequest<T> = {
++  auth: AuthContext;
++  incidentId: string;
++  /** Carried in every outbox payload for log correlation. */
++  requestId?: string;
++  /** Gate 2 beyond the team gate and body validation, before any lock (chain membership, …). */
++  gate?: (scope: TransitionScope) => Promise<void> | void;
++  /**
++   * Under the lock: re-check the state and the role-by-state rules, then decide the change. It
++   * may add writes of its own on `tx` (other rows), which commit with the transition.
++   */
++  decide: (tx: Db, incident: LockedIncident) => Promise<Plan> | Plan;
++  /** Builds the response on the same transaction, after the writes. */
++  respond: (tx: Db) => Promise<T>;
++  lockTimeoutMs?: number;
++};
++
++/**
++ * The transition kernel. One transaction: load and apply the team gate, lock the incident row
++ * with a bounded wait, `decide` under the lock, apply the changes, append the audit events in
++ * order, write the outbox events and one notification per audit event (`occurrenceId` = that
++ * event's id), then commit. Nothing external runs inside it. A lock timeout or deadlock is
++ * `409 CONCURRENCY_CONFLICT`; a database outage `503`.
++ */
++export async function runTransition<T>(request: TransitionRequest<T>): Promise<T> {
++  const { auth, incidentId } = request;
++  requireTeam(auth);
++
++  const scope = await withDatabaseOutageMapping(() => findTransitionScope(getPrisma(), incidentId));
++  assertIncidentAccess(auth, scope);
++  await request.gate?.(scope);
++
++  return runIncidentTransaction(async (tx) => {
++    await setLockTimeout(tx, request.lockTimeoutMs ?? INCIDENT_LOCK_TIMEOUT_MS);
++    const incident = await lockIncidentForUpdate(tx, incidentId);
++    assertIncidentAccess(auth, incident);
++
++    const plan = await request.decide(tx, incident);
++    if (Object.keys(plan.changes).length > 0) await updateIncident(tx, incidentId, plan.changes);
++
++    const occurrences: {
++      eventType: Plan['events'][number]['eventType'];
++      id: string;
++      subjectUserId?: string;
++    }[] = [];
++    for (const event of plan.events) {
++      const id = await appendAuditEvent(tx, {
++        incidentId,
++        eventType: event.eventType,
++        actorId: auth.userId,
++        metadata: event.metadata,
++      });
++      occurrences.push({ eventType: event.eventType, id, subjectUserId: event.subjectUserId });
++    }
++    for (const step of plan.outbox) {
++      await enqueueOutbox(tx, {
++        ...step,
++        payload: {
++          ...step.payload,
++          ...(request.requestId ? { requestId: request.requestId } : {}),
++        },
++      });
++    }
++    for (const occurrence of occurrences) {
++      await enqueueNotification(tx, {
++        eventType: occurrence.eventType,
++        occurrenceId: occurrence.id,
++        incidentId,
++        serviceId: incident.affectedServiceId,
++        teamId: incident.teamId,
++        ...(occurrence.subjectUserId === undefined
++          ? {}
++          : { subjectUserId: occurrence.subjectUserId }),
++      });
++    }
++    return request.respond(tx);
++  });
++}
+diff --git a/backend/src/modules/incidents/update/incident-update.controller.ts b/backend/src/modules/incidents/update/incident-update.controller.ts
+index 8152189..bbed0a3 100644
+--- a/backend/src/modules/incidents/update/incident-update.controller.ts
++++ b/backend/src/modules/incidents/update/incident-update.controller.ts
+@@ -10,6 +10,11 @@ export const updateIncidentHandler: RequestHandler = async (req, res) => {
+   const { incidentId } = parseOrThrow(incidentParamsSchema, req.params);
+   const body = parseOrThrow(updateIncidentBodySchema, req.body);
+   const row = selectRow(body);
+-  const result = await row.handle({ auth: getAuth(req), incidentId, body });
++  const result = await row.handle({
++    auth: getAuth(req),
++    incidentId,
++    body,
++    requestId: res.locals.requestId as string,
++  });
+   res.status(result.status).json({ data: result.data });
+ };
+diff --git a/backend/src/modules/incidents/update/incident-update.dispatcher.spec.ts b/backend/src/modules/incidents/update/incident-update.dispatcher.spec.ts
+index f7553d8..7b10fdd 100644
+--- a/backend/src/modules/incidents/update/incident-update.dispatcher.spec.ts
++++ b/backend/src/modules/incidents/update/incident-update.dispatcher.spec.ts
+@@ -58,8 +58,7 @@ describe('selectRow', () => {
+ 
+   it.each([
+     ['an empty body', {}],
+-    ['an action owned by another slice', { status: 'ACKNOWLEDGED' }],
+-    ['a null assignee (present, matches no row yet)', { currentAssignee: null }],
++    ['a null assignee without status OPEN', { currentAssignee: null }],
+     ['a comment combined with another field', { comment: { body: 'x' }, severity: 'P1' }],
+   ])('rejects %s with 422', (_name, body) => {
+     expect(code(() => selectRow(parse(body)))).toEqual({ status: 422, code: 'VALIDATION_FAILED' });
+@@ -80,6 +79,6 @@ describe('selectRow', () => {
+       'currentAssignee',
+       'severity',
+     ]);
+-    expect(UPDATE_ROWS.map((row) => row.id)).toEqual(['I10']);
++    expect(UPDATE_ROWS.map((row) => row.id)).toEqual(['I3', 'I4', 'I5', 'I6', 'I7', 'I8', 'I10']);
+   });
+ });
+diff --git a/backend/src/modules/incidents/update/incident-update.dispatcher.ts b/backend/src/modules/incidents/update/incident-update.dispatcher.ts
+index d740815..8a05f17 100644
+--- a/backend/src/modules/incidents/update/incident-update.dispatcher.ts
++++ b/backend/src/modules/incidents/update/incident-update.dispatcher.ts
+@@ -1,19 +1,25 @@
+ import { ValidationError } from '../../../shared/errors/AppError.js';
+ import type { AuthContext } from '../../../shared/types/auth-context.js';
+ import { addComment } from '../comments/comment.service.js';
++import { LIFECYCLE_ROWS } from './lifecycle-rows.js';
+ import type { UpdateIncidentBody } from './incident-update.schema.js';
+ 
+-export type UpdateContext = { auth: AuthContext; incidentId: string; body: UpdateIncidentBody };
++export type UpdateContext = {
++  auth: AuthContext;
++  incidentId: string;
++  body: UpdateIncidentBody;
++  requestId: string;
++};
+ export type UpdateResult = { status: number; data: unknown };
+ 
+ /** One action of `PATCH /incidents/:incidentId` (I3–I8, I10): the body shape it owns and its handler. */
+ export type UpdateRow = {
+   id: string;
+-  matches: (presentFields: string[]) => boolean;
++  matches: (presentFields: string[], body: UpdateIncidentBody) => boolean;
+   handle: (context: UpdateContext) => Promise<UpdateResult>;
+ };
+ 
+-/** I10: exactly `{ comment }`. Rows of other slices are added here by the slice that owns them. */
++/** I10: exactly `{ comment }`. */
+ const commentRow: UpdateRow = {
+   id: 'I10',
+   matches: (fields) => fields.length === 1 && fields[0] === 'comment',
+@@ -23,7 +29,7 @@ const commentRow: UpdateRow = {
+   }),
+ };
+ 
+-export const UPDATE_ROWS: readonly UpdateRow[] = [commentRow];
++export const UPDATE_ROWS: readonly UpdateRow[] = [...LIFECYCLE_ROWS, commentRow];
+ 
+ /** The names of the fields the request actually carries (`null` counts as present). */
+ export function presentFields(body: UpdateIncidentBody): string[] {
+@@ -35,7 +41,7 @@ export function presentFields(body: UpdateIncidentBody): string[] {
+ /** A request must match exactly one row; none or several is `422 VALIDATION_FAILED`. */
+ export function selectRow(body: UpdateIncidentBody, rows: readonly UpdateRow[] = UPDATE_ROWS) {
+   const fields = presentFields(body);
+-  const matching = rows.filter((row) => row.matches(fields));
++  const matching = rows.filter((row) => row.matches(fields, body));
+   if (matching.length !== 1) {
+     throw new ValidationError(
+       'Request must match exactly one incident action',
+diff --git a/backend/src/modules/incidents/update/lifecycle-rows.spec.ts b/backend/src/modules/incidents/update/lifecycle-rows.spec.ts
+new file mode 100644
+index 0000000..f1eb2d3
+--- /dev/null
++++ b/backend/src/modules/incidents/update/lifecycle-rows.spec.ts
+@@ -0,0 +1,52 @@
++import { AppError } from '../../../shared/errors/AppError.js';
++import { parseOrThrow } from '../../../shared/errors/zod.js';
++import { selectRow } from './incident-update.dispatcher.js';
++import { updateIncidentBodySchema } from './incident-update.schema.js';
++
++const USER = '0198c3a0-7c1e-7a45-8a40-1f2f3a4b5c6d';
++const rowOf = (body: unknown) => selectRow(parseOrThrow(updateIncidentBodySchema, body)).id;
++const failure = (body: unknown) => {
++  try {
++    rowOf(body);
++  } catch (error) {
++    const { statusCode, code } = error as AppError;
++    return { statusCode, code };
++  }
++  throw new Error('matched a row');
++};
++
++describe('exactly-one-row matching of the lifecycle actions', () => {
++  it.each([
++    ['I3', { status: 'ACKNOWLEDGED' }],
++    ['I4', { status: 'MITIGATING', severity: 'P1' }],
++    ['I5', { severity: 'P2' }],
++    ['I6', { currentAssignee: USER }],
++    ['I7', { currentAssignee: null, status: 'OPEN' }],
++    ['I8', { status: 'RESOLVED', resolutionSummary: 'fixed', serviceConfirmedWorking: true }],
++    ['I10', { comment: { body: 'hi' } }],
++  ])('%s matches its documented body', (id, body) => {
++    expect(rowOf(body)).toBe(id);
++  });
++
++  it('routes an incomplete or false I8 body to the resolve row (its handler answers 422 / 400)', () => {
++    expect(rowOf({ status: 'RESOLVED' })).toBe('I8');
++    expect(
++      rowOf({ status: 'RESOLVED', resolutionSummary: 'x', serviceConfirmedWorking: false }),
++    ).toBe('I8');
++  });
++
++  it.each([
++    ['an empty body', {}],
++    ['status OPEN alone', { status: 'OPEN' }],
++    ['status MITIGATING without severity', { status: 'MITIGATING' }],
++    ['status ACKNOWLEDGED with severity', { status: 'ACKNOWLEDGED', severity: 'P1' }],
++    ['an assignee with a status', { currentAssignee: USER, status: 'OPEN' }],
++    ['an assignee with a severity', { currentAssignee: USER, severity: 'P1' }],
++    ['a null assignee with ACKNOWLEDGED', { currentAssignee: null, status: 'ACKNOWLEDGED' }],
++    ['a severity next to a resolve', { status: 'RESOLVED', severity: 'P1' }],
++    ['a resolution summary without status', { resolutionSummary: 'x' }],
++    ['a comment next to an action', { comment: { body: 'x' }, status: 'ACKNOWLEDGED' }],
++  ])('%s matches no row: 422', (_name, body) => {
++    expect(failure(body)).toEqual({ statusCode: 422, code: 'VALIDATION_FAILED' });
++  });
++});
+diff --git a/backend/src/modules/incidents/update/lifecycle-rows.ts b/backend/src/modules/incidents/update/lifecycle-rows.ts
+new file mode 100644
+index 0000000..9650427
+--- /dev/null
++++ b/backend/src/modules/incidents/update/lifecycle-rows.ts
+@@ -0,0 +1,108 @@
++import {
++  acknowledgeIncident,
++  assignIncident,
++  changeSeverity,
++  confirmSeverity,
++  resolveIncident,
++  unassignIncident,
++} from '../lifecycle/lifecycle.service.js';
++import type { UpdateRow } from './incident-update.dispatcher.js';
++
++const only =
++  (...names: string[]) =>
++  (fields: string[]) =>
++    fields.length === names.length && names.every((name) => fields.includes(name));
++
++const respond = (data: unknown) => ({ status: 200, data });
++
++/** I3: exactly `{ status: ACKNOWLEDGED }`. */
++const acknowledgeRow: UpdateRow = {
++  id: 'I3',
++  matches: (fields, body) => only('status')(fields) && body.status === 'ACKNOWLEDGED',
++  handle: async ({ auth, incidentId, requestId }) =>
++    respond(await acknowledgeIncident(auth, incidentId, requestId)),
++};
++
++/** I4: exactly `{ status: MITIGATING, severity }`. */
++const confirmSeverityRow: UpdateRow = {
++  id: 'I4',
++  matches: (fields, body) => only('status', 'severity')(fields) && body.status === 'MITIGATING',
++  handle: async ({ auth, incidentId, body, requestId }) =>
++    respond(
++      await confirmSeverity(
++        auth,
++        incidentId,
++        body.severity as NonNullable<typeof body.severity>,
++        requestId,
++      ),
++    ),
++};
++
++/** I5: exactly `{ severity }`. */
++const changeSeverityRow: UpdateRow = {
++  id: 'I5',
++  matches: only('severity'),
++  handle: async ({ auth, incidentId, body, requestId }) =>
++    respond(
++      await changeSeverity(
++        auth,
++        incidentId,
++        body.severity as NonNullable<typeof body.severity>,
++        requestId,
++      ),
++    ),
++};
++
++/** I6: exactly `{ currentAssignee: <uuid> }`. */
++const assignRow: UpdateRow = {
++  id: 'I6',
++  matches: (fields, body) => only('currentAssignee')(fields) && body.currentAssignee !== null,
++  handle: async ({ auth, incidentId, body, requestId }) =>
++    respond(await assignIncident(auth, incidentId, body.currentAssignee as string, requestId)),
++};
++
++/** I7: exactly `{ currentAssignee: null, status: OPEN }`. */
++const unassignRow: UpdateRow = {
++  id: 'I7',
++  matches: (fields, body) =>
++    only('currentAssignee', 'status')(fields) &&
++    body.currentAssignee === null &&
++    body.status === 'OPEN',
++  handle: async ({ auth, incidentId, requestId }) =>
++    respond(await unassignIncident(auth, incidentId, requestId)),
++};
++
++/**
++ * I8: `status: RESOLVED` with `resolutionSummary` and `serviceConfirmedWorking` and nothing else.
++ * Matching only needs the status; a missing summary is `422` and a flag other than `true` is
++ * `400`, decided after the team gate.
++ */
++const resolveRow: UpdateRow = {
++  id: 'I8',
++  matches: (fields, body) =>
++    body.status === 'RESOLVED' &&
++    fields.every((field) =>
++      ['status', 'resolutionSummary', 'serviceConfirmedWorking'].includes(field),
++    ),
++  handle: async ({ auth, incidentId, body, requestId }) =>
++    respond(
++      await resolveIncident(
++        auth,
++        incidentId,
++        {
++          resolutionSummary: body.resolutionSummary,
++          serviceConfirmedWorking: body.serviceConfirmedWorking,
++        },
++        requestId,
++      ),
++    ),
++};
++
++export const LIFECYCLE_ROWS: readonly UpdateRow[] = [
++  acknowledgeRow,
++  confirmSeverityRow,
++  changeSeverityRow,
++  assignRow,
++  unassignRow,
++  resolveRow,
++];
+diff --git a/backend/src/modules/notifications/enqueue-notification.ts b/backend/src/modules/notifications/enqueue-notification.ts
+new file mode 100644
+index 0000000..b82d5a5
+--- /dev/null
++++ b/backend/src/modules/notifications/enqueue-notification.ts
+@@ -0,0 +1,50 @@
++import type { AuditEventType } from '../../generated/prisma/enums.js';
++import type { TransactionClient } from '../../infra/db/prisma.js';
++import { enqueueOutbox } from '../../infra/jobs/index.js';
++
++/** Producer contract of SLICE-09: what happened (`occurrenceId` = the audit event) and its context. */
++export type EnqueueNotificationInput = {
++  eventType: AuditEventType;
++  occurrenceId: string;
++  incidentId?: string;
++  serviceId?: string;
++  teamId?: string;
++  alertSourceId?: string;
++  subjectUserId?: string;
++};
++
++/**
++ * MINIMAL STAND-IN for the SLICE-09 producer contract, created by SLICE-05 because SLICE-09 is not
++ * implemented yet (approved by the project owner). It inserts one `ALERT` `Notification` and its
++ * `NOTIFICATION_REQUESTED` outbox event on the caller's transaction, once per occurrence
++ * (`idempotencyKey` = `<eventType>:<occurrenceId>`).
++ *
++ * It does NOT resolve recipients: `recipients` stays empty. The recipient rules belong to SLICE-09,
++ * which replaces the body of this function and keeps its signature.
++ */
++export async function enqueueNotification(
++  tx: TransactionClient,
++  input: EnqueueNotificationInput,
++): Promise<string> {
++  const notification = await tx.notification.create({
++    data: {
++      notificationType: 'ALERT',
++      idempotencyKey: `${input.eventType}:${input.occurrenceId}`,
++      recipients: [],
++      incidentId: input.incidentId ?? null,
++    },
++    select: { id: true },
++  });
++
++  await enqueueOutbox(tx, {
++    eventType: 'NOTIFICATION_REQUESTED',
++    aggregateType: 'NOTIFICATION',
++    aggregateId: notification.id,
++    payload: {
++      kind: input.eventType,
++      notificationId: notification.id,
++      ...(input.incidentId === undefined ? {} : { incidentId: input.incidentId }),
++    },
++  });
++  return notification.id;
++}
+diff --git a/backend/src/modules/notifications/index.ts b/backend/src/modules/notifications/index.ts
+new file mode 100644
+index 0000000..7976726
+--- /dev/null
++++ b/backend/src/modules/notifications/index.ts
+@@ -0,0 +1 @@
++export { enqueueNotification, type EnqueueNotificationInput } from './enqueue-notification.js';
+diff --git a/backend/test/integration/incident-lifecycle.int-spec.ts b/backend/test/integration/incident-lifecycle.int-spec.ts
+new file mode 100644
+index 0000000..2ceb739
+--- /dev/null
++++ b/backend/test/integration/incident-lifecycle.int-spec.ts
+@@ -0,0 +1,867 @@
++import { randomUUID } from 'node:crypto';
++import { Client } from 'pg';
++import request from 'supertest';
++import { Prisma } from '../../src/generated/prisma/client';
++import * as audit from '../../src/infra/audit/append-audit-event';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { getRedis } from '../../src/infra/redis/redis';
++import * as notifications from '../../src/modules/notifications/enqueue-notification';
++import { buildTestApp } from '../helpers/app';
++import { bearer, createUser, login, resetState } from '../helpers/identity';
++import { createAlertSource, createIncidentWith, incidentWorld } from '../helpers/incidents';
++import { testDatabaseUrl } from '../helpers/test-env';
++
++const app = buildTestApp();
++
++beforeEach(resetState);
++afterEach(() => jest.restoreAllMocks());
++afterAll(async () => {
++  await getPrisma().$disconnect();
++  getRedis().disconnect();
++});
++
++type Headers = Record<string, string>;
++const patch = (token: Headers, id: string, body: unknown) =>
++  request(app)
++    .patch(`/api/v1/incidents/${id}`)
++    .set(token)
++    .send(body as object);
++
++/**
++ * World of team A whose service has the escalation chain engA (level 1), leadA (levels 2, 3) and
++ * adminA (fallback). `engA2` and `adminA2` belong to the team but are outside the chain.
++ */
++async function lifecycleWorld() {
++  const w = await incidentWorld(app);
++  const db = getPrisma();
++  const engA2 = await createUser({ role: 'ENGINEER', teamId: w.teamA.id, name: 'Erin Engineer' });
++  const adminA2 = await createUser({ role: 'ADMIN', teamId: w.teamA.id, name: 'Abe Admin' });
++  const inactive = await createUser({
++    role: 'ENGINEER',
++    teamId: w.teamA.id,
++    status: 'DEACTIVATED',
++  });
++  const policy = await db.escalationPolicy.create({
++    data: {
++      level1Id: w.engA.id,
++      level2Id: w.leadA.id,
++      level3Id: w.leadA.id,
++      fallbackAdminId: w.adminA.id,
++    },
++  });
++  const service = await db.appService.create({
++    data: {
++      name: `chain-${randomUUID().slice(0, 8)}`,
++      teamId: w.teamA.id,
++      escalationPolicyId: policy.id,
++      P0ResponseSlaMinutes: 5,
++      P0ResolutionSlaMinutes: 30,
++      P1ResponseSlaMinutes: 10,
++      P1ResolutionSlaMinutes: 60,
++      P2ResponseSlaMinutes: 30,
++      P2ResolutionSlaMinutes: 120,
++      P3ResponseSlaMinutes: 60,
++      P3ResolutionSlaMinutes: 240,
++    },
++  });
++  const tokenOf = async (user: { email: string }) => bearer((await login(app, user.email)).token);
++  return {
++    ...w,
++    engA2,
++    adminA2,
++    inactive,
++    service,
++    auth: {
++      ...w.auth,
++      engA2: await tokenOf(engA2),
++      adminA2: await tokenOf(adminA2),
++    },
++  };
++}
++
++type World = Awaited<ReturnType<typeof lifecycleWorld>>;
++type Status = 'OPEN' | 'ACKNOWLEDGED' | 'MITIGATING' | 'RESOLVED' | 'CLOSED';
++
++function incidentIn(
++  w: World,
++  status: Status,
++  extra: { assignee?: string | null; severity?: 'P0' | 'P1' | 'P2' | 'P3'; ackBy?: string } = {},
++) {
++  return createIncidentWith({
++    teamId: w.teamA.id,
++    serviceId: w.service.id,
++    status,
++    severity: extra.severity ?? 'P2',
++    currentAssigneeId: extra.assignee ?? null,
++    acknowledgedById: extra.ackBy ?? null,
++    acknowledgedAt: extra.ackBy ? new Date('2026-01-01T00:00:00.000Z') : null,
++  });
++}
++
++const eventsOf = (incidentId: string) =>
++  getPrisma().auditEvent.findMany({ where: { incidentId }, orderBy: { createdAt: 'asc' } });
++const eventTypes = async (incidentId: string) =>
++  (await eventsOf(incidentId)).map((event) => event.eventType);
++const outbox = (eventType?: string) =>
++  getPrisma().outboxEvent.findMany({ where: eventType ? { eventType } : {} });
++const reload = (id: string) => getPrisma().incident.findUniqueOrThrow({ where: { id } });
++
++async function nothingWritten(incidentId: string) {
++  expect(await eventsOf(incidentId)).toEqual([]);
++  expect(await outbox()).toEqual([]);
++  expect(await getPrisma().notification.count()).toBe(0);
++}
++
++const conflict = (currentStatus: string, requiredStatus: string | string[]) => ({
++  error: {
++    code: 'INVALID_STATE_TRANSITION',
++    message: expect.any(String),
++    details: [{ currentStatus, requiredStatus }],
++    requestId: expect.any(String),
++  },
++});
++
++describe('PATCH /incidents/:incidentId — gates and request model', () => {
++  it('401 without a token', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    const res = await request(app)
++      .patch(`/api/v1/incidents/${incident.id}`)
++      .send({ status: 'ACKNOWLEDGED' });
++    expect(res.status).toBe(401);
++    expect(res.body.error.code).toBe('UNAUTHENTICATED');
++  });
++
++  it.each([
++    ['an unknown field', { status: 'ACKNOWLEDGED', extra: 1 }, 400, 'BAD_REQUEST'],
++    ['an empty body', {}, 422, 'VALIDATION_FAILED'],
++    ['status OPEN alone', { status: 'OPEN' }, 422, 'VALIDATION_FAILED'],
++    ['two actions', { status: 'ACKNOWLEDGED', severity: 'P1' }, 422, 'VALIDATION_FAILED'],
++    [
++      'an action next to a comment',
++      { severity: 'P1', comment: { body: 'x' } },
++      422,
++      'VALIDATION_FAILED',
++    ],
++    ['an invalid severity', { severity: 'P9' }, 422, 'VALIDATION_FAILED'],
++    ['a malformed assignee', { currentAssignee: 'nope' }, 422, 'VALIDATION_FAILED'],
++  ])('%s → %i %s', async (_name, body, status, code) => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    const res = await patch(w.auth.leadA, incident.id, body);
++    expect([res.status, res.body.error.code]).toEqual([status, code]);
++    await nothingWritten(incident.id);
++  });
++
++  it('422 for a malformed incident id', async () => {
++    const w = await lifecycleWorld();
++    const res = await patch(w.auth.leadA, 'not-a-uuid', { status: 'ACKNOWLEDGED' });
++    expect([res.status, res.body.error.code]).toEqual([422, 'VALIDATION_FAILED']);
++  });
++
++  it('403 INVALID_ACTION for a caller without a team (an Admin too), before any lookup', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    for (const id of [incident.id, randomUUID()]) {
++      const res = await patch(w.auth.noTeam, id, { status: 'ACKNOWLEDGED' });
++      expect([res.status, res.body.error.code]).toEqual([403, 'INVALID_ACTION']);
++    }
++  });
++
++  it('404 INCIDENT_NOT_FOUND and 403 TEAM_ACCESS_DENIED for another team', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    const missing = await patch(w.auth.leadA, randomUUID(), { status: 'ACKNOWLEDGED' });
++    expect([missing.status, missing.body.error.code]).toEqual([404, 'INCIDENT_NOT_FOUND']);
++    expect(missing.body.error.details).toEqual([{ resource: 'incident' }]);
++
++    const other = await patch(w.auth.engB, incident.id, { status: 'ACKNOWLEDGED' });
++    expect([other.status, other.body.error.code]).toEqual([403, 'TEAM_ACCESS_DENIED']);
++    await nothingWritten(incident.id);
++  });
++});
++
++describe('I3 acknowledge', () => {
++  it('auto-assigns an unassigned incident: ASSIGNED then ACKNOWLEDGED, one notification each', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    const res = await patch(w.auth.engA2, incident.id, { status: 'ACKNOWLEDGED' });
++
++    expect(res.status).toBe(200);
++    expect(Object.keys(res.body)).toEqual(['data']);
++    expect(res.body.data).toMatchObject({
++      id: incident.id,
++      status: 'ACKNOWLEDGED',
++      currentAssignee: { id: w.engA2.id, name: 'Erin Engineer' },
++      acknowledgedBy: { id: w.engA2.id, name: 'Erin Engineer' },
++      acknowledgedAt: expect.stringMatching(/Z$/),
++      severityConfirmedBy: null,
++      resolvedBy: null,
++      closedBy: null,
++      resolutionSummary: null,
++      service: { id: w.service.id },
++      teamId: w.teamA.id,
++    });
++    expect(res.body.data.sla.response.state).toBe('MET');
++
++    const events = await eventsOf(incident.id);
++    expect(events.map((e) => e.eventType)).toEqual(['ASSIGNED', 'ACKNOWLEDGED']);
++    expect(events.map((e) => e.actor)).toEqual([w.engA2.id, w.engA2.id]);
++    expect(events[0].metadata).toEqual({ from: null, to: w.engA2.id, auto: true });
++    expect(events[1].metadata).toEqual({ acknowledgedBy: w.engA2.id, autoAssigned: true });
++    expect(events[0].createdAt.getTime()).toBeLessThan(events[1].createdAt.getTime());
++
++    const rows = await getPrisma().notification.findMany({ orderBy: { createdAt: 'asc' } });
++    expect(rows.map((n) => n.notificationType)).toEqual(['ALERT', 'ALERT']);
++    expect(rows.map((n) => n.idempotencyKey)).toEqual([
++      `ASSIGNED:${events[0].id}`,
++      `ACKNOWLEDGED:${events[1].id}`,
++    ]);
++    expect(rows.every((n) => n.incidentId === incident.id)).toBe(true);
++
++    const queued = await outbox();
++    expect(queued.map((o) => o.eventType)).toEqual([
++      'NOTIFICATION_REQUESTED',
++      'NOTIFICATION_REQUESTED',
++    ]);
++    expect(
++      queued.map((o) => (o.payload as { notificationId: string }).notificationId).sort(),
++    ).toEqual(rows.map((n) => n.id).sort());
++    expect(await outbox('SLA_EVALUATION_REQUESTED')).toEqual([]);
++  });
++
++  it('keeps an existing assignee: only ACKNOWLEDGED, autoAssigned false; any role may acknowledge', async () => {
++    const w = await lifecycleWorld();
++    for (const token of [w.auth.engA, w.auth.leadA, w.auth.adminA2]) {
++      const incident = await incidentIn(w, 'OPEN', { assignee: w.engA2.id });
++      const res = await patch(token, incident.id, { status: 'ACKNOWLEDGED' });
++      expect(res.status).toBe(200);
++      expect(res.body.data.currentAssignee.id).toBe(w.engA2.id);
++      const events = await eventsOf(incident.id);
++      expect(events.map((e) => e.eventType)).toEqual(['ACKNOWLEDGED']);
++      expect(events[0].metadata).toMatchObject({ autoAssigned: false });
++      const stored = await reload(incident.id);
++      expect(stored.acknowledgedById).not.toBe(stored.currentAssigneeId);
++    }
++  });
++
++  it.each(['ACKNOWLEDGED', 'MITIGATING', 'RESOLVED', 'CLOSED'] as const)(
++    'from %s → 409 INVALID_STATE_TRANSITION, nothing written',
++    async (status) => {
++      const w = await lifecycleWorld();
++      const incident = await incidentIn(w, status);
++      const res = await patch(w.auth.leadA, incident.id, { status: 'ACKNOWLEDGED' });
++      expect(res.status).toBe(409);
++      expect(res.body).toEqual(conflict(status, 'OPEN'));
++      await nothingWritten(incident.id);
++    },
++  );
++
++  it('a retry gets 409 and creates no second event, outbox row or notification', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    expect((await patch(w.auth.leadA, incident.id, { status: 'ACKNOWLEDGED' })).status).toBe(200);
++    expect((await patch(w.auth.leadA, incident.id, { status: 'ACKNOWLEDGED' })).status).toBe(409);
++    expect(await eventTypes(incident.id)).toEqual(['ASSIGNED', 'ACKNOWLEDGED']);
++    expect(await getPrisma().notification.count()).toBe(2);
++    expect(await outbox()).toHaveLength(2);
++  });
++
++  it('N parallel acknowledgements: exactly one 200, the rest 409, one set of rows', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    const tokens = [w.auth.engA, w.auth.engA2, w.auth.leadA, w.auth.adminA, w.auth.adminA2];
++    const results = await Promise.all(
++      tokens.map((token) => patch(token, incident.id, { status: 'ACKNOWLEDGED' })),
++    );
++    const statuses = results.map((r) => r.status).sort();
++    expect(statuses).toEqual([200, 409, 409, 409, 409]);
++    for (const loser of results.filter((r) => r.status === 409)) {
++      expect(loser.body.error.code).toBe('INVALID_STATE_TRANSITION');
++    }
++    const winner = results.find((r) => r.status === 200)!;
++    const stored = await reload(incident.id);
++    expect(stored.acknowledgedById).toBe(winner.body.data.acknowledgedBy.id);
++    expect(stored.currentAssigneeId).toBe(winner.body.data.acknowledgedBy.id);
++    expect(await eventTypes(incident.id)).toEqual(['ASSIGNED', 'ACKNOWLEDGED']);
++    expect(await outbox()).toHaveLength(2);
++    expect(await getPrisma().notification.count()).toBe(2);
++  });
++});
++
++describe('I4 confirm severity', () => {
++  const body = (severity: string) => ({ status: 'MITIGATING', severity });
++
++  it('a chain member confirms: MITIGATING, severityConfirmedBy/At, event, notification, SLA evaluation', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'ACKNOWLEDGED', { assignee: w.engA.id, ackBy: w.engA.id });
++    const res = await patch(w.auth.engA, incident.id, body('P0'));
++
++    expect(res.status).toBe(200);
++    expect(res.body.data).toMatchObject({
++      status: 'MITIGATING',
++      severity: 'P0',
++      severityConfirmedBy: { id: w.engA.id },
++      severityConfirmedAt: expect.stringMatching(/Z$/),
++    });
++    expect(res.body.data.sla.applicableSeverity).toBe('P0');
++    const events = await eventsOf(incident.id);
++    expect(events).toHaveLength(1);
++    expect(events[0]).toMatchObject({
++      eventType: 'SEVERITY_CONFIRMED',
++      actor: w.engA.id,
++      metadata: { from: 'P2', to: 'P0', statusFrom: 'ACKNOWLEDGED', statusTo: 'MITIGATING' },
++    });
++    const sla = await outbox('SLA_EVALUATION_REQUESTED');
++    expect(sla).toHaveLength(1);
++    expect(sla[0].payload).toMatchObject({
++      incidentId: incident.id,
++      requestId: expect.any(String),
++    });
++    expect(await getPrisma().notification.count()).toBe(1);
++  });
++
++  it('writes the event when the confirmed value equals the current severity', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'ACKNOWLEDGED', { severity: 'P2', ackBy: w.leadA.id });
++    expect((await patch(w.auth.leadA, incident.id, body('P2'))).status).toBe(200);
++    expect((await eventsOf(incident.id))[0].metadata).toMatchObject({ from: 'P2', to: 'P2' });
++  });
++
++  it('403 FORBIDDEN for a team member outside the chain, an Admin included', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'ACKNOWLEDGED');
++    for (const token of [w.auth.engA2, w.auth.adminA2]) {
++      const res = await patch(token, incident.id, body('P1'));
++      expect([res.status, res.body.error.code]).toEqual([403, 'FORBIDDEN']);
++    }
++    await nothingWritten(incident.id);
++  });
++
++  it.each(['OPEN', 'MITIGATING', 'RESOLVED', 'CLOSED'] as const)(
++    'from %s → 409',
++    async (status) => {
++      const w = await lifecycleWorld();
++      const incident = await incidentIn(w, status);
++      const res = await patch(w.auth.leadA, incident.id, body('P1'));
++      expect(res.status).toBe(409);
++      expect(res.body).toEqual(conflict(status, 'ACKNOWLEDGED'));
++    },
++  );
++
++  it('a retry gets 409 and writes nothing more', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'ACKNOWLEDGED');
++    expect((await patch(w.auth.leadA, incident.id, body('P1'))).status).toBe(200);
++    expect((await patch(w.auth.leadA, incident.id, body('P1'))).status).toBe(409);
++    expect(await eventsOf(incident.id)).toHaveLength(1);
++    expect(await outbox()).toHaveLength(2);
++  });
++});
++
++describe('I5 change severity', () => {
++  it.each(['ACKNOWLEDGED', 'MITIGATING'] as const)(
++    'changes the severity in %s, status unchanged, SEVERITY_CONFIRMED with statusFrom = statusTo',
++    async (status) => {
++      const w = await lifecycleWorld();
++      const incident = await incidentIn(w, status);
++      const res = await patch(w.auth.engA, incident.id, { severity: 'P0' });
++      expect(res.status).toBe(200);
++      expect(res.body.data).toMatchObject({ status, severity: 'P0', severityConfirmedBy: null });
++      expect((await eventsOf(incident.id))[0].metadata).toEqual({
++        from: 'P2',
++        to: 'P0',
++        statusFrom: status,
++        statusTo: status,
++      });
++      expect(await outbox('SLA_EVALUATION_REQUESTED')).toHaveLength(1);
++      expect(await getPrisma().notification.count()).toBe(1);
++    },
++  );
++
++  it('in OPEN a Team Lead in the chain may, an Engineer in the chain gets 403 FORBIDDEN_ROLE', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    const denied = await patch(w.auth.engA, incident.id, { severity: 'P0' });
++    expect([denied.status, denied.body.error.code]).toEqual([403, 'FORBIDDEN_ROLE']);
++    await nothingWritten(incident.id);
++    expect((await patch(w.auth.leadA, incident.id, { severity: 'P0' })).status).toBe(200);
++    expect((await patch(w.auth.adminA, incident.id, { severity: 'P3' })).status).toBe(200);
++  });
++
++  it('the same value is 200 and writes nothing', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING', { severity: 'P1' });
++    const res = await patch(w.auth.leadA, incident.id, { severity: 'P1' });
++    expect(res.status).toBe(200);
++    expect(res.body.data.severity).toBe('P1');
++    await nothingWritten(incident.id);
++  });
++
++  it('403 FORBIDDEN outside the chain (Admin too), checked before the role-by-state rule', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    for (const token of [w.auth.adminA2, w.auth.engA2]) {
++      const res = await patch(token, incident.id, { severity: 'P0' });
++      expect([res.status, res.body.error.code]).toEqual([403, 'FORBIDDEN']);
++    }
++  });
++
++  it.each(['RESOLVED', 'CLOSED'] as const)('%s → 409 with the allowed set', async (status) => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, status);
++    const res = await patch(w.auth.leadA, incident.id, { severity: 'P0' });
++    expect(res.status).toBe(409);
++    expect(res.body).toEqual(conflict(status, ['OPEN', 'ACKNOWLEDGED', 'MITIGATING']));
++  });
++});
++
++describe('I6 assign', () => {
++  it('assigns an unassigned incident: ASSIGNED { auto: false }; acknowledgement untouched', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'ACKNOWLEDGED', { ackBy: w.engA.id });
++    const res = await patch(w.auth.leadA, incident.id, { currentAssignee: w.engA2.id });
++    expect(res.status).toBe(200);
++    expect(res.body.data).toMatchObject({
++      status: 'ACKNOWLEDGED',
++      currentAssignee: { id: w.engA2.id },
++      acknowledgedBy: { id: w.engA.id },
++    });
++    const events = await eventsOf(incident.id);
++    expect(events.map((e) => [e.eventType, e.actor, e.metadata])).toEqual([
++      ['ASSIGNED', w.leadA.id, { from: null, to: w.engA2.id, auto: false }],
++    ]);
++    expect(await getPrisma().notification.count()).toBe(1);
++    expect(await outbox('SLA_EVALUATION_REQUESTED')).toEqual([]);
++  });
++
++  it('reassigns: REASSIGNED { from, to }; a Team Lead may be the assignee', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING', { assignee: w.engA.id });
++    const res = await patch(w.auth.adminA2, incident.id, { currentAssignee: w.leadA.id });
++    expect(res.status).toBe(200);
++    expect((await eventsOf(incident.id))[0]).toMatchObject({
++      eventType: 'REASSIGNED',
++      metadata: { from: w.engA.id, to: w.leadA.id },
++    });
++  });
++
++  it('the current assignee again is 200 and writes nothing', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN', { assignee: w.engA.id });
++    const res = await patch(w.auth.leadA, incident.id, { currentAssignee: w.engA.id });
++    expect(res.status).toBe(200);
++    await nothingWritten(incident.id);
++  });
++
++  it('an Engineer gets 403 FORBIDDEN_ROLE', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    const res = await patch(w.auth.engA, incident.id, { currentAssignee: w.engA2.id });
++    expect([res.status, res.body.error.code]).toEqual([403, 'FORBIDDEN_ROLE']);
++    await nothingWritten(incident.id);
++  });
++
++  it.each([
++    ['a user of another team', (w: World) => w.engB.id],
++    ['a deactivated user', (w: World) => w.inactive.id],
++    ['an Admin of the team', (w: World) => w.adminA2.id],
++    ['a user that does not exist', () => randomUUID()],
++  ])('%s → 403 ASSIGNEE_NOT_ELIGIBLE with no details', async (_name, pick) => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    const res = await patch(w.auth.leadA, incident.id, { currentAssignee: pick(w) });
++    expect([res.status, res.body.error.code]).toEqual([403, 'ASSIGNEE_NOT_ELIGIBLE']);
++    expect(res.body.error.details).toEqual([]);
++    await nothingWritten(incident.id);
++  });
++
++  it.each(['RESOLVED', 'CLOSED'] as const)('%s → 409', async (status) => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, status);
++    const res = await patch(w.auth.leadA, incident.id, { currentAssignee: w.engA2.id });
++    expect(res.status).toBe(409);
++    expect(res.body).toEqual(conflict(status, ['OPEN', 'ACKNOWLEDGED', 'MITIGATING']));
++  });
++});
++
++describe('I7 unassign', () => {
++  const body = { currentAssignee: null, status: 'OPEN' };
++
++  it('assigned and mitigating: REASSIGNED then OPEN, acknowledgement cleared, SLA evaluation, 2 notifications', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING', { assignee: w.engA.id, ackBy: w.engA.id });
++    const res = await patch(w.auth.leadA, incident.id, body);
++    expect(res.status).toBe(200);
++    expect(res.body.data).toMatchObject({
++      status: 'OPEN',
++      currentAssignee: null,
++      acknowledgedBy: null,
++      acknowledgedAt: null,
++    });
++    const events = await eventsOf(incident.id);
++    expect(events.map((e) => [e.eventType, e.metadata])).toEqual([
++      ['REASSIGNED', { from: w.engA.id, to: null }],
++      ['OPEN', { statusFrom: 'MITIGATING' }],
++    ]);
++    expect(await getPrisma().notification.count()).toBe(2);
++    expect(await outbox('SLA_EVALUATION_REQUESTED')).toHaveLength(1);
++  });
++
++  it('assigned but already OPEN: only REASSIGNED, no SLA evaluation', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN', { assignee: w.engA.id });
++    expect((await patch(w.auth.adminA, incident.id, body)).status).toBe(200);
++    expect(await eventTypes(incident.id)).toEqual(['REASSIGNED']);
++    expect(await outbox('SLA_EVALUATION_REQUESTED')).toEqual([]);
++  });
++
++  it('already unassigned and OPEN: 200 and nothing written', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    expect((await patch(w.auth.leadA, incident.id, body)).status).toBe(200);
++    await nothingWritten(incident.id);
++  });
++
++  it('an Engineer gets 403 FORBIDDEN_ROLE', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING', { assignee: w.engA.id });
++    const res = await patch(w.auth.engA, incident.id, body);
++    expect([res.status, res.body.error.code]).toEqual([403, 'FORBIDDEN_ROLE']);
++  });
++
++  it.each(['RESOLVED', 'CLOSED'] as const)('%s → 409', async (status) => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, status);
++    const res = await patch(w.auth.leadA, incident.id, body);
++    expect(res.status).toBe(409);
++    expect(res.body).toEqual(conflict(status, ['OPEN', 'ACKNOWLEDGED', 'MITIGATING']));
++  });
++});
++
++describe('I8 resolve', () => {
++  const body = {
++    status: 'RESOLVED',
++    resolutionSummary: 'Rolled back',
++    serviceConfirmedWorking: true,
++  };
++
++  async function withAlerts(w: World, incidentId: string) {
++    const source = await createAlertSource();
++    const db = getPrisma();
++    const alerts = await Promise.all(
++      ['a', 'b'].map((key) =>
++        db.alert.create({
++          data: {
++            name: key,
++            environment: 'production',
++            startedTimestamp: new Date('2026-01-01T00:00:00.000Z'),
++            originalPayload: {},
++            alertSourceId: source.id,
++            affectedServiceId: w.service.id,
++            incidentId,
++            activeIdentityKey: `fingerprint:${key}`,
++          },
++        }),
++      ),
++    );
++    return alerts;
++  }
++
++  it('resolves atomically: incident, RESOLVED event, postmortem, cleared keys, outbox, notification', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING', { assignee: w.engA.id });
++    await withAlerts(w, incident.id);
++
++    const res = await patch(w.auth.leadA, incident.id, body);
++    expect(res.status).toBe(200);
++    expect(res.body.data).toMatchObject({
++      status: 'RESOLVED',
++      resolvedBy: { id: w.leadA.id },
++      resolvedAt: expect.stringMatching(/Z$/),
++      resolutionSummary: 'Rolled back',
++    });
++    expect(res.body.data.sla.resolution.state).toBe('MET');
++
++    const events = await eventsOf(incident.id);
++    expect(events.map((e) => [e.eventType, e.actor, e.metadata])).toEqual([
++      ['RESOLVED', w.leadA.id, { resolutionSummary: 'Rolled back', serviceConfirmedWorking: true }],
++    ]);
++
++    const postmortems = await getPrisma().postmortem.findMany();
++    expect(postmortems).toHaveLength(1);
++    expect(postmortems[0]).toMatchObject({
++      incidentId: incident.id,
++      generationStatus: 'GENERATING',
++      reviewStatus: 'PENDING',
++      summary: null,
++      MTTR: null,
++      riskLevel: null,
++    });
++
++    const alerts = await getPrisma().alert.findMany({ where: { incidentId: incident.id } });
++    expect(alerts.map((a) => a.activeIdentityKey)).toEqual([null, null]);
++
++    const generation = await outbox('POSTMORTEM_GENERATION_REQUESTED');
++    expect(generation).toHaveLength(1);
++    expect(generation[0].payload).toMatchObject({
++      postmortemId: postmortems[0].id,
++      incidentId: incident.id,
++    });
++    expect(await getPrisma().notification.count()).toBe(1);
++    expect(await outbox('SLA_EVALUATION_REQUESTED')).toEqual([]);
++  });
++
++  it('an Engineer resolves only as the current assignee', async () => {
++    const w = await lifecycleWorld();
++    const mine = await incidentIn(w, 'MITIGATING', { assignee: w.engA.id });
++    const theirs = await incidentIn(w, 'MITIGATING', { assignee: w.engA2.id });
++    const nobody = await incidentIn(w, 'MITIGATING');
++    expect((await patch(w.auth.engA, mine.id, body)).status).toBe(200);
++    for (const incident of [theirs, nobody]) {
++      const res = await patch(w.auth.engA, incident.id, body);
++      expect([res.status, res.body.error.code]).toEqual([403, 'NOT_CURRENT_ASSIGNEE']);
++      expect((await reload(incident.id)).status).toBe('MITIGATING');
++    }
++    expect(await getPrisma().postmortem.count()).toBe(1);
++  });
++
++  it('a Team Lead and an Admin resolve any incident of the team', async () => {
++    const w = await lifecycleWorld();
++    for (const token of [w.auth.leadA, w.auth.adminA2]) {
++      const incident = await incidentIn(w, 'MITIGATING', { assignee: w.engA2.id });
++      expect((await patch(token, incident.id, body)).status).toBe(200);
++    }
++  });
++
++  it('422 when the summary is missing or invalid, 400 when serviceConfirmedWorking is not true', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING');
++    const cases: [object, number, string][] = [
++      [{ status: 'RESOLVED', serviceConfirmedWorking: true }, 422, 'VALIDATION_FAILED'],
++      [{ ...body, resolutionSummary: '   ' }, 422, 'VALIDATION_FAILED'],
++      [{ ...body, resolutionSummary: 'x'.repeat(10_001) }, 422, 'VALIDATION_FAILED'],
++      [{ ...body, serviceConfirmedWorking: false }, 400, 'BAD_REQUEST'],
++      [{ status: 'RESOLVED', resolutionSummary: 'x' }, 400, 'BAD_REQUEST'],
++    ];
++    for (const [payload, status, code] of cases) {
++      const res = await patch(w.auth.leadA, incident.id, payload);
++      expect([res.status, res.body.error.code]).toEqual([status, code]);
++    }
++    expect(await getPrisma().postmortem.count()).toBe(0);
++    await nothingWritten(incident.id);
++  });
++
++  it('the body checks run after the team gate: another team still gets 403', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING');
++    const res = await patch(w.auth.engB, incident.id, { ...body, serviceConfirmedWorking: false });
++    expect([res.status, res.body.error.code]).toEqual([403, 'TEAM_ACCESS_DENIED']);
++  });
++
++  it.each(['OPEN', 'ACKNOWLEDGED', 'RESOLVED', 'CLOSED'] as const)(
++    'from %s → 409',
++    async (status) => {
++      const w = await lifecycleWorld();
++      const incident = await incidentIn(w, status);
++      const res = await patch(w.auth.leadA, incident.id, body);
++      expect(res.status).toBe(409);
++      expect(res.body).toEqual(conflict(status, 'MITIGATING'));
++      expect(await getPrisma().postmortem.count()).toBe(0);
++    },
++  );
++
++  it('a retry gets 409: still one postmortem, one generation job, one RESOLVED event', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING');
++    expect((await patch(w.auth.leadA, incident.id, body)).status).toBe(200);
++    expect((await patch(w.auth.leadA, incident.id, body)).status).toBe(409);
++    expect(await getPrisma().postmortem.count()).toBe(1);
++    expect(await outbox('POSTMORTEM_GENERATION_REQUESTED')).toHaveLength(1);
++    expect(await eventTypes(incident.id)).toEqual(['RESOLVED']);
++  });
++
++  it('parallel resolves: one 200, the rest 409, one postmortem and one job', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING');
++    const results = await Promise.all(
++      [w.auth.leadA, w.auth.adminA, w.auth.adminA2, w.auth.leadA].map((token) =>
++        patch(token, incident.id, body),
++      ),
++    );
++    expect(results.map((r) => r.status).sort()).toEqual([200, 409, 409, 409]);
++    expect(await getPrisma().postmortem.count()).toBe(1);
++    expect(await outbox('POSTMORTEM_GENERATION_REQUESTED')).toHaveLength(1);
++    expect(await eventTypes(incident.id)).toEqual(['RESOLVED']);
++  });
++
++  it('resolve racing unassign: one wins by lock order, the other gets 409, state matches the events', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING', { assignee: w.engA.id, ackBy: w.engA.id });
++    const [resolve, unassign] = await Promise.all([
++      patch(w.auth.leadA, incident.id, body),
++      patch(w.auth.adminA, incident.id, { currentAssignee: null, status: 'OPEN' }),
++    ]);
++    const stored = await reload(incident.id);
++    if (resolve.status === 200) {
++      expect(unassign.status).toBe(409);
++      expect(stored.status).toBe('RESOLVED');
++      expect(await eventTypes(incident.id)).toEqual(['RESOLVED']);
++      expect(await getPrisma().postmortem.count()).toBe(1);
++    } else {
++      expect([resolve.status, unassign.status]).toEqual([409, 200]);
++      expect(stored.status).toBe('OPEN');
++      expect(await eventTypes(incident.id)).toEqual(['REASSIGNED', 'OPEN']);
++      expect(await getPrisma().postmortem.count()).toBe(0);
++    }
++  });
++});
++
++describe('atomicity: a failure rolls back state, audit, notifications and outbox together', () => {
++  it('I8: a failing audit append leaves the incident, postmortem, alert keys and outbox untouched', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING', { assignee: w.engA.id });
++    const source = await createAlertSource();
++    await getPrisma().alert.create({
++      data: {
++        name: 'a',
++        environment: 'production',
++        startedTimestamp: new Date('2026-01-01T00:00:00.000Z'),
++        originalPayload: {},
++        alertSourceId: source.id,
++        affectedServiceId: w.service.id,
++        incidentId: incident.id,
++        activeIdentityKey: 'fingerprint:a',
++      },
++    });
++    jest.spyOn(audit, 'appendAuditEvent').mockRejectedValueOnce(new Error('audit down'));
++
++    const res = await patch(w.auth.leadA, incident.id, {
++      status: 'RESOLVED',
++      resolutionSummary: 'x',
++      serviceConfirmedWorking: true,
++    });
++    expect([res.status, res.body.error.code]).toEqual([500, 'INTERNAL_ERROR']);
++
++    const stored = await reload(incident.id);
++    expect(stored).toMatchObject({
++      status: 'MITIGATING',
++      resolvedById: null,
++      resolutionSummary: null,
++    });
++    expect(await getPrisma().postmortem.count()).toBe(0);
++    expect((await getPrisma().alert.findFirstOrThrow()).activeIdentityKey).toBe('fingerprint:a');
++    await nothingWritten(incident.id);
++  });
++
++  it('I8: a failure at the very end (notification) rolls everything back', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'MITIGATING');
++    jest
++      .spyOn(notifications, 'enqueueNotification')
++      .mockRejectedValueOnce(new Error('notification producer down'));
++
++    const res = await patch(w.auth.leadA, incident.id, {
++      status: 'RESOLVED',
++      resolutionSummary: 'x',
++      serviceConfirmedWorking: true,
++    });
++    expect(res.status).toBe(500);
++    expect((await reload(incident.id)).status).toBe('MITIGATING');
++    expect(await getPrisma().postmortem.count()).toBe(0);
++    await nothingWritten(incident.id);
++  });
++
++  it('I3: a failure after the first of two audit events leaves nothing behind', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    const real = audit.appendAuditEvent;
++    jest
++      .spyOn(audit, 'appendAuditEvent')
++      .mockImplementationOnce(real)
++      .mockRejectedValueOnce(new Error('second event fails'));
++
++    const res = await patch(w.auth.leadA, incident.id, { status: 'ACKNOWLEDGED' });
++    expect(res.status).toBe(500);
++    const stored = await reload(incident.id);
++    expect(stored).toMatchObject({
++      status: 'OPEN',
++      currentAssigneeId: null,
++      acknowledgedById: null,
++    });
++    await nothingWritten(incident.id);
++  });
++});
++
++describe('lock timeout', () => {
++  async function holdLock(sql: string, params: string[], work: () => Promise<void>) {
++    const holder = new Client({ connectionString: testDatabaseUrl() });
++    await holder.connect();
++    try {
++      await holder.query('BEGIN');
++      await holder.query(sql, params);
++      await work();
++    } finally {
++      await holder.query('ROLLBACK');
++      await holder.end();
++    }
++  }
++
++  it('a held incident lock → 409 CONCURRENCY_CONFLICT, nothing written; a retry then succeeds', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    await holdLock(
++      'SELECT id FROM "Incident" WHERE id = $1::uuid FOR UPDATE',
++      [incident.id],
++      async () => {
++        const res = await patch(w.auth.leadA, incident.id, { status: 'ACKNOWLEDGED' });
++        expect([res.status, res.body.error.code]).toEqual([409, 'CONCURRENCY_CONFLICT']);
++        await nothingWritten(incident.id);
++      },
++    );
++    expect((await patch(w.auth.leadA, incident.id, { status: 'ACKNOWLEDGED' })).status).toBe(200);
++  });
++
++  it('I3 takes a share lock on the acknowledging user: a held user lock conflicts', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    await holdLock(
++      'SELECT id FROM "User" WHERE id = $1::uuid FOR UPDATE',
++      [w.leadA.id],
++      async () => {
++        const res = await patch(w.auth.leadA, incident.id, { status: 'ACKNOWLEDGED' });
++        expect([res.status, res.body.error.code]).toEqual([409, 'CONCURRENCY_CONFLICT']);
++      },
++    );
++    await nothingWritten(incident.id);
++  });
++
++  it('I6 takes a share lock on the assignee: a held user lock conflicts', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    await holdLock(
++      'SELECT id FROM "User" WHERE id = $1::uuid FOR UPDATE',
++      [w.engA2.id],
++      async () => {
++        const res = await patch(w.auth.leadA, incident.id, { currentAssignee: w.engA2.id });
++        expect([res.status, res.body.error.code]).toEqual([409, 'CONCURRENCY_CONFLICT']);
++      },
++    );
++    await nothingWritten(incident.id);
++  });
++});
++
++describe('database outage', () => {
++  it('503 DEPENDENCY_UNAVAILABLE with Retry-After when the database cannot be reached', async () => {
++    const w = await lifecycleWorld();
++    const incident = await incidentIn(w, 'OPEN');
++    jest
++      .spyOn(getPrisma().incident, 'findUnique')
++      .mockRejectedValueOnce(new Prisma.PrismaClientInitializationError('down', 'test', 'P1001'));
++
++    const res = await patch(w.auth.leadA, incident.id, { status: 'ACKNOWLEDGED' });
++    expect([res.status, res.body.error.code]).toEqual([503, 'DEPENDENCY_UNAVAILABLE']);
++    expect(res.headers['retry-after']).toBe('5');
++    await nothingWritten(incident.id);
++  });
++});
+diff --git a/backend/test/integration/incidents-write.int-spec.ts b/backend/test/integration/incidents-write.int-spec.ts
+index ffa69b3..c2f6546 100644
+--- a/backend/test/integration/incidents-write.int-spec.ts
++++ b/backend/test/integration/incidents-write.int-spec.ts
+@@ -143,7 +143,7 @@ describe('I10 PATCH /incidents/:incidentId — comment', () => {
+     ['missing body', { comment: {} }, 422],
+     ['comment that is not an object', { comment: 'hi' }, 422],
+     ['empty body', {}, 422],
+-    ['another action instead of a comment', { status: 'ACKNOWLEDGED' }, 422],
++    ['a body that matches no action instead of a comment', { status: 'OPEN' }, 422],
+     ['a comment combined with another action', { comment: { body: 'x' }, severity: 'P1' }, 422],
+     ['an unknown field', { comment: { body: 'x' }, extra: 1 }, 400],
+     ['a client-sent author', { comment: { body: 'x', authorId: randomUUID() } }, 400],

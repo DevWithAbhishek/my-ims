@@ -1,19 +1,25 @@
 import { ValidationError } from '../../../shared/errors/AppError.js';
 import type { AuthContext } from '../../../shared/types/auth-context.js';
 import { addComment } from '../comments/comment.service.js';
+import { LIFECYCLE_ROWS } from './lifecycle-rows.js';
 import type { UpdateIncidentBody } from './incident-update.schema.js';
 
-export type UpdateContext = { auth: AuthContext; incidentId: string; body: UpdateIncidentBody };
+export type UpdateContext = {
+  auth: AuthContext;
+  incidentId: string;
+  body: UpdateIncidentBody;
+  requestId: string;
+};
 export type UpdateResult = { status: number; data: unknown };
 
 /** One action of `PATCH /incidents/:incidentId` (I3–I8, I10): the body shape it owns and its handler. */
 export type UpdateRow = {
   id: string;
-  matches: (presentFields: string[]) => boolean;
+  matches: (presentFields: string[], body: UpdateIncidentBody) => boolean;
   handle: (context: UpdateContext) => Promise<UpdateResult>;
 };
 
-/** I10: exactly `{ comment }`. Rows of other slices are added here by the slice that owns them. */
+/** I10: exactly `{ comment }`. */
 const commentRow: UpdateRow = {
   id: 'I10',
   matches: (fields) => fields.length === 1 && fields[0] === 'comment',
@@ -23,7 +29,7 @@ const commentRow: UpdateRow = {
   }),
 };
 
-export const UPDATE_ROWS: readonly UpdateRow[] = [commentRow];
+export const UPDATE_ROWS: readonly UpdateRow[] = [...LIFECYCLE_ROWS, commentRow];
 
 /** The names of the fields the request actually carries (`null` counts as present). */
 export function presentFields(body: UpdateIncidentBody): string[] {
@@ -35,7 +41,7 @@ export function presentFields(body: UpdateIncidentBody): string[] {
 /** A request must match exactly one row; none or several is `422 VALIDATION_FAILED`. */
 export function selectRow(body: UpdateIncidentBody, rows: readonly UpdateRow[] = UPDATE_ROWS) {
   const fields = presentFields(body);
-  const matching = rows.filter((row) => row.matches(fields));
+  const matching = rows.filter((row) => row.matches(fields, body));
   if (matching.length !== 1) {
     throw new ValidationError(
       'Request must match exactly one incident action',

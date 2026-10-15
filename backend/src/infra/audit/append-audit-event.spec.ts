@@ -8,7 +8,7 @@ function fakeTx() {
     auditEvent: {
       create: ({ data }: { data: { eventType: string; createdAt: Date } }) => {
         created.push(data);
-        return Promise.resolve(data);
+        return Promise.resolve({ ...data, id: `id-${created.length}` });
       },
     },
   } as unknown as TransactionClient;
@@ -18,6 +18,11 @@ function fakeTx() {
 const input = { incidentId: null, actorId: null, metadata: {} } as const;
 
 describe('appendAuditEvent', () => {
+  it('returns the id of the stored event', async () => {
+    const { tx } = fakeTx();
+    await expect(appendAuditEvent(tx, { ...input, eventType: 'ASSIGNED' })).resolves.toBe('id-1');
+  });
+
   it('stamps each event on one transaction strictly later than the previous one', async () => {
     jest.useFakeTimers().setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
     const { tx, created } = fakeTx();
