@@ -4,6 +4,7 @@ import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
 import { ConflictError } from '../../../shared/errors/AppError.js';
 import type { AuthContext } from '../../../shared/types/auth-context.js';
 import { assertSameTeam, requireTeam } from '../auth/guard.js';
+import { enqueueNotification } from '../../notifications/index.js';
 import { revokeSessionsForUsers } from '../auth/session.repository.js';
 import { invalidAction, notFound, toPage, type Page } from '../identity.common.js';
 import { runIdentityTransaction } from '../transaction.js';
@@ -73,12 +74,15 @@ export async function updateTeam(
         (field) => body[field] !== undefined && body[field] !== team[field],
       );
       if (changedFields.length > 0) {
-        await appendAuditEvent(tx, {
+        const eventType = deactivating ? 'TEAM_DEACTIVATED' : 'TEAM_UPDATED';
+        const auditEventId = await appendAuditEvent(tx, {
           incidentId: null,
-          eventType: deactivating ? 'TEAM_DEACTIVATED' : 'TEAM_UPDATED',
+          eventType,
           actorId,
           metadata: { teamId, changedFields },
         });
+        // Before the users are detached, so the recipients are the members at the time of the change.
+        await enqueueNotification(tx, { eventType, occurrenceId: auditEventId, teamId });
       }
       if (deactivating) {
         const userIds = await detachUsersFromTeam(tx, teamId);

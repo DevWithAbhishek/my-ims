@@ -214,9 +214,10 @@ describe('I3 acknowledge', () => {
     const rows = await getPrisma().notification.findMany({ orderBy: { createdAt: 'asc' } });
     expect(rows.map((n) => n.notificationType)).toEqual(['ALERT', 'ALERT']);
     expect(rows.map((n) => n.idempotencyKey)).toEqual([
-      `ASSIGNED:${events[0].id}`,
-      `ACKNOWLEDGED:${events[1].id}`,
+      `ASSIGNED:${incident.id}:${events[0].id}`,
+      `ACKNOWLEDGED:${incident.id}:${events[1].id}`,
     ]);
+    expect(rows.map((n) => n.eventType)).toEqual(['ASSIGNED', 'ACKNOWLEDGED']);
     expect(rows.every((n) => n.incidentId === incident.id)).toBe(true);
 
     const queued = await outbox();

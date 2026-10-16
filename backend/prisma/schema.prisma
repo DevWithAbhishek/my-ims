@@ -91,6 +91,13 @@ enum NotificationType {
   ALERT
 }
 
+enum NotificationDeliveryStatus {
+  REQUESTED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
 enum InvestigationStatus {
   REQUESTED
   RUNNING
@@ -461,13 +468,14 @@ model Postmortem {
 }
 
 model Notification {
-  id                   String           @id @default(uuid(7)) @db.Uuid
-  deliveryStatus       LifecycleStates  @default(PENDING)
+  id                   String                     @id @default(uuid(7)) @db.Uuid
+  deliveryStatus       NotificationDeliveryStatus @default(REQUESTED)
   notificationType     NotificationType
+  eventType            String
   attemptCount         Int?
   lastAttemptTimestamp DateTime?
   providerResponse     Json?
-  idempotencyKey       String           @unique
+  idempotencyKey       String                     @unique
 
   recipients String[] @db.Uuid
 

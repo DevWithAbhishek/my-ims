@@ -3,6 +3,7 @@ import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
 import { ConflictError } from '../../../shared/errors/AppError.js';
 import type { AuthContext } from '../../../shared/types/auth-context.js';
 import { assertSameTeam, requireTeam } from '../../identity/index.js';
+import { enqueueNotification } from '../../notifications/index.js';
 import { invalidAction, policyNotFound, serviceNotFound } from '../appService.common.js';
 import { policyUserViolations } from '../policy-users.rules.js';
 import { findServiceById, hasUnresolvedIncidents } from '../services/service.repository.js';
@@ -85,11 +86,16 @@ export async function updatePolicyUsers(
     )
       .filter(([, value]) => value !== undefined)
       .map(([name]) => name);
-    await appendAuditEvent(tx, {
+    const auditEventId = await appendAuditEvent(tx, {
       incidentId: null,
       eventType: 'ESCALATION_POLICY_UPDATED',
       actorId,
       metadata: { escalationPolicyId: policyId, changedFields },
+    });
+    await enqueueNotification(tx, {
+      eventType: 'ESCALATION_POLICY_UPDATED',
+      occurrenceId: auditEventId,
+      serviceId,
     });
     return toPolicyResponse(updated);
   });

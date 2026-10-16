@@ -66,6 +66,12 @@ export default tseslint.config(
               allow: [['module', { moduleName: 'identity' }]],
             },
 
+            // Every module can use notifications (enqueueNotification), through its index.ts
+            {
+              from: 'module',
+              allow: [['module', { moduleName: 'notifications' }]],
+            },
+
             // alerts -> incidents, appService
             {
               from: [['module', { moduleName: 'alerts' }]],

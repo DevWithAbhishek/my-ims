@@ -199,3 +199,38 @@ export function getJobsConfig(): JobsConfig {
   }
   return cachedJobs;
 }
+
+/** Email delivery settings (SLICE-09, SendGrid). Every value must be configured. */
+export interface NotificationsConfig {
+  sendgridApiKey: string;
+  fromEmail: string;
+  sendTimeoutMs: number;
+}
+
+const notificationsEnvSchema = z.object({
+  SENDGRID_API_KEY: z.string().min(1),
+  NOTIFICATION_FROM_EMAIL: z.email(),
+  NOTIFICATION_SEND_TIMEOUT_MS: positiveInt,
+});
+
+export function parseNotificationsConfig(env: NodeJS.ProcessEnv): NotificationsConfig {
+  const result = notificationsEnvSchema.safeParse(env);
+  if (!result.success) throw toConfigError(env, result.error.issues);
+
+  return {
+    sendgridApiKey: result.data.SENDGRID_API_KEY,
+    fromEmail: result.data.NOTIFICATION_FROM_EMAIL,
+    sendTimeoutMs: result.data.NOTIFICATION_SEND_TIMEOUT_MS,
+  };
+}
+
+let cachedNotifications: NotificationsConfig | undefined;
+
+/** Validated email settings, parsed once. Startup of the worker fails when any is missing. */
+export function getNotificationsConfig(): NotificationsConfig {
+  if (!cachedNotifications) {
+    dotenv.config({ quiet: true });
+    cachedNotifications = parseNotificationsConfig(process.env);
+  }
+  return cachedNotifications;
+}

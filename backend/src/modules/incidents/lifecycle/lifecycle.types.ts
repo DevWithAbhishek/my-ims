@@ -1,5 +1,6 @@
 import type { Prisma } from '../../../generated/prisma/client.js';
 import type { AuditEventType } from '../../../generated/prisma/enums.js';
+import type { NotificationEventType } from '../../notifications/index.js';
 import type { IncidentStatus, Severity } from '../incidents.types.js';
 
 /** The incident row as read under `FOR UPDATE`. */
@@ -33,7 +34,7 @@ export type IncidentChanges = Pick<
 
 /** One audit event; the caller is its actor. Every event written also gets one notification. */
 export type AuditStep = {
-  eventType: AuditEventType;
+  eventType: Extract<AuditEventType, NotificationEventType>;
   metadata: Prisma.InputJsonObject;
   subjectUserId?: string;
 };

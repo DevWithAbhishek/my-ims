@@ -89,6 +89,7 @@ export async function runTransition<T>(request: TransitionRequest<T>): Promise<T
         incidentId,
         serviceId: incident.affectedServiceId,
         teamId: incident.teamId,
+        ...(request.requestId ? { requestId: request.requestId } : {}),
         ...(occurrence.subjectUserId === undefined
           ? {}
           : { subjectUserId: occurrence.subjectUserId }),

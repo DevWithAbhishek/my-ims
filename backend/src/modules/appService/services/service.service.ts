@@ -4,6 +4,7 @@ import { getPrisma, lockRowForUpdate } from '../../../infra/db/prisma.js';
 import { ConflictError, ValidationError } from '../../../shared/errors/AppError.js';
 import type { AuthContext } from '../../../shared/types/auth-context.js';
 import { assertSameTeam, requireTeam } from '../../identity/index.js';
+import { enqueueNotification } from '../../notifications/index.js';
 import {
   invalidAction,
   serviceNotFound,
@@ -154,12 +155,14 @@ export async function updateService(
 
       if (Object.keys(changes).length === 0) return toServiceResponse(stored);
       const updated = await writeService(tx, serviceId, changes);
-      await appendAuditEvent(tx, {
+      const eventType = deactivating ? 'SERVICE_DEACTIVATED' : 'SERVICE_UPDATED';
+      const auditEventId = await appendAuditEvent(tx, {
         incidentId: null,
-        eventType: deactivating ? 'SERVICE_DEACTIVATED' : 'SERVICE_UPDATED',
+        eventType,
         actorId,
         metadata: { serviceId, changedFields: Object.keys(changes) },
       });
+      await enqueueNotification(tx, { eventType, occurrenceId: auditEventId, serviceId });
       return toServiceResponse(updated);
     });
   } catch (error) {
