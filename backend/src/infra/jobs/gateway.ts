@@ -20,6 +20,25 @@ export type DeadLetterJobData = {
   errorClass: string;
 };
 
+/** Job names of delayed jobs start with this prefix; outbox jobs are named after their event type. */
+export const DELAYED_JOB_PREFIX = 'delayed.';
+
+/**
+ * A job that runs once after `delayMs`, not backed by an outbox row. `jobId` identifies it: while a
+ * job with that id waits, scheduling it again replaces it. `data` carries ids only.
+ */
+export type DelayedJob = {
+  jobId: string;
+  name: string;
+  data: Record<string, string>;
+  delayMs: number;
+};
+
+/** Schedules delayed jobs (SLICE-07). Redis is never the source of truth for what they decide. */
+export interface DelayedJobScheduler {
+  scheduleDelayed(queue: QueueName, job: DelayedJob): Promise<void>;
+}
+
 /** The only door to Redis for business jobs, so tests can replace it. */
 export interface QueueGateway {
   publish(queue: QueueName, data: JobData): Promise<void>;
@@ -30,9 +49,13 @@ export interface QueueGateway {
 /**
  * BullMQ-backed gateway. Jobs use the outbox event id as `jobId` (BullMQ de-duplicates while the
  * job exists), finished jobs are removed (the outbox row is the durable record), and retries use
- * the custom backoff strategy the workers register.
+ * the custom backoff strategy the workers register. Delayed jobs (no outbox row) are removed when
+ * they finish or fail for good, so their id can be scheduled again.
  */
-export function createBullmqGateway(connection: Redis, executionAttempts: number): QueueGateway {
+export function createBullmqGateway(
+  connection: Redis,
+  executionAttempts: number,
+): QueueGateway & DelayedJobScheduler {
   const queues = new Map<string, Queue>();
 
   const queueFor = (name: string): Queue => {
@@ -49,6 +72,22 @@ export function createBullmqGateway(connection: Redis, executionAttempts: number
     async publish(queue, data) {
       await queueFor(queue).add(data.eventType, data, {
         jobId: data.outboxEventId,
+        attempts: executionAttempts,
+        backoff: { type: 'custom' },
+        removeOnComplete: true,
+        removeOnFail: true,
+      });
+    },
+    async scheduleDelayed(queue, job) {
+      const target = queueFor(queue);
+      const existing = await target.getJob(job.jobId);
+      if (existing) {
+        // A job that is running cannot be removed; it re-reads the incident under the lock anyway.
+        await existing.remove().catch(() => undefined);
+      }
+      await target.add(`${DELAYED_JOB_PREFIX}${job.name}`, job.data, {
+        jobId: job.jobId,
+        delay: job.delayMs,
         attempts: executionAttempts,
         backoff: { type: 'custom' },
         removeOnComplete: true,

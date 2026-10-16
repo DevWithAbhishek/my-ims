@@ -4,6 +4,7 @@ export {
   type EnqueueNotificationResult,
 } from './enqueue-notification.js';
 export { NotificationContractError } from './record-notification.js';
+export { deriveIdempotencyKey } from './idempotency-key.js';
 export { NOTIFICATION_CATALOG, type NotificationEventType } from './catalog.js';
 export { createNotificationProcessor, type DeliveryDeps } from './delivery.processor.js';
 export {

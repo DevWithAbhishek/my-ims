@@ -1,6 +1,6 @@
 # AGENTS.md — IMS Repository Rules for AI Coding Agents
 
-Reusable across every implementation chat. It is not slice-specific. The active slice file says *what* to build; this file says *how to work* and defines repository-wide conventions that apply to every slice.
+Reusable across every implementation chat. It is not slice-specific. The active slice file says _what_ to build; this file says _how to work_ and defines repository-wide conventions that apply to every slice.
 
 ---
 
@@ -12,14 +12,14 @@ Stack (from `backend/package.json`): Node 22, TypeScript (strict), Express 5, Zo
 
 ## 2. Source of Truth
 
-| Question | Authority |
-|---|---|
-| What exists in code right now | **The repository** (never assume docs match code) |
-| What the active capability must do | **The active `SLICE-XX.md`** |
-| How to work / repo-wide rules | **This file** |
-| Project-state snapshot (what is done, what is broken) | **`PROJECT_STATUS.md`** |
+| Question                                              | Authority                                         |
+| ----------------------------------------------------- | ------------------------------------------------- |
+| What exists in code right now                         | **The repository** (never assume docs match code) |
+| What the active capability must do                    | **The active `SLICE-XX.md`**                      |
+| How to work / repo-wide rules                         | **This file**                                     |
+| Project-state snapshot (what is done, what is broken) | **`PROJECT_STATUS.md`**                           |
 
-The master design documents (PRD, Domain Model, DB schema, API, Index) are **not** inputs to normal slice implementation. Each slice already contains the endpoint contracts and data context it needs. If the slice and the repository disagree about *current implementation*, the repository wins; if they disagree about *required behavior*, the slice wins. Do not edit `prisma/schema.prisma` semantics away from what the slice states.
+The master design documents (PRD, Domain Model, DB schema, API, Index) are **not** inputs to normal slice implementation. Each slice already contains the endpoint contracts and data context it needs. If the slice and the repository disagree about _current implementation_, the repository wins; if they disagree about _required behavior_, the slice wins. Do not edit `prisma/schema.prisma` semantics away from what the slice states.
 
 ## 3. Before Changing Anything
 
@@ -75,13 +75,13 @@ The master design documents (PRD, Domain Model, DB schema, API, Index) are **not
 - Retries: separate ownership by stage — the relay retries publication (unbounded, capped exponential backoff, for retryable/Redis failures); BullMQ retries execution (5 attempts total, exponential backoff). Retryable vs non-retryable classification is defined in SLICE-08. Terminal failure = `DEAD_LETTER` outbox row (error class, last error, counters) plus a job on the shared `dead-letter` queue; operators re-drive with the CLI. `SUCCESS` rows are deleted after the retention window; `DEAD_LETTER` rows are kept. All values are configuration in one module with no hard-coded defaults.
 - **Outbox event catalog** (repo-wide contract; one module exports these constants, payloads carry ids and the minimum facts only, plus the originating `requestId` for log correlation — never secrets, prompts, or payload bodies). Queue names: `ai-triage`, `sla-escalation`, `notifications`, `postmortem`, `investigation`.
 
-  | Event type | Written (in the producer's transaction) by | Consumer queue | Payload |
-  |---|---|---|---|
-  | `ALERT_TRIAGE_REQUESTED` | alert ingestion (incident created) | `ai-triage` | `{ alertId, incidentId }` |
-  | `SLA_EVALUATION_REQUESTED` | ingestion; severity/ack/unassign changes, when the SLA scheduling mechanism needs it | `sla-escalation` | `{ incidentId }` |
-  | `NOTIFICATION_REQUESTED` | lifecycle actions, SLA/escalation, postmortem generation failure/closure, admin rate-limit notices | `notifications` | `{ kind, incidentId?, actorId?, … ids needed to resolve recipients }` |
-  | `POSTMORTEM_GENERATION_REQUESTED` | resolve (I8), retry (P4) | `postmortem` | `{ postmortemId, incidentId }` |
-  | `INVESTIGATION_REQUESTED` | investigation request (N1) | `investigation` | `{ investigationId, incidentId }` |
+  | Event type                        | Written (in the producer's transaction) by                                                         | Consumer queue   | Payload                                                               |
+  | --------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------- | --------------------------------------------------------------------- |
+  | `ALERT_TRIAGE_REQUESTED`          | alert ingestion (incident created)                                                                 | `ai-triage`      | `{ alertId, incidentId }`                                             |
+  | `SLA_EVALUATION_REQUESTED`        | ingestion; severity/ack/unassign changes, when the SLA scheduling mechanism needs it               | `sla-escalation` | `{ incidentId }`                                                      |
+  | `NOTIFICATION_REQUESTED`          | lifecycle actions, SLA/escalation, postmortem generation failure/closure, admin rate-limit notices | `notifications`  | `{ kind, incidentId?, actorId?, … ids needed to resolve recipients }` |
+  | `POSTMORTEM_GENERATION_REQUESTED` | resolve (I8), retry (P4)                                                                           | `postmortem`     | `{ postmortemId, incidentId }`                                        |
+  | `INVESTIGATION_REQUESTED`         | investigation request (N1)                                                                         | `investigation`  | `{ investigationId, incidentId }`                                     |
 
 - Redis is never the source of truth for business state. Workers run as a separate process (`dist/worker.js`).
 - No LLM or email call inside an HTTP request or a DB transaction. AI failure never blocks persistence or lifecycle transitions.

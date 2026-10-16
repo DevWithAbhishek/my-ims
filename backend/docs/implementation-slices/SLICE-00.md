@@ -9,6 +9,7 @@ The scaffold commit already provides: Express 5 app with JSON parsing and reques
 ## 2. Scope
 
 ### In Scope
+
 - Fix toolchain: ESLint config crash and module-boundary patterns; Prettier compliance for existing files; scripts; Prisma config naming; compose healthcheck.
 - Entrypoints and build: `build` script, `src/main.ts` (API), `src/worker.ts` (worker bootstrap shell only), matching `start`/`start:worker` and the Dockerfile.
 - Configuration with validation (Zod), including Redis.
@@ -18,9 +19,11 @@ The scaffold commit already provides: Express 5 app with JSON parsing and reques
 - Test infrastructure for unit and integration tests.
 
 ### Out of Scope
+
 Any authentication, module business logic, endpoints beyond health/readiness, outbox/queue/worker logic (SLICE-08), rate limiting (owned by the slices that use it), AI provider code, new Prisma models, other migrations.
 
 ## 3. Actors & Responsibilities
+
 Developer/CI running the app and checks. The API process serves HTTP; the worker process (same image) will host BullMQ workers in later slices.
 
 ## 4. Capability Behavior
@@ -38,37 +41,46 @@ Developer/CI running the app and checks. The API process serves HTTP; the worker
 **4.6 Infra.** `src/infra/db` exports a single Prisma client configured with the pg adapter (small pool, TLS when the URL requires it) and a helper to run an interactive transaction and a helper for row-lock raw queries; `src/infra/redis` exports a connection factory suitable for both general use and BullMQ (BullMQ requires `maxRetriesPerRequest: null` on its connection). No business queries here.
 
 ## 5. Domain & Data Context
+
 No schema change. The init migration already creates the full schema. Do not add models. The schema's Prisma generator outputs to `../generated/prisma` (git-ignored); the build must run `prisma generate`.
 
 ## 6. API Contract
+
 `GET /health` — keep the existing behavior: `200` with body `{ "status": "ok" }` (liveness, no dependencies, outside `/api/v1`, no authentication).
 `GET /ready` — `200 { "data": { "status": "ok" } }` when PostgreSQL and Redis respond; otherwise `503` with the standard error envelope (`DEPENDENCY_UNAVAILABLE`) and a `Retry-After` header. No authentication.
 No other endpoints.
 
 ## 7. Authorization & Security
+
 None required. Never log secrets; config validation errors list variable names only. JSON body limit set explicitly (default for non-webhook routes; the webhook raw-body/1 MB handling belongs to SLICE-03).
 
 ## 8. Consistency & Concurrency
+
 Not applicable beyond clean connection shutdown.
 
 ## 9. Async / Events / Workers
+
 Only the worker process shell and the Redis connection factory. No queues, no relay.
 
 ## 10. Failure & Recovery
+
 Database or Redis unreachable at startup → fail fast (API and worker). At runtime `/ready` reports `503`. Errors thrown in async handlers reach the error middleware (Express 5 forwards rejected promises).
 
 ## 11. Implementation Surface
+
 - Config/tooling: `eslint.config.mjs`, `package.json` scripts (`build`, `start`, `start:worker`, `prisma:generate` with `--config`/rename of `prisma7.config.ts` to the name the Prisma 7 CLI detects), `tsconfig*.json` (`include` of the actual Prisma config file), `.env.example`, `docker-compose.yml` (enable Redis per the existing commented block with `noeviction` + AOF; fix healthcheck user), `jest*.config.js`, Prettier run over existing sources.
 - Application: `src/config/env.ts`, `src/main.ts`, `src/worker.ts`, `src/app.ts`, `src/shared/errors`, `src/shared/middleware`, `src/shared/observability`, `src/infra/db`, `src/infra/redis`.
 - Tests: `test/integration/env.ts` (referenced by `jest.int.config.js`), helpers for app + DB reset, unit specs for config, error mapping, request-id.
 - Boundary lint: align `boundaries/elements` patterns with the real layout (`src/modules/<name>/**`, `src/infra/**`, `src/shared/**`, `src/workers/**`), keep "modules enter other modules only via `index.ts`" and "Alerts may use Incident and AppService".
 
 ## 12. Verification Requirements
+
 - Unit: config validation (missing/invalid values), error mapping for each error class and for unknown errors (no leakage), request-id acceptance/replacement, Zod→`422`/`400` mapping.
 - Integration (real PostgreSQL + Redis): `/ready` returns `200`; stopping Redis (or pointing at a bad URL) makes it `503` with `Retry-After`; migrations apply to an empty database.
 - Tooling: `npm run lint`, `typecheck`, `format:check`, `test`, `test:int`, `build` all run and pass; `node dist/main.js` boots; the Docker image builds.
 
 ## 13. Completion Criteria
+
 - `npm run lint` executes without crashing and passes; boundary rules reflect the real layout.
 - `npm run format:check` passes for all tracked source files.
 - `npm run build` produces `dist/main.js` and `dist/worker.js`; `start` and `start:worker` work; `docker build` succeeds.

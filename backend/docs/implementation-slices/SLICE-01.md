@@ -1,19 +1,24 @@
 # SLICE-01 — Identity, Authentication & Team Isolation
 
 ## 1. Purpose
+
 Authenticate users, own users/teams/roles, and produce the verified request context (`userId`, `email`, `role`, `teamId`, `sessionId`) that every other slice uses for role checks and team isolation. Provide the admin APIs for teams and users.
 
 ## 2. Scope
+
 ### In Scope
+
 - Auth endpoints A1–A4 (login, refresh with rotation, logout, logout-all), JWT access tokens, refresh-token cookie, `UserSession` management, login/refresh rate limiting.
 - Identity endpoints T1–T4 (teams) and U1–U4 (users).
 - The authentication guard and reusable authorization helpers consumed by all later slices.
 - A seed script that creates `ADMIN` users (Admins are never created through the API).
 
 ### Out of Scope
+
 Alert-source authentication (SLICE-03); services/policies (SLICE-02); incident endpoints; password reset, email verification, user self-service profile, `GET /auth/me` (none exist); any DELETE.
 
 ## 3. Dependencies
+
 Requires from SLICE-00: validated config (`JWT_SECRET`, token expiries), Prisma client, Redis client, error envelope, request id. Reads (never writes) the `Incident` and `AppService` tables for conflict checks (T4, U4); those tables exist in the schema.
 
 **Contract provided to other slices:** an `authenticate` middleware that verifies the Bearer JWT and sets request context; `requireRoles(...)`; a helper that rejects `teamId = null` callers with `403 INVALID_ACTION`; a helper that compares a resource's `teamId` with the caller's and throws `403 TEAM_ACCESS_DENIED`. Exposed through the module's `index.ts`.
@@ -35,6 +40,7 @@ Requires from SLICE-00: validated config (`JWT_SECRET`, token expiries), Prisma 
 **Seed.** An idempotent (by email) seed script creates `ADMIN` users. Credentials are supplied via environment/config at run time, never committed.
 
 ## 5. Domain & Data Context
+
 `Team`: `id` uuid(v7) PK, `name` unique, `status` (`ACTIVE|DEACTIVATED`, default `ACTIVE`), `createdAt`, `updatedAt`.
 `User`: `id`, `name`, `email` unique (stored lower-case; indexed), `passwordHash`, `role` (`ENGINEER|TEAM_LEAD|ADMIN`, default `ENGINEER`), `status` (default `ACTIVE`), `teamId` nullable FK→Team, `leadId` nullable self-FK→User (the user's Team Lead), timestamps; index `(teamId, leadId)`.
 `UserSession`: `id`, `refreshTokenHash`, `lastRefreshHash?`, `ip?`, `userAgent?`, `lastIp?`, `lastSeen?`, `revoked` (default false), `expiresIn` datetime, `userId` FK→User, timestamps.
@@ -42,6 +48,7 @@ Read-only: `Incident(status, acknowledgedById, teamId)`, `AppService(teamId)`.
 Invariants: a user has exactly one role and at most one team and at most one lead; `leadId` references an `ACTIVE` `TEAM_LEAD` of the same team; Admins never have a `leadId`; team and email are unique.
 
 ## 6. API Contract
+
 Envelope, headers, pagination, error format per `AGENTS.md` §6. All bodies Zod-strict. Every endpoint can additionally return `500 INTERNAL_ERROR` / `503 DEPENDENCY_UNAVAILABLE`.
 
 **A1 `POST /auth/login`** — public. Body `{ email (valid, ≤72, lower-cased before lookup), password (8–24) }`. `200` with headers/body per §4. Errors: `422 VALIDATION_FAILED`, `400 BAD_REQUEST`, `401 INVALID_CREDENTIALS` (unknown email or wrong password — same response, similar timing; always run a hash verification), `403 ACCOUNT_DEACTIVATED` (password correct, user `DEACTIVATED`), `429 RATE_LIMITED`. One `UserSession` insert in one transaction; no idempotency.
@@ -71,21 +78,27 @@ Envelope, headers, pagination, error format per `AGENTS.md` §6. All bodies Zod-
 **Response types.** `TeamResponse { id, name, status, createdAt, updatedAt }`. `UserResponse` / `UserListItem { id, name, email, role, status, teamId|null, leadId|null, createdAt, updatedAt }`. Never return `passwordHash`.
 
 ## 7. Authorization & Security
+
 Gate order per `AGENTS.md` §6. Roles: writes are `ADMIN` only (`403 FORBIDDEN_ROLE` otherwise). Passwords: hashed with the **Argon2** password-hashing algorithm using the library's default configuration; no custom cost, memory or time parameters are specified. Refresh tokens: hash only. Login never reveals whether the email exists. JWT secret from config. No tokens, passwords, or hashes in logs or audit. Cookie attributes exactly as in §4.
 
 ## 8. Consistency & Concurrency
+
 Each write endpoint is a single transaction (including session revocation). Uniqueness (`Team.name`, `User.email`) is enforced by the database; unique violations map to `DUPLICATE_TEAM` / `EMAIL_ALREADY_EXISTS`. Conflict checks (T4, U4) and the update run in the same transaction; two concurrent refreshes with the same token: one rotates, the other is treated as reuse (update guarded by the expected `refreshTokenHash`).
 
 ## 9. Async / Events / Workers
+
 None. (Rate-limit counters and blocks live in Redis.) No audit events are written by this slice.
 
 ## 10. Failure & Recovery
+
 The error catalogue lists `503 DEPENDENCY_UNAVAILABLE` (with `Retry-After`) when a required dependency such as Redis is down. The design is the A1/A2 rate limiter fails-closed during a Redis outage. Database failure rolls back the whole operation, including session revocation. Expired/invalid access token → `401 UNAUTHENTICATED`; client refreshes via A2.
 
 ## 11. Implementation Surface
+
 Application: auth and identity (users/teams) modules — controllers, services, repositories, Zod DTOs, Argon2 password hashing (default configuration), JWT/cookie helpers, rate-limit helper (Redis), guard/authorization helpers exported via `index.ts`. Database: no schema change expected (models exist). Tests: unit (token/cookie, rate-limit ladder, role/team helpers), integration (all endpoints against PostgreSQL + Redis). Tooling: seed script and its `package.json` script.
 
 ## 12. Verification Requirements
+
 - Stored `passwordHash` values are Argon2 hashes; login verifies against them; the password is never stored or returned in clear text.
 - Login success sets header/cookie/body exactly; wrong password and unknown email are indistinguishable; deactivated user → `ACCOUNT_DEACTIVATED`; ladder escalation and counter reset.
 - Refresh rotation; reuse detection revokes all sessions; revoked/expired/absent cookie cases; deactivated user.
@@ -97,6 +110,7 @@ Application: auth and identity (users/teams) modules — controllers, services, 
 - Rollback test: a failure mid-transaction leaves no partial changes.
 
 ## 13. Completion Criteria
+
 - All 12 endpoints behave exactly as specified, with the listed status and error codes.
 - The guard and helpers are exported and usable by other modules; protected requests do not hit the database.
 - Session rotation, reuse detection, logout and logout-all work; revocation on `role|teamId|password|status` change and team deactivation is atomic.

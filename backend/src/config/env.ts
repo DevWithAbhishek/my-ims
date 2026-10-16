@@ -234,3 +234,31 @@ export function getNotificationsConfig(): NotificationsConfig {
   }
   return cachedNotifications;
 }
+
+/** SLA monitoring settings (SLICE-07). Every value must be configured. */
+export interface SlaConfig {
+  /** How often the PostgreSQL scanner looks for crossed SLA thresholds that were not recorded. */
+  scanIntervalMs: number;
+}
+
+const slaEnvSchema = z.object({
+  SLA_SCAN_INTERVAL_MS: positiveInt,
+});
+
+export function parseSlaConfig(env: NodeJS.ProcessEnv): SlaConfig {
+  const result = slaEnvSchema.safeParse(env);
+  if (!result.success) throw toConfigError(env, result.error.issues);
+
+  return { scanIntervalMs: result.data.SLA_SCAN_INTERVAL_MS };
+}
+
+let cachedSla: SlaConfig | undefined;
+
+/** Validated SLA settings, parsed once. Startup of the worker fails when any is missing. */
+export function getSlaConfig(): SlaConfig {
+  if (!cachedSla) {
+    dotenv.config({ quiet: true });
+    cachedSla = parseSlaConfig(process.env);
+  }
+  return cachedSla;
+}

@@ -6,7 +6,7 @@ import { createBullmqGateway, type QueueGateway } from './gateway.js';
 import { startLoop } from './loop.js';
 import { purgeFinishedOutbox, recoverStaleOutbox } from './maintenance.js';
 import { createJobWorker } from './processor.js';
-import { getRegisteredProcessors } from './registry.js';
+import { getRegisteredDelayedProcessors, getRegisteredProcessors } from './registry.js';
 import { runRelayCycle } from './relay.js';
 
 export type JobsRuntime = { stop(): Promise<void> };
@@ -22,10 +22,17 @@ export function startJobsRuntime(config: JobsConfig, gatewayOverride?: QueueGate
     gatewayOverride ?? createBullmqGateway(publisherConnection!, config.executionAttempts);
 
   const processors = [...getRegisteredProcessors()];
+  const delayedProcessors = getRegisteredDelayedProcessors();
   const workerConnection = processors.length > 0 ? createRedisConnection('bullmq') : undefined;
   const workers: Worker[] = workerConnection
     ? processors.map(([queue, processor]) =>
-        createJobWorker(queue, processor, { config, gateway }, workerConnection),
+        createJobWorker(
+          queue,
+          processor,
+          { config, gateway },
+          workerConnection,
+          delayedProcessors.get(queue),
+        ),
       )
     : [];
 

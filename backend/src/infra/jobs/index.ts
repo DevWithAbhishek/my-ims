@@ -15,4 +15,12 @@ export {
   type NonRetryableReason,
   type RetryableReason,
 } from './errors.js';
-export { registerProcessor, type OutboxProcessor, type ProcessorInput } from './registry.js';
+export {
+  registerDelayedProcessor,
+  registerProcessor,
+  type DelayedJobInput,
+  type DelayedJobProcessor,
+  type OutboxProcessor,
+  type ProcessorInput,
+} from './registry.js';
+export { type DelayedJob, type DelayedJobScheduler } from './gateway.js';

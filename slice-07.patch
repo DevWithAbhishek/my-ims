@@ -1,0 +1,2450 @@
+diff --git a/backend/.env.example b/backend/.env.example
+index 5a1319f..ad17db2 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -66,6 +66,11 @@ SENDGRID_API_KEY=change-me-sendgrid-api-key
+ NOTIFICATION_FROM_EMAIL=ims-notifications@example.com
+ NOTIFICATION_SEND_TIMEOUT_MS=10000
+ 
++# --- SLA monitoring (worker only, SLICE-07) ------------------------------------------
++# How often (milliseconds) the PostgreSQL scanner looks for SLA thresholds that were crossed
++# without the milestone being recorded. The worker refuses to start when it is missing.
++SLA_SCAN_INTERVAL_MS=5000
++
+ # --- Alert source seed (npm run seed:alert-source, SLICE-03) -----------------------
+ # The id identifies the source: re-running the seed with the same id updates its configuration
+ # (and audits the change); a new id creates another source. The signing secret must be at least
+diff --git a/backend/src/config/env.ts b/backend/src/config/env.ts
+index e809b82..c78058d 100644
+--- a/backend/src/config/env.ts
++++ b/backend/src/config/env.ts
+@@ -234,3 +234,31 @@ export function getNotificationsConfig(): NotificationsConfig {
+   }
+   return cachedNotifications;
+ }
++
++/** SLA monitoring settings (SLICE-07). Every value must be configured. */
++export interface SlaConfig {
++  /** How often the PostgreSQL scanner looks for crossed SLA thresholds that were not recorded. */
++  scanIntervalMs: number;
++}
++
++const slaEnvSchema = z.object({
++  SLA_SCAN_INTERVAL_MS: positiveInt,
++});
++
++export function parseSlaConfig(env: NodeJS.ProcessEnv): SlaConfig {
++  const result = slaEnvSchema.safeParse(env);
++  if (!result.success) throw toConfigError(env, result.error.issues);
++
++  return { scanIntervalMs: result.data.SLA_SCAN_INTERVAL_MS };
++}
++
++let cachedSla: SlaConfig | undefined;
++
++/** Validated SLA settings, parsed once. Startup of the worker fails when any is missing. */
++export function getSlaConfig(): SlaConfig {
++  if (!cachedSla) {
++    dotenv.config({ quiet: true });
++    cachedSla = parseSlaConfig(process.env);
++  }
++  return cachedSla;
++}
+diff --git a/backend/src/config/sla-config.spec.ts b/backend/src/config/sla-config.spec.ts
+new file mode 100644
+index 0000000..1b0b03e
+--- /dev/null
++++ b/backend/src/config/sla-config.spec.ts
+@@ -0,0 +1,21 @@
++import { ConfigError, parseSlaConfig } from './env';
++
++describe('parseSlaConfig', () => {
++  it('reads the scan interval from the environment', () => {
++    expect(parseSlaConfig({ SLA_SCAN_INTERVAL_MS: '5000' })).toEqual({ scanIntervalMs: 5000 });
++  });
++
++  it('has no default: a missing variable is reported by name', () => {
++    expect.assertions(2);
++    try {
++      parseSlaConfig({});
++    } catch (error) {
++      expect(error).toBeInstanceOf(ConfigError);
++      expect((error as ConfigError).variables).toEqual(['SLA_SCAN_INTERVAL_MS']);
++    }
++  });
++
++  it.each(['0', '-1', 'abc', '1.5'])('rejects %s', (value) => {
++    expect(() => parseSlaConfig({ SLA_SCAN_INTERVAL_MS: value })).toThrow(ConfigError);
++  });
++});
+diff --git a/backend/src/infra/jobs/delayed-job.spec.ts b/backend/src/infra/jobs/delayed-job.spec.ts
+new file mode 100644
+index 0000000..96a3b03
+--- /dev/null
++++ b/backend/src/infra/jobs/delayed-job.spec.ts
+@@ -0,0 +1,81 @@
++import { UnrecoverableError } from 'bullmq';
++import { NonRetryableJobError, RetryableJobError } from './errors';
++import { processDelayedJob } from './processor';
++import {
++  clearProcessors,
++  getRegisteredDelayedProcessors,
++  registerDelayedProcessor,
++} from './registry';
++
++const config = {
++  executionAttempts: 5,
++  executionBackoffBaseMs: 10,
++  executionBackoffCapMs: 50,
++  processingWindowMs: 1000,
++  workerConcurrency: 1,
++  queueRateLimits: {},
++} as never;
++
++const job = (attemptsMade: number, data: unknown = { incidentId: 'i-1' }) => ({
++  name: 'delayed.SLA_MILESTONE',
++  data,
++  attemptsMade,
++  opts: { attempts: 5 },
++});
++
++describe('processDelayedJob', () => {
++  it('hands the consumer the name without the internal prefix, string data and the attempt number', async () => {
++    const handler = jest.fn().mockResolvedValue(undefined);
++    await processDelayedJob(
++      job(0, { incidentId: 'i-1', ignored: 3 }) as never,
++      'sla-escalation',
++      handler,
++      { config },
++    );
++    expect(handler).toHaveBeenCalledWith({
++      name: 'SLA_MILESTONE',
++      data: { incidentId: 'i-1' },
++      attempt: 1,
++    });
++  });
++
++  it('rethrows a retryable failure so BullMQ retries it', async () => {
++    const error = new RetryableJobError('NETWORK', 'down');
++    await expect(
++      processDelayedJob(job(1) as never, 'sla-escalation', async () => Promise.reject(error), {
++        config,
++      }),
++    ).rejects.toBe(error);
++  });
++
++  it('ends the job for good on the last attempt and on a non-retryable failure', async () => {
++    await expect(
++      processDelayedJob(
++        job(4) as never,
++        'sla-escalation',
++        async () => Promise.reject(new RetryableJobError('NETWORK', 'down')),
++        { config },
++      ),
++    ).rejects.toBeInstanceOf(UnrecoverableError);
++    await expect(
++      processDelayedJob(
++        job(0) as never,
++        'sla-escalation',
++        async () => Promise.reject(new NonRetryableJobError('INVALID_PAYLOAD', 'bad')),
++        { config },
++      ),
++    ).rejects.toBeInstanceOf(UnrecoverableError);
++  });
++});
++
++describe('delayed processor registry', () => {
++  afterEach(clearProcessors);
++
++  it('allows one delayed-job processor per queue', () => {
++    registerDelayedProcessor('sla-escalation', async () => undefined);
++    expect(getRegisteredDelayedProcessors().has('sla-escalation')).toBe(true);
++    expect(() => registerDelayedProcessor('sla-escalation', async () => undefined)).toThrow(
++      /already registered/,
++    );
++  });
++});
+diff --git a/backend/src/infra/jobs/gateway.ts b/backend/src/infra/jobs/gateway.ts
+index bcddc03..db1a8af 100644
+--- a/backend/src/infra/jobs/gateway.ts
++++ b/backend/src/infra/jobs/gateway.ts
+@@ -20,6 +20,25 @@ export type DeadLetterJobData = {
+   errorClass: string;
+ };
+ 
++/** Job names of delayed jobs start with this prefix; outbox jobs are named after their event type. */
++export const DELAYED_JOB_PREFIX = 'delayed.';
++
++/**
++ * A job that runs once after `delayMs`, not backed by an outbox row. `jobId` identifies it: while a
++ * job with that id waits, scheduling it again replaces it. `data` carries ids only.
++ */
++export type DelayedJob = {
++  jobId: string;
++  name: string;
++  data: Record<string, string>;
++  delayMs: number;
++};
++
++/** Schedules delayed jobs (SLICE-07). Redis is never the source of truth for what they decide. */
++export interface DelayedJobScheduler {
++  scheduleDelayed(queue: QueueName, job: DelayedJob): Promise<void>;
++}
++
+ /** The only door to Redis for business jobs, so tests can replace it. */
+ export interface QueueGateway {
+   publish(queue: QueueName, data: JobData): Promise<void>;
+@@ -30,9 +49,13 @@ export interface QueueGateway {
+ /**
+  * BullMQ-backed gateway. Jobs use the outbox event id as `jobId` (BullMQ de-duplicates while the
+  * job exists), finished jobs are removed (the outbox row is the durable record), and retries use
+- * the custom backoff strategy the workers register.
++ * the custom backoff strategy the workers register. Delayed jobs (no outbox row) are removed when
++ * they finish or fail for good, so their id can be scheduled again.
+  */
+-export function createBullmqGateway(connection: Redis, executionAttempts: number): QueueGateway {
++export function createBullmqGateway(
++  connection: Redis,
++  executionAttempts: number,
++): QueueGateway & DelayedJobScheduler {
+   const queues = new Map<string, Queue>();
+ 
+   const queueFor = (name: string): Queue => {
+@@ -55,6 +78,22 @@ export function createBullmqGateway(connection: Redis, executionAttempts: number
+         removeOnFail: true,
+       });
+     },
++    async scheduleDelayed(queue, job) {
++      const target = queueFor(queue);
++      const existing = await target.getJob(job.jobId);
++      if (existing) {
++        // A job that is running cannot be removed; it re-reads the incident under the lock anyway.
++        await existing.remove().catch(() => undefined);
++      }
++      await target.add(`${DELAYED_JOB_PREFIX}${job.name}`, job.data, {
++        jobId: job.jobId,
++        delay: job.delayMs,
++        attempts: executionAttempts,
++        backoff: { type: 'custom' },
++        removeOnComplete: true,
++        removeOnFail: true,
++      });
++    },
+     async publishDeadLetter(data) {
+       await queueFor(DEAD_LETTER_QUEUE).add('DEAD_LETTERED', data, {
+         removeOnComplete: true,
+diff --git a/backend/src/infra/jobs/index.ts b/backend/src/infra/jobs/index.ts
+index 4ce62c8..6b7aacc 100644
+--- a/backend/src/infra/jobs/index.ts
++++ b/backend/src/infra/jobs/index.ts
+@@ -15,4 +15,12 @@ export {
+   type NonRetryableReason,
+   type RetryableReason,
+ } from './errors.js';
+-export { registerProcessor, type OutboxProcessor, type ProcessorInput } from './registry.js';
++export {
++  registerDelayedProcessor,
++  registerProcessor,
++  type DelayedJobInput,
++  type DelayedJobProcessor,
++  type OutboxProcessor,
++  type ProcessorInput,
++} from './registry.js';
++export { type DelayedJob, type DelayedJobScheduler } from './gateway.js';
+diff --git a/backend/src/infra/jobs/processor.ts b/backend/src/infra/jobs/processor.ts
+index a7d0132..f64409c 100644
+--- a/backend/src/infra/jobs/processor.ts
++++ b/backend/src/infra/jobs/processor.ts
+@@ -8,9 +8,9 @@ import { executionRetryDelayMs } from './backoff.js';
+ import { announceDeadLetter } from './dead-letter.js';
+ import { classifyError, NonRetryableJobError, sanitizeError } from './errors.js';
+ import { isOutboxEventType, queueForEvent, validatePayload, type QueueName } from './events.js';
+-import type { QueueGateway } from './gateway.js';
++import { DELAYED_JOB_PREFIX, type QueueGateway } from './gateway.js';
+ import { deadLetterExecution, markSuccess, recordExecutionRetry } from './outbox.repository.js';
+-import type { OutboxProcessor } from './registry.js';
++import type { DelayedJobProcessor, OutboxProcessor } from './registry.js';
+ import { requestIdOf } from './relay.js';
+ 
+ export type WorkerConfig = Pick<
+@@ -149,15 +149,69 @@ export async function processOutboxJob(
+   }
+ }
+ 
++/**
++ * Wrapper around a delayed-job consumer. Retryable failures are rethrown so BullMQ retries them
++ * (bounded attempts, the same backoff as outbox jobs); a non-retryable failure or the last failed
++ * attempt is logged at `error` and ends the job. There is no outbox row to dead-letter.
++ */
++export async function processDelayedJob(
++  job: JobLike & { name: string },
++  queue: QueueName,
++  handler: DelayedJobProcessor,
++  deps: { config: WorkerConfig },
++): Promise<void> {
++  const name = job.name.slice(DELAYED_JOB_PREFIX.length);
++  const attempt = job.attemptsMade + 1;
++  const maxAttempts = job.opts.attempts ?? deps.config.executionAttempts;
++  const fields = { queue, delayedJob: name, attempt, maxAttempts };
++  const started = Date.now();
++
++  const rawData = job.data as unknown;
++  const data: Record<string, string> = {};
++  if (typeof rawData === 'object' && rawData !== null) {
++    for (const [key, value] of Object.entries(rawData)) {
++      if (typeof value === 'string') data[key] = value;
++    }
++  }
++
++  try {
++    await handler({ name, data, attempt });
++    logger.info(
++      { ...fields, outcome: 'success', durationMs: Date.now() - started },
++      'Delayed job completed',
++    );
++  } catch (error) {
++    const { retryable, errorClass } = classifyError(error);
++    const lastError = sanitizeError(error);
++    if (!retryable || attempt >= maxAttempts) {
++      logger.error(
++        { ...fields, errorClass, retryable, outcome: 'delayed_job_failed', lastError },
++        'Delayed job failed for good',
++      );
++      throw new UnrecoverableError(lastError);
++    }
++    logger.warn(
++      { ...fields, errorClass, retryable, outcome: 'retry_scheduled', lastError },
++      'Delayed job failed; will retry',
++    );
++    throw error;
++  }
++}
++
+ /** One BullMQ worker for `queue`, running the common wrapper around `processor`. */
+ export function createJobWorker(
+   queue: QueueName,
+   processor: OutboxProcessor,
+   deps: { config: WorkerConfig; gateway: QueueGateway },
+   connection: Redis,
++  delayedProcessor?: DelayedJobProcessor,
+ ): Worker {
+   const limit = deps.config.queueRateLimits[queue];
+-  const worker = new Worker(queue, (job) => processOutboxJob(job, queue, processor, deps), {
++  const run = (job: Job): Promise<void> =>
++    delayedProcessor && job.name.startsWith(DELAYED_JOB_PREFIX)
++      ? processDelayedJob(job, queue, delayedProcessor, deps)
++      : processOutboxJob(job, queue, processor, deps);
++  const worker = new Worker(queue, run, {
+     connection,
+     concurrency: deps.config.workerConcurrency,
+     limiter: { max: limit.max, duration: limit.durationMs },
+diff --git a/backend/src/infra/jobs/registry.ts b/backend/src/infra/jobs/registry.ts
+index c9a8a64..edeb365 100644
+--- a/backend/src/infra/jobs/registry.ts
++++ b/backend/src/infra/jobs/registry.ts
+@@ -16,7 +16,23 @@ export type ProcessorInput = {
+  */
+ export type OutboxProcessor = (input: ProcessorInput) => Promise<void>;
+ 
++/** What a delayed job (see `DelayedJob`) hands its consumer. */
++export type DelayedJobInput = {
++  /** The name given when it was scheduled (without the internal prefix). */
++  name: string;
++  data: Record<string, string>;
++  /** 1-based execution attempt number. */
++  attempt: number;
++};
++
++/**
++ * Consumer of delayed jobs on a queue. Delayed jobs have no outbox row, so a failure that exhausts
++ * the attempts is logged and nothing else: the consumer's slice must have its own recovery.
++ */
++export type DelayedJobProcessor = (input: DelayedJobInput) => Promise<void>;
++
+ const processors = new Map<QueueName, OutboxProcessor>();
++const delayedProcessors = new Map<QueueName, DelayedJobProcessor>();
+ 
+ /** Called by a consumer's slice (from `src/workers`) to attach its processor to a queue. */
+ export function registerProcessor(queue: QueueName, processor: OutboxProcessor): void {
+@@ -24,6 +40,18 @@ export function registerProcessor(queue: QueueName, processor: OutboxProcessor):
+   processors.set(queue, processor);
+ }
+ 
++/** Attaches the consumer of a queue's delayed jobs; the queue also needs an outbox processor. */
++export function registerDelayedProcessor(queue: QueueName, processor: DelayedJobProcessor): void {
++  if (delayedProcessors.has(queue)) {
++    throw new Error(`A delayed-job processor is already registered for ${queue}`);
++  }
++  delayedProcessors.set(queue, processor);
++}
++
++export function getRegisteredDelayedProcessors(): ReadonlyMap<QueueName, DelayedJobProcessor> {
++  return delayedProcessors;
++}
++
+ export function getRegisteredProcessors(): ReadonlyMap<QueueName, OutboxProcessor> {
+   return processors;
+ }
+@@ -31,4 +59,5 @@ export function getRegisteredProcessors(): ReadonlyMap<QueueName, OutboxProcesso
+ /** Test support. */
+ export function clearProcessors(): void {
+   processors.clear();
++  delayedProcessors.clear();
+ }
+diff --git a/backend/src/infra/jobs/runtime.ts b/backend/src/infra/jobs/runtime.ts
+index 39d88d9..81a7f68 100644
+--- a/backend/src/infra/jobs/runtime.ts
++++ b/backend/src/infra/jobs/runtime.ts
+@@ -6,7 +6,7 @@ import { createBullmqGateway, type QueueGateway } from './gateway.js';
+ import { startLoop } from './loop.js';
+ import { purgeFinishedOutbox, recoverStaleOutbox } from './maintenance.js';
+ import { createJobWorker } from './processor.js';
+-import { getRegisteredProcessors } from './registry.js';
++import { getRegisteredDelayedProcessors, getRegisteredProcessors } from './registry.js';
+ import { runRelayCycle } from './relay.js';
+ 
+ export type JobsRuntime = { stop(): Promise<void> };
+@@ -22,10 +22,17 @@ export function startJobsRuntime(config: JobsConfig, gatewayOverride?: QueueGate
+     gatewayOverride ?? createBullmqGateway(publisherConnection!, config.executionAttempts);
+ 
+   const processors = [...getRegisteredProcessors()];
++  const delayedProcessors = getRegisteredDelayedProcessors();
+   const workerConnection = processors.length > 0 ? createRedisConnection('bullmq') : undefined;
+   const workers: Worker[] = workerConnection
+     ? processors.map(([queue, processor]) =>
+-        createJobWorker(queue, processor, { config, gateway }, workerConnection),
++        createJobWorker(
++          queue,
++          processor,
++          { config, gateway },
++          workerConnection,
++          delayedProcessors.get(queue),
++        ),
+       )
+     : [];
+ 
+diff --git a/backend/src/modules/appService/index.ts b/backend/src/modules/appService/index.ts
+index 981ab13..f62de65 100644
+--- a/backend/src/modules/appService/index.ts
++++ b/backend/src/modules/appService/index.ts
+@@ -5,3 +5,8 @@ export {
+   type EscalationPolicyConfig,
+   type ServiceConfig,
+ } from './config.js';
++export {
++  policyUserViolations,
++  type PolicyLevel,
++  type PolicyUserFacts,
++} from './policy-users.rules.js';
+diff --git a/backend/src/modules/incidents/index.ts b/backend/src/modules/incidents/index.ts
+index 17ab00e..adfae0a 100644
+--- a/backend/src/modules/incidents/index.ts
++++ b/backend/src/modules/incidents/index.ts
+@@ -1,2 +1,9 @@
+ export { createIncidentsRouter } from './incidents.routes.js';
+ export { assertCanAccessIncident, createIncident } from './incident.service.js';
++export {
++  createSlaEvaluationProcessor,
++  createSlaMilestoneProcessor,
++  runSlaScan,
++  type ScanResult,
++  type SlaDeps,
++} from './sla-monitoring/index.js';
+diff --git a/backend/src/modules/incidents/sla-monitoring/index.ts b/backend/src/modules/incidents/sla-monitoring/index.ts
+new file mode 100644
+index 0000000..81a7153
+--- /dev/null
++++ b/backend/src/modules/incidents/sla-monitoring/index.ts
+@@ -0,0 +1,7 @@
++export {
++  createSlaEvaluationProcessor,
++  createSlaMilestoneProcessor,
++  runSlaScan,
++  type ScanResult,
++  type SlaDeps,
++} from './sla.processors.js';
+diff --git a/backend/src/modules/incidents/sla-monitoring/sla.calculator.spec.ts b/backend/src/modules/incidents/sla-monitoring/sla.calculator.spec.ts
+new file mode 100644
+index 0000000..262b0e8
+--- /dev/null
++++ b/backend/src/modules/incidents/sla-monitoring/sla.calculator.spec.ts
+@@ -0,0 +1,208 @@
++import type { IncidentStatus, Severity } from '../incidents.types';
++import {
++  breachDueAt,
++  isClockRunning,
++  nextStep,
++  thresholdMinutes,
++  upcomingMilestones,
++  warningDueAt,
++  type SlaSnapshot,
++} from './sla.calculator';
++import type { Milestone } from './sla.milestones';
++
++const T0 = new Date('2026-10-16T10:00:00.000Z');
++const MIN = 60_000;
++const at = (ms: number) => new Date(T0.getTime() + ms);
++
++const thresholds = {
++  P0: { responseMinutes: 5, resolutionMinutes: 30 },
++  P1: { responseMinutes: 10, resolutionMinutes: 60 },
++  P2: { responseMinutes: 30, resolutionMinutes: 120 },
++  P3: { responseMinutes: 60, resolutionMinutes: 240 },
++};
++
++const snapshot = (
++  overrides: Partial<{ status: IncidentStatus; severity: Severity }> = {},
++): SlaSnapshot => ({ status: 'OPEN', severity: 'P1', createdAt: T0, thresholds, ...overrides });
++
++const none = new Set<Milestone>();
++
++describe('SLA time model', () => {
++  it('uses the threshold of the current severity', () => {
++    expect(thresholdMinutes(snapshot({ severity: 'P0' }), 'RESPONSE')).toBe(5);
++    expect(thresholdMinutes(snapshot({ severity: 'P3' }), 'RESOLUTION')).toBe(240);
++  });
++
++  it('counts both clocks from createdAt: warning at exactly 80 %, breach strictly after 100 %', () => {
++    expect(warningDueAt(snapshot(), 'RESPONSE')).toBe(T0.getTime() + 8 * MIN);
++    expect(breachDueAt(snapshot(), 'RESPONSE')).toBe(T0.getTime() + 10 * MIN + 1);
++    expect(warningDueAt(snapshot(), 'RESOLUTION')).toBe(T0.getTime() + 48 * MIN);
++  });
++
++  it('runs the response clock only while OPEN and the resolution clock until resolved', () => {
++    expect(isClockRunning('OPEN', 'RESPONSE')).toBe(true);
++    expect(isClockRunning('ACKNOWLEDGED', 'RESPONSE')).toBe(false);
++    expect(isClockRunning('MITIGATING', 'RESOLUTION')).toBe(true);
++    expect(isClockRunning('RESOLVED', 'RESOLUTION')).toBe(false);
++    expect(isClockRunning('CLOSED', 'RESOLUTION')).toBe(false);
++  });
++});
++
++describe('nextStep', () => {
++  it('does nothing before 80 %', () => {
++    expect(nextStep(snapshot(), at(8 * MIN - 1), none)).toBeNull();
++  });
++
++  it('warns at exactly 80 % of the response window', () => {
++    expect(nextStep(snapshot(), at(8 * MIN), none)).toEqual({
++      kind: 'WARNING',
++      clock: 'RESPONSE',
++      milestone: 'RESPONSE_WARNING',
++    });
++  });
++
++  it('is not breached at the deadline itself, only after it', () => {
++    const warned = new Set<Milestone>(['RESPONSE_WARNING']);
++    expect(nextStep(snapshot(), at(10 * MIN), warned)).toBeNull();
++    expect(nextStep(snapshot(), at(10 * MIN + 1), warned)).toEqual({
++      kind: 'BREACH',
++      clock: 'RESPONSE',
++      milestone: 'RESPONSE_BREACH',
++    });
++  });
++
++  it('records an overdue warning before the breach (downtime recovery)', () => {
++    expect(nextStep(snapshot(), at(11 * MIN), none)).toMatchObject({
++      milestone: 'RESPONSE_WARNING',
++    });
++    expect(
++      nextStep(snapshot(), at(11 * MIN), new Set<Milestone>(['RESPONSE_WARNING'])),
++    ).toMatchObject({
++      milestone: 'RESPONSE_BREACH',
++    });
++  });
++
++  it('never repeats a recorded milestone', () => {
++    const done = new Set<Milestone>(['RESPONSE_WARNING', 'RESPONSE_BREACH']);
++    const step = nextStep(snapshot(), at(11 * MIN), done);
++    expect(step).toEqual({ kind: 'ESCALATION', level: 1 });
++  });
++
++  it('moves the threshold with a severity change without resetting the clock', () => {
++    // At minute 6 nothing is due under P1 (warning at 8, breach after 10); raised to P0 (5 min)
++    // the same elapsed time is past the deadline, so the warning and then the breach are due.
++    expect(nextStep(snapshot({ severity: 'P1' }), at(6 * MIN), none)).toBeNull();
++    expect(nextStep(snapshot({ severity: 'P0' }), at(6 * MIN), none)).toMatchObject({
++      milestone: 'RESPONSE_WARNING',
++    });
++    expect(
++      nextStep(snapshot({ severity: 'P0' }), at(6 * MIN), new Set<Milestone>(['RESPONSE_WARNING'])),
++    ).toMatchObject({ milestone: 'RESPONSE_BREACH' });
++    // Lowered to P3 (60 min) nothing is due at minute 9 although P1 would have warned.
++    expect(nextStep(snapshot({ severity: 'P3' }), at(9 * MIN), none)).toBeNull();
++  });
++
++  it('escalates levels in policy order, resuming from the next unrecorded level', () => {
++    const base: Milestone[] = ['RESPONSE_WARNING', 'RESPONSE_BREACH'];
++    const step = (extra: Milestone[]) =>
++      nextStep(snapshot(), at(11 * MIN), new Set<Milestone>([...base, ...extra]));
++    expect(step([])).toEqual({ kind: 'ESCALATION', level: 1 });
++    expect(step(['ESCALATION_LEVEL_1'])).toEqual({ kind: 'ESCALATION', level: 2 });
++    expect(step(['ESCALATION_LEVEL_1', 'ESCALATION_LEVEL_2'])).toEqual({
++      kind: 'ESCALATION',
++      level: 3,
++    });
++    expect(step(['ESCALATION_LEVEL_1', 'ESCALATION_LEVEL_2', 'ESCALATION_LEVEL_3'])).toEqual({
++      kind: 'ESCALATION',
++      level: 4,
++    });
++  });
++
++  it('treats a failed level as finished and attempts the next one', () => {
++    const recorded = new Set<Milestone>([
++      'RESPONSE_WARNING',
++      'RESPONSE_BREACH',
++      'ESCALATION_LEVEL_1',
++      'ESCALATION_FAILURE_2',
++    ]);
++    expect(nextStep(snapshot(), at(11 * MIN), recorded)).toEqual({ kind: 'ESCALATION', level: 3 });
++  });
++
++  it('ends the chain after the last level, whether it succeeded or failed', () => {
++    const through = (last: Milestone) =>
++      new Set<Milestone>([
++        'RESPONSE_WARNING',
++        'RESPONSE_BREACH',
++        'ESCALATION_LEVEL_1',
++        'ESCALATION_LEVEL_2',
++        'ESCALATION_LEVEL_3',
++        last,
++      ]);
++    expect(nextStep(snapshot(), at(11 * MIN), through('ESCALATION_LEVEL_4'))).toBeNull();
++    expect(nextStep(snapshot(), at(11 * MIN), through('ESCALATION_FAILURE_4'))).toBeNull();
++  });
++
++  it('does not escalate before the response breach is recorded', () => {
++    expect(nextStep(snapshot(), at(5 * MIN), none)).toBeNull();
++  });
++
++  it('stops every response milestone and escalation once acknowledged, resolved or closed', () => {
++    const breached = new Set<Milestone>(['RESPONSE_WARNING', 'RESPONSE_BREACH']);
++    for (const status of ['ACKNOWLEDGED', 'MITIGATING', 'RESOLVED', 'CLOSED'] as const) {
++      const step = nextStep(snapshot({ status }), at(11 * MIN), breached);
++      expect(step?.kind === 'ESCALATION').toBe(false);
++      expect(step?.kind === 'WARNING' && step.clock === 'RESPONSE').toBe(false);
++    }
++    expect(nextStep(snapshot({ status: 'ACKNOWLEDGED' }), at(11 * MIN), none)).toBeNull();
++  });
++
++  it('keeps the resolution clock running after acknowledgement and stops it at resolve', () => {
++    expect(nextStep(snapshot({ status: 'MITIGATING' }), at(48 * MIN), none)).toEqual({
++      kind: 'WARNING',
++      clock: 'RESOLUTION',
++      milestone: 'RESOLUTION_WARNING',
++    });
++    expect(nextStep(snapshot({ status: 'RESOLVED' }), at(500 * MIN), none)).toBeNull();
++    expect(nextStep(snapshot({ status: 'CLOSED' }), at(500 * MIN), none)).toBeNull();
++  });
++
++  it('records the resolution breach without any other effect on the incident state', () => {
++    const recorded = new Set<Milestone>(['RESOLUTION_WARNING']);
++    expect(nextStep(snapshot({ status: 'MITIGATING' }), at(60 * MIN + 1), recorded)).toEqual({
++      kind: 'BREACH',
++      clock: 'RESOLUTION',
++      milestone: 'RESOLUTION_BREACH',
++    });
++  });
++
++  it('after an unassign (back to OPEN) the response clock runs against the original deadline', () => {
++    expect(nextStep(snapshot({ status: 'OPEN' }), at(11 * MIN), none)).toMatchObject({
++      milestone: 'RESPONSE_WARNING',
++    });
++  });
++});
++
++describe('upcomingMilestones', () => {
++  it('lists warnings and breaches of running clocks that are still ahead', () => {
++    const upcoming = upcomingMilestones(snapshot(), at(0), none);
++    expect(upcoming.map((u) => u.milestone).sort()).toEqual([
++      'RESOLUTION_BREACH',
++      'RESOLUTION_WARNING',
++      'RESPONSE_BREACH',
++      'RESPONSE_WARNING',
++    ]);
++    expect(upcoming.find((u) => u.milestone === 'RESPONSE_WARNING')?.dueAt).toBe(
++      T0.getTime() + 8 * MIN,
++    );
++  });
++
++  it('leaves out what is due, recorded or belongs to a stopped clock', () => {
++    const upcoming = upcomingMilestones(
++      snapshot({ status: 'MITIGATING' }),
++      at(9 * MIN),
++      new Set<Milestone>(['RESOLUTION_WARNING']),
++    );
++    expect(upcoming.map((u) => u.milestone)).toEqual(['RESOLUTION_BREACH']);
++    expect(upcomingMilestones(snapshot({ status: 'RESOLVED' }), at(0), none)).toEqual([]);
++  });
++});
+diff --git a/backend/src/modules/incidents/sla-monitoring/sla.calculator.ts b/backend/src/modules/incidents/sla-monitoring/sla.calculator.ts
+new file mode 100644
+index 0000000..dd22712
+--- /dev/null
++++ b/backend/src/modules/incidents/sla-monitoring/sla.calculator.ts
+@@ -0,0 +1,111 @@
++import type { IncidentStatus, Severity } from '../incidents.types.js';
++import type { SlaThresholds } from '../sla.js';
++import {
++  breachMilestone,
++  ESCALATION_LEVELS,
++  failureMilestone,
++  levelMilestone,
++  warningMilestone,
++  type EscalationLevel,
++  type Milestone,
++  type SlaClockName,
++} from './sla.milestones.js';
++
++const MINUTE_MS = 60_000;
++/** 80 % of a window of whole minutes is a whole number of milliseconds (4/5 of 60 000). */
++const WARNING_MS_PER_MINUTE = 48_000;
++
++export type SlaSnapshot = {
++  status: IncidentStatus;
++  severity: Severity;
++  createdAt: Date;
++  thresholds: SlaThresholds;
++};
++
++/** What the evaluation has to do next, in the order the slice defines. */
++export type SlaStep =
++  | { kind: 'WARNING'; clock: SlaClockName; milestone: Milestone }
++  | { kind: 'BREACH'; clock: SlaClockName; milestone: Milestone }
++  | { kind: 'ESCALATION'; level: EscalationLevel };
++
++/** The threshold of the incident's **current** severity; a severity change never resets the clock. */
++export function thresholdMinutes(snapshot: SlaSnapshot, clock: SlaClockName): number {
++  const threshold = snapshot.thresholds[snapshot.severity];
++  return clock === 'RESPONSE' ? threshold.responseMinutes : threshold.resolutionMinutes;
++}
++
++/** Response runs until acknowledgement (an unassign returns to `OPEN`); resolution until resolved. */
++export function isClockRunning(status: IncidentStatus, clock: SlaClockName): boolean {
++  return clock === 'RESPONSE' ? status === 'OPEN' : status !== 'RESOLVED' && status !== 'CLOSED';
++}
++
++/** The instant (epoch ms) from which the 80 % warning is due: reached once 80 % has elapsed. */
++export function warningDueAt(snapshot: SlaSnapshot, clock: SlaClockName): number {
++  return snapshot.createdAt.getTime() + thresholdMinutes(snapshot, clock) * WARNING_MS_PER_MINUTE;
++}
++
++/** The first instant (epoch ms) at which the window is exceeded: strictly after the deadline. */
++export function breachDueAt(snapshot: SlaSnapshot, clock: SlaClockName): number {
++  return snapshot.createdAt.getTime() + thresholdMinutes(snapshot, clock) * MINUTE_MS + 1;
++}
++
++const CLOCKS: readonly SlaClockName[] = ['RESPONSE', 'RESOLUTION'];
++
++/**
++ * The first milestone that is due and not yet recorded, or `null`. Order: response warning,
++ * response breach, escalation levels (only after the response breach is recorded and while the
++ * incident is still `OPEN`; a level is finished once it or its failure is recorded), then the
++ * resolution warning and breach. Pure: the caller supplies the clock reading.
++ */
++export function nextStep(
++  snapshot: SlaSnapshot,
++  now: Date,
++  recorded: ReadonlySet<Milestone>,
++): SlaStep | null {
++  const nowMs = now.getTime();
++
++  for (const clock of CLOCKS) {
++    if (!isClockRunning(snapshot.status, clock)) continue;
++
++    const warning = warningMilestone(clock);
++    if (!recorded.has(warning) && nowMs >= warningDueAt(snapshot, clock)) {
++      return { kind: 'WARNING', clock, milestone: warning };
++    }
++    const breach = breachMilestone(clock);
++    if (!recorded.has(breach) && nowMs >= breachDueAt(snapshot, clock)) {
++      return { kind: 'BREACH', clock, milestone: breach };
++    }
++    if (clock === 'RESPONSE' && recorded.has(breach)) {
++      const level = ESCALATION_LEVELS.find(
++        (candidate) =>
++          !recorded.has(levelMilestone(candidate)) && !recorded.has(failureMilestone(candidate)),
++      );
++      if (level !== undefined) return { kind: 'ESCALATION', level };
++    }
++  }
++  return null;
++}
++
++export type ScheduledMilestone = { milestone: Milestone; dueAt: number };
++
++/** Warnings and breaches of running clocks that are not yet due or recorded, with their instants. */
++export function upcomingMilestones(
++  snapshot: SlaSnapshot,
++  now: Date,
++  recorded: ReadonlySet<Milestone>,
++): ScheduledMilestone[] {
++  const upcoming: ScheduledMilestone[] = [];
++  for (const clock of CLOCKS) {
++    if (!isClockRunning(snapshot.status, clock)) continue;
++    const candidates: ScheduledMilestone[] = [
++      { milestone: warningMilestone(clock), dueAt: warningDueAt(snapshot, clock) },
++      { milestone: breachMilestone(clock), dueAt: breachDueAt(snapshot, clock) },
++    ];
++    for (const candidate of candidates) {
++      if (!recorded.has(candidate.milestone) && candidate.dueAt > now.getTime()) {
++        upcoming.push(candidate);
++      }
++    }
++  }
++  return upcoming;
++}
+diff --git a/backend/src/modules/incidents/sla-monitoring/sla.evaluate.ts b/backend/src/modules/incidents/sla-monitoring/sla.evaluate.ts
+new file mode 100644
+index 0000000..3b9b157
+--- /dev/null
++++ b/backend/src/modules/incidents/sla-monitoring/sla.evaluate.ts
+@@ -0,0 +1,164 @@
++import { policyUserViolations, type PolicyLevel } from '../../appService/index.js';
++import { runInTransaction, type TransactionClient } from '../../../infra/db/prisma.js';
++import { appendAuditEvent } from '../../../infra/audit/append-audit-event.js';
++import { logger } from '../../../shared/observability/logger.js';
++import { enqueueNotification } from '../../notifications/index.js';
++import { INCIDENT_LOCK_TIMEOUT_MS } from '../lifecycle/lifecycle.config.js';
++import { setLockTimeout } from '../lifecycle/lifecycle.repository.js';
++import { nextStep, type SlaStep } from './sla.calculator.js';
++import {
++  ALL_MILESTONES,
++  escalationAuditEvent,
++  failureMilestone,
++  levelMilestone,
++  type EscalationLevel,
++} from './sla.milestones.js';
++import { findRecordedMilestones, findResponder, findSlaIncident } from './sla.repository.js';
++
++export type EvaluationDeps = {
++  /** The clock; injected so thresholds are testable. */
++  now: () => Date;
++  /** Correlation id of the outbox event that asked for this evaluation, when there is one. */
++  requestId?: string;
++};
++
++type StepOutcome = 'NOTHING_DUE' | 'RECORDED' | 'ALREADY_RECORDED';
++
++const LEVEL_FIELD: Record<EscalationLevel, PolicyLevel> = {
++  1: 'level1',
++  2: 'level2',
++  3: 'level3',
++  4: 'fallbackAdmin',
++};
++
++/**
++ * Records the milestone of `step`. The notification goes first: its unique key is the database-level
++ * once-only guard, and `created = false` means the milestone was already recorded, so nothing else
++ * is written. Audit events are written only where the matrix says Yes.
++ */
++async function recordStep(
++  tx: TransactionClient,
++  incident: { id: string; teamId: string; affectedServiceId: string },
++  step: SlaStep,
++  deps: EvaluationDeps,
++): Promise<StepOutcome> {
++  const common = {
++    incidentId: incident.id,
++    ...(deps.requestId === undefined ? {} : { requestId: deps.requestId }),
++  };
++
++  if (step.kind === 'WARNING') {
++    const { created } = await enqueueNotification(tx, {
++      eventType: 'SLA_WARNING',
++      occurrenceId: step.milestone,
++      ...common,
++    });
++    if (!created) return 'ALREADY_RECORDED';
++    await appendAuditEvent(tx, {
++      incidentId: incident.id,
++      eventType: 'SLA_WARNING',
++      actorId: null,
++      metadata: { kind: step.clock },
++    });
++    return 'RECORDED';
++  }
++
++  if (step.kind === 'BREACH') {
++    const { created } = await enqueueNotification(tx, {
++      eventType: step.clock === 'RESPONSE' ? 'RESPONSE_BREACH' : 'RESOLUTION_BREACH',
++      occurrenceId: step.milestone,
++      ...common,
++    });
++    return created ? 'RECORDED' : 'ALREADY_RECORDED';
++  }
++
++  const responder = await findResponder(tx, incident.affectedServiceId, step.level);
++  const field = LEVEL_FIELD[step.level];
++  const invalid =
++    responder === null ||
++    policyUserViolations(
++      { [field]: responder.userId },
++      new Map([[responder.userId, responder.facts]]),
++      incident.teamId,
++    ).length > 0;
++
++  if (invalid) {
++    const { created } = await enqueueNotification(tx, {
++      eventType: 'ESCALATION_FAILED',
++      occurrenceId: failureMilestone(step.level),
++      ...common,
++    });
++    if (created) {
++      logger.warn(
++        { incidentId: incident.id, level: step.level, outcome: 'escalation_failed' },
++        'Escalation responder is invalid; the next level is attempted',
++      );
++    }
++    return created ? 'RECORDED' : 'ALREADY_RECORDED';
++  }
++
++  const auditEvent = escalationAuditEvent(step.level);
++  const { created } = await enqueueNotification(tx, {
++    eventType: auditEvent,
++    occurrenceId: levelMilestone(step.level),
++    ...common,
++  });
++  if (!created) return 'ALREADY_RECORDED';
++  await appendAuditEvent(tx, {
++    incidentId: incident.id,
++    eventType: auditEvent,
++    actorId: null,
++    metadata: { notifiedUser: responder.userId },
++  });
++  return 'RECORDED';
++}
++
++/**
++ * One transaction: lock the incident (same lock as the transition kernel), re-read status, severity
++ * and acknowledgement under it, and record the first due milestone, if any. An acknowledgement that
++ * committed first wins: the incident is no longer `OPEN` and no escalation happens.
++ */
++async function evaluateOnce(
++  tx: TransactionClient,
++  incidentId: string,
++  deps: EvaluationDeps,
++): Promise<{ outcome: StepOutcome; step: SlaStep | null }> {
++  await setLockTimeout(tx, INCIDENT_LOCK_TIMEOUT_MS);
++  const incident = await findSlaIncident(tx, incidentId, { lock: true });
++  if (!incident) return { outcome: 'NOTHING_DUE', step: null };
++
++  const recorded = await findRecordedMilestones(tx, incidentId);
++  const step = nextStep(incident, deps.now(), recorded);
++  if (!step) return { outcome: 'NOTHING_DUE', step: null };
++
++  return { outcome: await recordStep(tx, incident, step, deps), step };
++}
++
++/**
++ * Evaluates one incident until nothing is due: every due milestone is recorded once, in its own
++ * transaction, so an escalation level re-verifies the incident under the lock. Safe to call any
++ * number of times and from any number of workers: the milestone's unique notification key makes
++ * a repeat a no-op. Returns how many milestones this call recorded.
++ */
++export async function evaluateIncident(incidentId: string, deps: EvaluationDeps): Promise<number> {
++  let recordedCount = 0;
++  // Every pass records or skips one of at most ALL_MILESTONES.length milestones.
++  for (let pass = 0; pass <= ALL_MILESTONES.length; pass += 1) {
++    const { outcome, step } = await runInTransaction((tx) => evaluateOnce(tx, incidentId, deps));
++    if (outcome === 'NOTHING_DUE') break;
++    if (outcome === 'RECORDED') {
++      recordedCount += 1;
++      logger.info(
++        {
++          incidentId,
++          step: step?.kind,
++          ...(step?.kind === 'ESCALATION' ? { level: step.level } : { milestone: step?.milestone }),
++          requestId: deps.requestId,
++          outcome: 'milestone_recorded',
++        },
++        'SLA milestone recorded',
++      );
++    }
++  }
++  return recordedCount;
++}
+diff --git a/backend/src/modules/incidents/sla-monitoring/sla.milestones.spec.ts b/backend/src/modules/incidents/sla-monitoring/sla.milestones.spec.ts
+new file mode 100644
+index 0000000..f1fed20
+--- /dev/null
++++ b/backend/src/modules/incidents/sla-monitoring/sla.milestones.spec.ts
+@@ -0,0 +1,51 @@
++import {
++  ALL_MILESTONES,
++  escalationAuditEvent,
++  isMilestone,
++  milestoneKey,
++  notificationEventOf,
++} from './sla.milestones';
++import { NOTIFICATION_CATALOG } from '../../notifications/index';
++
++const ID = '0192b5e0-7c1a-7d2e-8f3b-4a5c6d7e8f90';
++
++describe('milestone keys (SLICE-07 §4: <eventType>:<incidentId>:<milestone>)', () => {
++  it.each([
++    ['RESPONSE_WARNING', `SLA_WARNING:${ID}:RESPONSE_WARNING`],
++    ['RESOLUTION_WARNING', `SLA_WARNING:${ID}:RESOLUTION_WARNING`],
++    ['RESPONSE_BREACH', `RESPONSE_BREACH:${ID}:RESPONSE_BREACH`],
++    ['RESOLUTION_BREACH', `RESOLUTION_BREACH:${ID}:RESOLUTION_BREACH`],
++    ['ESCALATION_LEVEL_1', `ESCALATED_L1:${ID}:ESCALATION_LEVEL_1`],
++    ['ESCALATION_LEVEL_2', `ESCALATED_L2:${ID}:ESCALATION_LEVEL_2`],
++    ['ESCALATION_LEVEL_3', `ESCALATED_L3:${ID}:ESCALATION_LEVEL_3`],
++    ['ESCALATION_LEVEL_4', `ESCALATED_L4:${ID}:ESCALATION_LEVEL_4`],
++    ['ESCALATION_FAILURE_2', `ESCALATION_FAILED:${ID}:ESCALATION_FAILURE_2`],
++  ] as const)('%s', (milestone, key) => {
++    expect(milestoneKey(ID, milestone)).toBe(key);
++  });
++
++  it('has a distinct key for every milestone, including the failure of each level', () => {
++    const keys = ALL_MILESTONES.map((milestone) => milestoneKey(ID, milestone));
++    expect(new Set(keys).size).toBe(12);
++  });
++
++  it('only produces event types that exist in the notification catalog', () => {
++    for (const milestone of ALL_MILESTONES) {
++      expect(Object.keys(NOTIFICATION_CATALOG)).toContain(notificationEventOf(milestone));
++    }
++  });
++
++  it('names the audit event of each escalation level', () => {
++    expect([1, 2, 3, 4].map((level) => escalationAuditEvent(level as 1 | 2 | 3 | 4))).toEqual([
++      'ESCALATED_L1',
++      'ESCALATED_L2',
++      'ESCALATED_L3',
++      'ESCALATED_L4',
++    ]);
++  });
++
++  it('recognizes only real milestones', () => {
++    expect(isMilestone('RESPONSE_BREACH')).toBe(true);
++    expect(isMilestone('ESCALATION_LEVEL_5')).toBe(false);
++  });
++});
+diff --git a/backend/src/modules/incidents/sla-monitoring/sla.milestones.ts b/backend/src/modules/incidents/sla-monitoring/sla.milestones.ts
+new file mode 100644
+index 0000000..98de686
+--- /dev/null
++++ b/backend/src/modules/incidents/sla-monitoring/sla.milestones.ts
+@@ -0,0 +1,69 @@
++import { deriveIdempotencyKey, type NotificationEventType } from '../../notifications/index.js';
++
++export type SlaClockName = 'RESPONSE' | 'RESOLUTION';
++
++export const ESCALATION_LEVELS = [1, 2, 3, 4] as const;
++export type EscalationLevel = (typeof ESCALATION_LEVELS)[number];
++
++/** The once-only identities of SLICE-07 §4 (the `<milestone>` part of the notification key). */
++export type Milestone =
++  | 'RESPONSE_WARNING'
++  | 'RESOLUTION_WARNING'
++  | 'RESPONSE_BREACH'
++  | 'RESOLUTION_BREACH'
++  | `ESCALATION_LEVEL_${EscalationLevel}`
++  | `ESCALATION_FAILURE_${EscalationLevel}`;
++
++export const warningMilestone = (clock: SlaClockName): Milestone => `${clock}_WARNING`;
++export const breachMilestone = (clock: SlaClockName): Milestone => `${clock}_BREACH`;
++export const levelMilestone = (level: EscalationLevel): Milestone => `ESCALATION_LEVEL_${level}`;
++export const failureMilestone = (level: EscalationLevel): Milestone =>
++  `ESCALATION_FAILURE_${level}`;
++
++export const ALL_MILESTONES: readonly Milestone[] = [
++  'RESPONSE_WARNING',
++  'RESOLUTION_WARNING',
++  'RESPONSE_BREACH',
++  'RESOLUTION_BREACH',
++  ...ESCALATION_LEVELS.map(levelMilestone),
++  ...ESCALATION_LEVELS.map(failureMilestone),
++];
++
++export function isMilestone(value: string): value is Milestone {
++  return (ALL_MILESTONES as readonly string[]).includes(value);
++}
++
++/** The notification event a milestone produces (SLICE-07 §4 matrix). */
++export function notificationEventOf(milestone: Milestone): NotificationEventType {
++  switch (milestone) {
++    case 'RESPONSE_WARNING':
++    case 'RESOLUTION_WARNING':
++      return 'SLA_WARNING';
++    case 'RESPONSE_BREACH':
++      return 'RESPONSE_BREACH';
++    case 'RESOLUTION_BREACH':
++      return 'RESOLUTION_BREACH';
++    case 'ESCALATION_LEVEL_1':
++      return 'ESCALATED_L1';
++    case 'ESCALATION_LEVEL_2':
++      return 'ESCALATED_L2';
++    case 'ESCALATION_LEVEL_3':
++      return 'ESCALATED_L3';
++    case 'ESCALATION_LEVEL_4':
++      return 'ESCALATED_L4';
++    default:
++      return 'ESCALATION_FAILED';
++  }
++}
++
++/** `Notification.idempotencyKey` of a milestone: the database-level once-only key. */
++export function milestoneKey(incidentId: string, milestone: Milestone): string {
++  return deriveIdempotencyKey(notificationEventOf(milestone), incidentId, milestone);
++}
++
++/** The audit event of an escalation level (`ESCALATED_L1` … `ESCALATED_L4`). */
++export function escalationAuditEvent(
++  level: EscalationLevel,
++): 'ESCALATED_L1' | 'ESCALATED_L2' | 'ESCALATED_L3' | 'ESCALATED_L4' {
++  return `ESCALATED_L${level}`;
++}
+diff --git a/backend/src/modules/incidents/sla-monitoring/sla.processors.ts b/backend/src/modules/incidents/sla-monitoring/sla.processors.ts
+new file mode 100644
+index 0000000..8e0af9e
+--- /dev/null
++++ b/backend/src/modules/incidents/sla-monitoring/sla.processors.ts
+@@ -0,0 +1,94 @@
++import { z } from 'zod';
++import { getPrisma } from '../../../infra/db/prisma.js';
++import {
++  NonRetryableJobError,
++  type DelayedJobProcessor,
++  type DelayedJobScheduler,
++  type OutboxProcessor,
++} from '../../../infra/jobs/index.js';
++import { logger } from '../../../shared/observability/logger.js';
++import { evaluateIncident } from './sla.evaluate.js';
++import { isMilestone } from './sla.milestones.js';
++import { findScanCandidates } from './sla.repository.js';
++import { scheduleMilestoneJobs, SLA_MILESTONE_JOB } from './sla.schedule.js';
++
++export type SlaDeps = {
++  now?: () => Date;
++  scheduler: DelayedJobScheduler;
++};
++
++const clock = (deps: { now?: () => Date }): (() => Date) => deps.now ?? (() => new Date());
++
++/**
++ * Consumer of `SLA_EVALUATION_REQUESTED` (written by ingestion and by severity and unassign
++ * changes): records what is already overdue, then (re)schedules the delayed jobs for what is
++ * still ahead under the incident's current severity.
++ */
++export function createSlaEvaluationProcessor(deps: SlaDeps): OutboxProcessor {
++  const now = clock(deps);
++  return async ({ payload }) => {
++    const { incidentId, requestId } = payload as { incidentId: string; requestId?: string };
++    await evaluateIncident(incidentId, { now, ...(requestId === undefined ? {} : { requestId }) });
++    await scheduleMilestoneJobs(incidentId, { now, scheduler: deps.scheduler });
++  };
++}
++
++const milestoneJobData = z.object({
++  incidentId: z.uuid(),
++  milestone: z.string().refine(isMilestone),
++});
++
++/**
++ * Consumer of the delayed milestone jobs. The job only says *when* to look: the evaluation decides
++ * from the incident's state under its lock, so a stale job (acknowledged, resolved, severity
++ * changed) is a harmless no-op. Afterwards it schedules what is still ahead (a milestone further
++ * away than one delay allows is scheduled in several steps).
++ */
++export function createSlaMilestoneProcessor(deps: SlaDeps): DelayedJobProcessor {
++  const now = clock(deps);
++  return async ({ name, data }) => {
++    if (name !== SLA_MILESTONE_JOB) {
++      throw new NonRetryableJobError('UNSUPPORTED_EVENT_TYPE', 'Unsupported delayed job');
++    }
++    const parsed = milestoneJobData.safeParse(data);
++    if (!parsed.success) {
++      throw new NonRetryableJobError('INVALID_PAYLOAD', 'Invalid delayed job data');
++    }
++    await evaluateIncident(parsed.data.incidentId, { now });
++    await scheduleMilestoneJobs(parsed.data.incidentId, { now, scheduler: deps.scheduler });
++  };
++}
++
++export type ScanResult = { candidates: number; recorded: number; failed: number };
++
++/**
++ * The PostgreSQL safety net: finds unresolved incidents whose thresholds were crossed without the
++ * milestone being recorded and evaluates each one. A milestone stays a candidate until its record
++ * exists, so every pass retries what an earlier pass, a lost delayed job or an exhausted job left
++ * undone; one failing incident never stops the others.
++ */
++export async function runSlaScan(deps: { now?: () => Date } = {}): Promise<ScanResult> {
++  const now = clock(deps);
++  const candidates = await findScanCandidates(getPrisma(), now());
++
++  let recorded = 0;
++  let failed = 0;
++  for (const incidentId of candidates) {
++    try {
++      recorded += await evaluateIncident(incidentId, { now });
++    } catch (err) {
++      failed += 1;
++      logger.error(
++        { err, incidentId, outcome: 'sla_scan_incident_failed' },
++        'SLA scan could not evaluate an incident; it is retried on the next scan',
++      );
++    }
++  }
++  if (candidates.length > 0) {
++    logger.info(
++      { candidates: candidates.length, recorded, failed, outcome: 'sla_scan' },
++      'SLA scan finished',
++    );
++  }
++  return { candidates: candidates.length, recorded, failed };
++}
+diff --git a/backend/src/modules/incidents/sla-monitoring/sla.repository.ts b/backend/src/modules/incidents/sla-monitoring/sla.repository.ts
+new file mode 100644
+index 0000000..4f0e317
+--- /dev/null
++++ b/backend/src/modules/incidents/sla-monitoring/sla.repository.ts
+@@ -0,0 +1,181 @@
++import { Prisma } from '../../../generated/prisma/client.js';
++import type { Db } from '../incidents.common.js';
++import type { IncidentStatus, Severity } from '../incidents.types.js';
++import type { SlaThresholds } from '../sla.js';
++import type { PolicyUserFacts } from '../../appService/index.js';
++import {
++  ALL_MILESTONES,
++  ESCALATION_LEVELS,
++  failureMilestone,
++  levelMilestone,
++  milestoneKey,
++  type EscalationLevel,
++  type Milestone,
++} from './sla.milestones.js';
++import type { SlaSnapshot } from './sla.calculator.js';
++
++export type SlaIncident = SlaSnapshot & {
++  id: string;
++  teamId: string;
++  affectedServiceId: string;
++};
++
++type IncidentRow = {
++  id: string;
++  status: IncidentStatus;
++  severity: Severity;
++  createdAt: Date;
++  teamId: string;
++  affectedServiceId: string;
++  p0r: number;
++  p0s: number;
++  p1r: number;
++  p1s: number;
++  p2r: number;
++  p2s: number;
++  p3r: number;
++  p3s: number;
++};
++
++function toIncident(row: IncidentRow): SlaIncident {
++  const thresholds: SlaThresholds = {
++    P0: { responseMinutes: row.p0r, resolutionMinutes: row.p0s },
++    P1: { responseMinutes: row.p1r, resolutionMinutes: row.p1s },
++    P2: { responseMinutes: row.p2r, resolutionMinutes: row.p2s },
++    P3: { responseMinutes: row.p3r, resolutionMinutes: row.p3s },
++  };
++  return {
++    id: row.id,
++    status: row.status,
++    severity: row.severity,
++    createdAt: row.createdAt,
++    teamId: row.teamId,
++    affectedServiceId: row.affectedServiceId,
++    thresholds,
++  };
++}
++
++/**
++ * The incident with the service's eight SLA minute columns. With `lock` the incident row is taken
++ * `FOR UPDATE` (the same lock the transition kernel takes), so status, severity and
++ * acknowledgement are read under the lock; the service row is not locked.
++ */
++export async function findSlaIncident(
++  db: Db,
++  id: string,
++  options: { lock: boolean },
++): Promise<SlaIncident | null> {
++  const rows = await db.$queryRaw<IncidentRow[]>(Prisma.sql`
++    SELECT i."id", i."status"::text AS "status", i."severity"::text AS "severity", i."createdAt",
++           i."teamId", i."affectedServiceId",
++           s."P0ResponseSlaMinutes" AS "p0r", s."P0ResolutionSlaMinutes" AS "p0s",
++           s."P1ResponseSlaMinutes" AS "p1r", s."P1ResolutionSlaMinutes" AS "p1s",
++           s."P2ResponseSlaMinutes" AS "p2r", s."P2ResolutionSlaMinutes" AS "p2s",
++           s."P3ResponseSlaMinutes" AS "p3r", s."P3ResolutionSlaMinutes" AS "p3s"
++    FROM "Incident" i
++    JOIN "AppService" s ON s."id" = i."affectedServiceId"
++    WHERE i."id" = ${id}::uuid
++    ${options.lock ? Prisma.sql`FOR UPDATE OF i` : Prisma.empty}`);
++  return rows[0] ? toIncident(rows[0]) : null;
++}
++
++/** Milestones already recorded: the incident's `Notification` rows with a milestone key. */
++export async function findRecordedMilestones(db: Db, incidentId: string): Promise<Set<Milestone>> {
++  const byKey = new Map(ALL_MILESTONES.map((m) => [milestoneKey(incidentId, m), m]));
++  const rows = await db.notification.findMany({
++    where: { incidentId, idempotencyKey: { in: [...byKey.keys()] } },
++    select: { idempotencyKey: true },
++  });
++  const recorded = new Set<Milestone>();
++  for (const row of rows) {
++    const milestone = byKey.get(row.idempotencyKey);
++    if (milestone) recorded.add(milestone);
++  }
++  return recorded;
++}
++
++export type Responder = { userId: string; facts: PolicyUserFacts };
++
++/** The user of an escalation level (`level1`, `level2`, `level3`, `fallbackAdmin` for level 4). */
++export async function findResponder(
++  db: Db,
++  serviceId: string,
++  level: EscalationLevel,
++): Promise<Responder | null> {
++  const select = { id: true, role: true, status: true, teamId: true } as const;
++  const policy = await db.escalationPolicy.findFirst({
++    where: { appService: { id: serviceId } },
++    select: {
++      level1: { select },
++      level2: { select },
++      level3: { select },
++      fallbackAdmin: { select },
++    },
++  });
++  if (!policy) return null;
++  const user = [policy.level1, policy.level2, policy.level3, policy.fallbackAdmin][level - 1];
++  return {
++    userId: user.id,
++    facts: { role: user.role, status: user.status, teamId: user.teamId },
++  };
++}
++
++/**
++ * The key format is owned by the notification contract; its pieces around the incident id are read
++ * off a key built for a placeholder id, so SQL and TypeScript cannot drift apart.
++ */
++const PLACEHOLDER_ID = '00000000-0000-0000-0000-000000000000';
++
++function recordedInSql(milestone: Milestone): Prisma.Sql {
++  const [prefix, suffix] = milestoneKey(PLACEHOLDER_ID, milestone).split(PLACEHOLDER_ID);
++  return Prisma.sql`EXISTS (SELECT 1 FROM "Notification" n
++    WHERE n."idempotencyKey" = ${prefix}::text || t."id"::text || ${suffix}::text)`;
++}
++
++const notRecorded = (milestone: Milestone): Prisma.Sql =>
++  Prisma.sql`NOT ${recordedInSql(milestone)}`;
++
++const levelPending = (level: EscalationLevel): Prisma.Sql =>
++  Prisma.sql`(${notRecorded(levelMilestone(level))} AND ${notRecorded(failureMilestone(level))})`;
++
++/**
++ * The scanner's safety net: unresolved incidents with a due milestone that is not recorded (the
++ * same rules as `nextStep`, expressed in SQL against the same clock reading `now`). Only ids are
++ * returned; each incident is then evaluated under its lock.
++ */
++export async function findScanCandidates(db: Db, now: Date): Promise<string[]> {
++  const nowTs = Prisma.sql`(${now.toISOString()}::timestamptz AT TIME ZONE 'UTC')`;
++  const due = (column: string, perMinuteMs: number, strict: boolean): Prisma.Sql =>
++    strict
++      ? Prisma.sql`${nowTs} > t."createdAt" + (${Prisma.raw(column)}::double precision * ${perMinuteMs}) * interval '1 millisecond'`
++      : Prisma.sql`${nowTs} >= t."createdAt" + (${Prisma.raw(column)}::double precision * ${perMinuteMs}) * interval '1 millisecond'`;
++
++  const anyLevelPending = Prisma.join(ESCALATION_LEVELS.map(levelPending), ' OR ');
++
++  const rows = await db.$queryRaw<{ id: string }[]>(Prisma.sql`
++    WITH t AS (
++      SELECT i."id", i."status"::text AS "status", i."createdAt",
++        CASE i."severity"::text WHEN 'P0' THEN s."P0ResponseSlaMinutes"
++          WHEN 'P1' THEN s."P1ResponseSlaMinutes" WHEN 'P2' THEN s."P2ResponseSlaMinutes"
++          ELSE s."P3ResponseSlaMinutes" END AS "resp",
++        CASE i."severity"::text WHEN 'P0' THEN s."P0ResolutionSlaMinutes"
++          WHEN 'P1' THEN s."P1ResolutionSlaMinutes" WHEN 'P2' THEN s."P2ResolutionSlaMinutes"
++          ELSE s."P3ResolutionSlaMinutes" END AS "resol"
++      FROM "Incident" i
++      JOIN "AppService" s ON s."id" = i."affectedServiceId"
++      WHERE i."status" IN ('OPEN', 'ACKNOWLEDGED', 'MITIGATING')
++    )
++    SELECT t."id" FROM t
++    WHERE (
++      t."status" = 'OPEN' AND (
++        (${due('t."resp"', 48_000, false)} AND ${notRecorded('RESPONSE_WARNING')})
++        OR (${due('t."resp"', 60_000, true)} AND ${notRecorded('RESPONSE_BREACH')})
++        OR (${recordedInSql('RESPONSE_BREACH')} AND (${anyLevelPending}))
++      )
++    ) OR (
++      (${due('t."resol"', 48_000, false)} AND ${notRecorded('RESOLUTION_WARNING')})
++      OR (${due('t."resol"', 60_000, true)} AND ${notRecorded('RESOLUTION_BREACH')})
++    )
++    ORDER BY t."createdAt", t."id"`);
++  return rows.map((row) => row.id);
++}
+diff --git a/backend/src/modules/incidents/sla-monitoring/sla.schedule.ts b/backend/src/modules/incidents/sla-monitoring/sla.schedule.ts
+new file mode 100644
+index 0000000..eef1c14
+--- /dev/null
++++ b/backend/src/modules/incidents/sla-monitoring/sla.schedule.ts
+@@ -0,0 +1,41 @@
++import { getPrisma } from '../../../infra/db/prisma.js';
++import { QUEUES, type DelayedJobScheduler } from '../../../infra/jobs/index.js';
++import { upcomingMilestones } from './sla.calculator.js';
++import { findRecordedMilestones, findSlaIncident } from './sla.repository.js';
++
++/** Name of the delayed job that evaluates an incident at a milestone's precise time. */
++export const SLA_MILESTONE_JOB = 'SLA_MILESTONE';
++
++/**
++ * Longest single delay handed to the queue (the largest 32-bit signed integer, in milliseconds).
++ * A milestone further away is scheduled for this long and re-scheduled when that job runs.
++ */
++export const MAX_SINGLE_DELAY_MS = 2_147_483_647;
++
++/**
++ * Schedules a delayed job for every warning and breach of the incident that is not yet due or
++ * recorded, at its precise instant. The job id is deterministic, so scheduling again (after a
++ * severity change, an unassign, or a lost job) replaces the waiting job instead of adding another.
++ */
++export async function scheduleMilestoneJobs(
++  incidentId: string,
++  deps: { now: () => Date; scheduler: DelayedJobScheduler },
++): Promise<number> {
++  const db = getPrisma();
++  const incident = await findSlaIncident(db, incidentId, { lock: false });
++  if (!incident) return 0;
++
++  const now = deps.now();
++  const recorded = await findRecordedMilestones(db, incidentId);
++  const upcoming = upcomingMilestones(incident, now, recorded);
++
++  for (const { milestone, dueAt } of upcoming) {
++    await deps.scheduler.scheduleDelayed(QUEUES.SLA_ESCALATION, {
++      jobId: `sla-${incidentId}-${milestone}`,
++      name: SLA_MILESTONE_JOB,
++      data: { incidentId, milestone },
++      delayMs: Math.min(dueAt - now.getTime(), MAX_SINGLE_DELAY_MS),
++    });
++  }
++  return upcoming.length;
++}
+diff --git a/backend/src/modules/notifications/index.ts b/backend/src/modules/notifications/index.ts
+index 11a63bf..21f3c43 100644
+--- a/backend/src/modules/notifications/index.ts
++++ b/backend/src/modules/notifications/index.ts
+@@ -4,6 +4,7 @@ export {
+   type EnqueueNotificationResult,
+ } from './enqueue-notification.js';
+ export { NotificationContractError } from './record-notification.js';
++export { deriveIdempotencyKey } from './idempotency-key.js';
+ export { NOTIFICATION_CATALOG, type NotificationEventType } from './catalog.js';
+ export { createNotificationProcessor, type DeliveryDeps } from './delivery.processor.js';
+ export {
+diff --git a/backend/src/worker.ts b/backend/src/worker.ts
+index d7c4fa8..499107e 100644
+--- a/backend/src/worker.ts
++++ b/backend/src/worker.ts
+@@ -1,4 +1,4 @@
+-import { getConfig, getJobsConfig, getNotificationsConfig } from './config/env.js';
++import { getConfig, getJobsConfig, getNotificationsConfig, getSlaConfig } from './config/env.js';
+ import { disconnectPrisma, pingDatabase } from './infra/db/prisma.js';
+ import { closeRedis, pingRedis } from './infra/redis/redis.js';
+ import { onShutdownSignal } from './shared/lifecycle/shutdown.js';
+@@ -9,6 +9,7 @@ async function main(): Promise<void> {
+   const config = getConfig();
+   getJobsConfig(); // fails startup when any outbox/worker setting is missing
+   getNotificationsConfig(); // fails startup when any email setting is missing
++  getSlaConfig(); // fails startup when the SLA scan interval is missing
+ 
+   await pingDatabase();
+   await pingRedis();
+diff --git a/backend/src/workers/index.ts b/backend/src/workers/index.ts
+index ca4fed2..f764149 100644
+--- a/backend/src/workers/index.ts
++++ b/backend/src/workers/index.ts
+@@ -1,7 +1,15 @@
+-import { getJobsConfig, getNotificationsConfig } from '../config/env.js';
++import { getJobsConfig, getNotificationsConfig, getSlaConfig } from '../config/env.js';
+ import { QUEUES } from '../infra/jobs/events.js';
+-import { registerProcessor } from '../infra/jobs/registry.js';
++import { createBullmqGateway } from '../infra/jobs/gateway.js';
++import { startLoop } from '../infra/jobs/loop.js';
++import { registerDelayedProcessor, registerProcessor } from '../infra/jobs/registry.js';
+ import { startJobsRuntime, type JobsRuntime } from '../infra/jobs/runtime.js';
++import { createRedisConnection } from '../infra/redis/redis.js';
++import {
++  createSlaEvaluationProcessor,
++  createSlaMilestoneProcessor,
++  runSlaScan,
++} from '../modules/incidents/index.js';
+ import {
+   createNotificationProcessor,
+   createSendGridEmailProvider,
+@@ -14,6 +22,7 @@ import {
+ export function startWorkers(): JobsRuntime {
+   const jobs = getJobsConfig();
+   const email = getNotificationsConfig();
++  const sla = getSlaConfig();
+ 
+   registerProcessor(
+     QUEUES.NOTIFICATIONS,
+@@ -28,5 +37,25 @@ export function startWorkers(): JobsRuntime {
+     }),
+   );
+ 
+-  return startJobsRuntime(jobs);
++  // SLICE-07: the same gateway publishes outbox events and schedules the delayed milestone jobs.
++  const connection = createRedisConnection('general');
++  const gateway = createBullmqGateway(connection, jobs.executionAttempts);
++  registerProcessor(QUEUES.SLA_ESCALATION, createSlaEvaluationProcessor({ scheduler: gateway }));
++  registerDelayedProcessor(
++    QUEUES.SLA_ESCALATION,
++    createSlaMilestoneProcessor({ scheduler: gateway }),
++  );
++
++  const runtime = startJobsRuntime(jobs, gateway);
++  const scanner = startLoop('sla-scan', sla.scanIntervalMs, async () => {
++    await runSlaScan();
++  });
++
++  return {
++    async stop() {
++      await scanner.stop();
++      await runtime.stop();
++      connection.disconnect();
++    },
++  };
+ }
+diff --git a/backend/test/integration/sla-delayed-jobs.int-spec.ts b/backend/test/integration/sla-delayed-jobs.int-spec.ts
+new file mode 100644
+index 0000000..e3e2c57
+--- /dev/null
++++ b/backend/test/integration/sla-delayed-jobs.int-spec.ts
+@@ -0,0 +1,246 @@
++import { randomUUID } from 'node:crypto';
++import { getPrisma } from '../../src/infra/db/prisma';
++import { createBullmqGateway } from '../../src/infra/jobs/gateway';
++import { createJobWorker } from '../../src/infra/jobs/processor';
++import {
++  clearProcessors,
++  registerDelayedProcessor,
++  registerProcessor,
++} from '../../src/infra/jobs/registry';
++import { startJobsRuntime } from '../../src/infra/jobs/runtime';
++import { createRedisConnection, getRedis } from '../../src/infra/redis/redis';
++import { QUEUES } from '../../src/infra/jobs/events';
++import { Queue, type Worker } from 'bullmq';
++import { RetryableJobError } from '../../src/infra/jobs/errors';
++import {
++  createSlaEvaluationProcessor,
++  createSlaMilestoneProcessor,
++  runSlaScan,
++} from '../../src/modules/incidents/sla-monitoring';
++import * as evaluateModule from '../../src/modules/incidents/sla-monitoring/sla.evaluate';
++import { createIncidentWith } from '../helpers/incidents';
++import { createTeam, createUser, resetState } from '../helpers/identity';
++import { insertOutbox, sleep, testJobsConfig, waitFor } from '../helpers/jobs';
++
++const db = () => getPrisma();
++const config = testJobsConfig();
++const QUEUE = QUEUES.SLA_ESCALATION;
++
++let connections: ReturnType<typeof createRedisConnection>[] = [];
++let workers: Worker[] = [];
++let queue: Queue;
++
++const connect = (kind: 'general' | 'bullmq' = 'general') => {
++  const connection = createRedisConnection(kind);
++  connections.push(connection);
++  return connection;
++};
++
++beforeEach(async () => {
++  await resetState();
++  clearProcessors();
++  queue = new Queue(QUEUE, { connection: connect() });
++});
++afterEach(async () => {
++  jest.restoreAllMocks();
++  await Promise.all(workers.map((w) => w.close()));
++  workers = [];
++  await queue.close();
++  connections.forEach((c) => c.disconnect());
++  connections = [];
++  clearProcessors();
++});
++afterAll(async () => {
++  await db().$disconnect();
++  getRedis().disconnect();
++});
++
++async function service(responseMinutes: number) {
++  const team = await createTeam();
++  const eng = await createUser({ role: 'ENGINEER', teamId: team.id });
++  const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id });
++  const admin = await createUser({ role: 'ADMIN' });
++  const policy = await db().escalationPolicy.create({
++    data: { level1Id: eng.id, level2Id: eng.id, level3Id: lead.id, fallbackAdminId: admin.id },
++  });
++  const svc = await db().appService.create({
++    data: {
++      name: `svc-${randomUUID().slice(0, 8)}`,
++      teamId: team.id,
++      escalationPolicyId: policy.id,
++      P0ResponseSlaMinutes: 5,
++      P0ResolutionSlaMinutes: 30,
++      P1ResponseSlaMinutes: responseMinutes,
++      P1ResolutionSlaMinutes: 600,
++      P2ResponseSlaMinutes: 30,
++      P2ResolutionSlaMinutes: 120,
++      P3ResponseSlaMinutes: 60,
++      P3ResolutionSlaMinutes: 240,
++    },
++  });
++  return { team, svc };
++}
++
++function startWorker(handler: Parameters<typeof registerDelayedProcessor>[1]): void {
++  const gateway = createBullmqGateway(connect(), config.executionAttempts);
++  const worker = createJobWorker(
++    QUEUE,
++    async () => undefined,
++    { config, gateway },
++    connect('bullmq'),
++    handler,
++  );
++  workers.push(worker);
++}
++
++describe('delayed jobs on the real queue', () => {
++  it('runs a scheduled job after its delay, once, and frees its id afterwards', async () => {
++    const gateway = createBullmqGateway(connect(), config.executionAttempts);
++    const seen: string[] = [];
++    startWorker(async ({ data }) => void seen.push(data.incidentId));
++
++    const started = Date.now();
++    await gateway.scheduleDelayed(QUEUE, {
++      jobId: 'sla-test-1',
++      name: 'SLA_MILESTONE',
++      data: { incidentId: 'a' },
++      delayMs: 300,
++    });
++    expect(seen).toEqual([]);
++    await waitFor(async () => seen.length === 1);
++    expect(Date.now() - started).toBeGreaterThanOrEqual(250);
++
++    await sleep(100);
++    expect(await queue.getJob('sla-test-1')).toBeUndefined();
++    await gateway.scheduleDelayed(QUEUE, {
++      jobId: 'sla-test-1',
++      name: 'SLA_MILESTONE',
++      data: { incidentId: 'b' },
++      delayMs: 10,
++    });
++    await waitFor(async () => seen.length === 2);
++    expect(seen).toEqual(['a', 'b']);
++  });
++
++  it('scheduling the same id again replaces the waiting job (new delay, one run)', async () => {
++    const gateway = createBullmqGateway(connect(), config.executionAttempts);
++    const seen: string[] = [];
++    startWorker(async ({ data }) => void seen.push(data.incidentId));
++
++    await gateway.scheduleDelayed(QUEUE, {
++      jobId: 'sla-test-2',
++      name: 'SLA_MILESTONE',
++      data: { incidentId: 'old' },
++      delayMs: 60_000,
++    });
++    await gateway.scheduleDelayed(QUEUE, {
++      jobId: 'sla-test-2',
++      name: 'SLA_MILESTONE',
++      data: { incidentId: 'new' },
++      delayMs: 100,
++    });
++
++    await waitFor(async () => seen.length >= 1);
++    await sleep(200);
++    expect(seen).toEqual(['new']);
++  });
++
++  it('retries a retryable failure with the SLICE-08 attempts, then ends it with an error log and no stuck id', async () => {
++    const gateway = createBullmqGateway(connect(), config.executionAttempts);
++    let attempts = 0;
++    startWorker(async () => {
++      attempts += 1;
++      throw new RetryableJobError('NETWORK', 'down');
++    });
++
++    await gateway.scheduleDelayed(QUEUE, {
++      jobId: 'sla-test-3',
++      name: 'SLA_MILESTONE',
++      data: { incidentId: 'x' },
++      delayMs: 0,
++    });
++    await waitFor(async () => attempts === config.executionAttempts, 15_000);
++    await sleep(200);
++    expect(attempts).toBe(config.executionAttempts);
++    expect(await queue.getJob('sla-test-3')).toBeUndefined();
++  });
++});
++
++describe('at-least-once: an exhausted delayed job is recovered by the scanner', () => {
++  it('the milestone is recorded by the next scan once the failure is over', async () => {
++    const { team, svc } = await service(10);
++    const created = new Date(Date.now() - 11 * 60_000);
++    const incident = await createIncidentWith({
++      teamId: team.id,
++      serviceId: svc.id,
++      createdAt: created,
++    });
++    const gateway = createBullmqGateway(connect(), config.executionAttempts);
++
++    // Every attempt of the job fails (a database problem, say).
++    const real = evaluateModule.evaluateIncident;
++    let failing = true;
++    let calls = 0;
++    jest.spyOn(evaluateModule, 'evaluateIncident').mockImplementation(async (id, deps) => {
++      calls += 1;
++      if (failing) throw new RetryableJobError('TRANSIENT_DATABASE', 'db down');
++      return real(id, deps);
++    });
++    startWorker(createSlaMilestoneProcessor({ scheduler: gateway }));
++    await gateway.scheduleDelayed(QUEUE, {
++      jobId: `sla-${incident.id}-RESPONSE_BREACH`,
++      name: 'SLA_MILESTONE',
++      data: { incidentId: incident.id, milestone: 'RESPONSE_BREACH' },
++      delayMs: 0,
++    });
++    await waitFor(async () => calls === config.executionAttempts, 15_000);
++    await sleep(200);
++    expect(await db().notification.count({ where: { incidentId: incident.id } })).toBe(0);
++
++    // The job is gone for good, but the milestone is still a scan candidate until it is recorded.
++    failing = false;
++    const scan = await runSlaScan();
++    expect(scan).toMatchObject({ candidates: 1, failed: 0 });
++    expect(await db().notification.count({ where: { incidentId: incident.id } })).toBe(6);
++    expect(await runSlaScan()).toMatchObject({ candidates: 0 });
++  });
++});
++
++describe('end to end: outbox event → relay → worker → delayed BullMQ job', () => {
++  it('SLA_EVALUATION_REQUESTED schedules the warning, which the delayed job then records at 80 %', async () => {
++    const { team, svc } = await service(1); // 1-minute response window: warning after 48 s
++    const incident = await createIncidentWith({
++      teamId: team.id,
++      serviceId: svc.id,
++      createdAt: new Date(Date.now() - 47_000),
++    });
++    const gateway = createBullmqGateway(connect(), config.executionAttempts);
++    registerProcessor(QUEUE, createSlaEvaluationProcessor({ scheduler: gateway }));
++    registerDelayedProcessor(QUEUE, createSlaMilestoneProcessor({ scheduler: gateway }));
++    const runtime = startJobsRuntime(config);
++
++    try {
++      const { id } = await insertOutbox({ incidentId: incident.id });
++      await waitFor(async () => {
++        const row = await db().outboxEvent.findUnique({ where: { id } });
++        return row?.status === 'SUCCESS';
++      });
++
++      const delayed = await queue.getJob(`sla-${incident.id}-RESPONSE_WARNING`);
++      expect(delayed?.opts.delay).toBeGreaterThan(0);
++
++      const warning = await waitFor(
++        async () =>
++          db().auditEvent.findFirst({
++            where: { incidentId: incident.id, eventType: 'SLA_WARNING' },
++          }),
++        10_000,
++      );
++      expect(warning?.metadata).toEqual({ kind: 'RESPONSE' });
++      expect(await db().notification.count({ where: { incidentId: incident.id } })).toBe(1);
++    } finally {
++      await runtime.stop();
++      await gateway.close();
++    }
++  });
++});
+diff --git a/backend/test/integration/sla-escalation.int-spec.ts b/backend/test/integration/sla-escalation.int-spec.ts
+new file mode 100644
+index 0000000..4369b8f
+--- /dev/null
++++ b/backend/test/integration/sla-escalation.int-spec.ts
+@@ -0,0 +1,673 @@
++import { randomUUID } from 'node:crypto';
++import { getPrisma, runInTransaction } from '../../src/infra/db/prisma';
++import * as auditModule from '../../src/infra/audit/append-audit-event';
++import { getRedis } from '../../src/infra/redis/redis';
++import { evaluateIncident } from '../../src/modules/incidents/sla-monitoring/sla.evaluate';
++import { nextStep } from '../../src/modules/incidents/sla-monitoring/sla.calculator';
++import {
++  ALL_MILESTONES,
++  milestoneKey,
++} from '../../src/modules/incidents/sla-monitoring/sla.milestones';
++import {
++  createSlaEvaluationProcessor,
++  createSlaMilestoneProcessor,
++  runSlaScan,
++} from '../../src/modules/incidents/sla-monitoring';
++import * as evaluateModule from '../../src/modules/incidents/sla-monitoring/sla.evaluate';
++import {
++  findRecordedMilestones,
++  findScanCandidates,
++  findSlaIncident,
++} from '../../src/modules/incidents/sla-monitoring/sla.repository';
++import { enqueueNotification } from '../../src/modules/notifications';
++import type { DelayedJob, DelayedJobScheduler } from '../../src/infra/jobs/gateway';
++import { createIncidentWith } from '../helpers/incidents';
++import { createTeam, createUser, resetState } from '../helpers/identity';
++
++const db = () => getPrisma();
++const MIN = 60_000;
++const T0 = new Date('2026-10-16T10:00:00.000Z');
++const at = (ms: number) => () => new Date(T0.getTime() + ms);
++
++beforeEach(resetState);
++afterEach(() => jest.restoreAllMocks());
++afterAll(async () => {
++  await db().$disconnect();
++  getRedis().disconnect();
++});
++
++/** A team with two engineers, a lead, a fallback admin and a service whose policy uses them. */
++async function slaWorld(
++  overrides: {
++    sla?: Partial<{ P1ResponseSlaMinutes: number; P1ResolutionSlaMinutes: number }>;
++  } = {},
++) {
++  const team = await createTeam();
++  const eng1 = await createUser({ role: 'ENGINEER', teamId: team.id, name: 'Eng One' });
++  const eng2 = await createUser({ role: 'ENGINEER', teamId: team.id, name: 'Eng Two' });
++  const lead = await createUser({ role: 'TEAM_LEAD', teamId: team.id, name: 'Lead' });
++  const admin = await createUser({ role: 'ADMIN', teamId: null, name: 'Fallback Admin' });
++  const policy = await db().escalationPolicy.create({
++    data: {
++      level1Id: eng1.id,
++      level2Id: eng2.id,
++      level3Id: lead.id,
++      fallbackAdminId: admin.id,
++    },
++  });
++  const service = await db().appService.create({
++    data: {
++      name: `svc-${randomUUID().slice(0, 8)}`,
++      teamId: team.id,
++      escalationPolicyId: policy.id,
++      P0ResponseSlaMinutes: 5,
++      P0ResolutionSlaMinutes: 30,
++      P1ResponseSlaMinutes: overrides.sla?.P1ResponseSlaMinutes ?? 10,
++      P1ResolutionSlaMinutes: overrides.sla?.P1ResolutionSlaMinutes ?? 60,
++      P2ResponseSlaMinutes: 30,
++      P2ResolutionSlaMinutes: 120,
++      P3ResponseSlaMinutes: 60,
++      P3ResolutionSlaMinutes: 240,
++    },
++  });
++  const incident = (
++    opts: Parameters<typeof createIncidentWith>[0] extends infer O ? Partial<O> : never = {},
++  ) => createIncidentWith({ teamId: team.id, serviceId: service.id, createdAt: T0, ...opts });
++  return { team, eng1, eng2, lead, admin, policy, service, incident };
++}
++
++const audits = (incidentId: string) =>
++  db().auditEvent.findMany({ where: { incidentId }, orderBy: { createdAt: 'asc' } });
++const auditTypes = async (incidentId: string) => (await audits(incidentId)).map((a) => a.eventType);
++const notifications = (incidentId: string) =>
++  db().notification.findMany({ where: { incidentId }, orderBy: { createdAt: 'asc' } });
++const recordedKeys = async (incidentId: string) =>
++  (await notifications(incidentId)).map((n) => n.idempotencyKey).sort();
++const outboxNotificationCount = () =>
++  db().outboxEvent.count({ where: { eventType: 'NOTIFICATION_REQUESTED' } });
++
++describe('thresholds and the 80 % warning', () => {
++  it('records nothing before 80 % of the response window', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++
++    expect(await evaluateIncident(incident.id, { now: at(8 * MIN - 1) })).toBe(0);
++    expect(await notifications(incident.id)).toHaveLength(0);
++    expect(await audits(incident.id)).toHaveLength(0);
++  });
++
++  it('records the warning once at 80 %: SLA_WARNING audit (kind RESPONSE), WARNING notification, no state change', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++
++    expect(await evaluateIncident(incident.id, { now: at(8 * MIN) })).toBe(1);
++    expect(await evaluateIncident(incident.id, { now: at(9 * MIN) })).toBe(0);
++
++    const events = await audits(incident.id);
++    expect(events.map((e) => [e.eventType, e.actor, e.metadata])).toEqual([
++      ['SLA_WARNING', null, { kind: 'RESPONSE' }],
++    ]);
++    const rows = await notifications(incident.id);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({
++      eventType: 'SLA_WARNING',
++      notificationType: 'WARNING',
++      idempotencyKey: `SLA_WARNING:${incident.id}:RESPONSE_WARNING`,
++    });
++    expect(await outboxNotificationCount()).toBe(1);
++
++    const after = await db().incident.findUniqueOrThrow({ where: { id: incident.id } });
++    expect(after).toMatchObject({ status: 'OPEN', currentAssigneeId: null, severity: 'P1' });
++    expect(after.updatedAt).toEqual(incident.updatedAt);
++  });
++
++  it('a severity change moves the threshold without resetting the clock', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident({ severity: 'P3' }); // 60 min response window
++
++    expect(await evaluateIncident(incident.id, { now: at(9 * MIN) })).toBe(0);
++
++    await db().incident.update({ where: { id: incident.id }, data: { severity: 'P0' } }); // 5 min
++    // 9 minutes after creation, the P0 window is long over: warning, breach and the escalation chain.
++    expect(await evaluateIncident(incident.id, { now: at(9 * MIN) })).toBeGreaterThanOrEqual(2);
++    expect(await recordedKeys(incident.id)).toEqual(
++      expect.arrayContaining([
++        `RESPONSE_BREACH:${incident.id}:RESPONSE_BREACH`,
++        `SLA_WARNING:${incident.id}:RESPONSE_WARNING`,
++      ]),
++    );
++    expect(await evaluateIncident(incident.id, { now: at(9 * MIN) })).toBe(0);
++  });
++});
++
++describe('milestone matrix (audit / notification)', () => {
++  it('breach: notification (ALERT) and no audit event; incident unchanged', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident({ status: 'MITIGATING' }); // only the resolution clock runs
++
++    await evaluateIncident(incident.id, { now: at(60 * MIN + 1) });
++
++    expect(
++      (await notifications(incident.id)).map((n) => [n.eventType, n.notificationType]),
++    ).toEqual(
++      expect.arrayContaining([
++        ['SLA_WARNING', 'WARNING'],
++        ['RESOLUTION_BREACH', 'ALERT'],
++      ]),
++    );
++    // Only the warning writes an audit event; the breach never does.
++    expect(await auditTypes(incident.id)).toEqual(['SLA_WARNING']);
++    expect((await audits(incident.id))[0].metadata).toEqual({ kind: 'RESOLUTION' });
++    const after = await db().incident.findUniqueOrThrow({ where: { id: incident.id } });
++    expect(after.status).toBe('MITIGATING');
++  });
++
++  it('resolution breach does not escalate and changes no state', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident({ status: 'ACKNOWLEDGED', acknowledgedAt: T0 });
++
++    await evaluateIncident(incident.id, { now: at(61 * MIN) });
++
++    const types = (await notifications(incident.id)).map((n) => n.eventType).sort();
++    expect(types).toEqual(['RESOLUTION_BREACH', 'SLA_WARNING']);
++    expect(await auditTypes(incident.id)).toEqual(['SLA_WARNING']);
++  });
++
++  it('response breach escalates L1→L2→L3→L4 in policy order with audit + ESCALATED_Ln notification each', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++
++    await evaluateIncident(incident.id, { now: at(11 * MIN) });
++
++    const events = await audits(incident.id);
++    expect(events.map((e) => e.eventType)).toEqual([
++      'SLA_WARNING',
++      'ESCALATED_L1',
++      'ESCALATED_L2',
++      'ESCALATED_L3',
++      'ESCALATED_L4',
++    ]);
++    expect(events.every((e) => e.actor === null)).toBe(true);
++    expect(
++      events.slice(1).map((e) => (e.metadata as { notifiedUser: string }).notifiedUser),
++    ).toEqual([w.eng1.id, w.eng2.id, w.lead.id, w.admin.id]);
++
++    const rows = await notifications(incident.id);
++    expect(rows.map((n) => n.eventType).sort()).toEqual([
++      'ESCALATED_L1',
++      'ESCALATED_L2',
++      'ESCALATED_L3',
++      'ESCALATED_L4',
++      'RESPONSE_BREACH',
++      'SLA_WARNING',
++    ]);
++    for (const row of rows.filter((n) => n.eventType.startsWith('ESCALATED_'))) {
++      expect(row.notificationType).toBe('WARNING');
++      // team members ∪ the policy's fallback admin (recipients per SLICE-09)
++      expect([...row.recipients].sort()).toEqual(
++        [w.eng1.id, w.eng2.id, w.lead.id, w.admin.id].sort(),
++      );
++    }
++    expect(await outboxNotificationCount()).toBe(6);
++
++    // Escalation never assigns and never changes the state.
++    const after = await db().incident.findUniqueOrThrow({ where: { id: incident.id } });
++    expect(after).toMatchObject({
++      status: 'OPEN',
++      currentAssigneeId: null,
++      acknowledgedById: null,
++      acknowledgedTimestamp: null,
++      severity: 'P1',
++    });
++    expect(after.updatedAt).toEqual(incident.updatedAt);
++
++    // The response chain is over: only the two resolution milestones can still be recorded.
++    expect(await evaluateIncident(incident.id, { now: at(500 * MIN) })).toBe(2);
++    expect(await evaluateIncident(incident.id, { now: at(501 * MIN) })).toBe(0);
++  });
++});
++
++describe('invalid or deactivated responder', () => {
++  it('records ESCALATION_FAILED (notification only), skips the audit event and attempts the next level at once', async () => {
++    const w = await slaWorld();
++    await db().user.update({ where: { id: w.eng2.id }, data: { status: 'DEACTIVATED' } });
++    const incident = await w.incident();
++
++    await evaluateIncident(incident.id, { now: at(11 * MIN) });
++
++    expect(await auditTypes(incident.id)).toEqual([
++      'SLA_WARNING',
++      'ESCALATED_L1',
++      'ESCALATED_L3',
++      'ESCALATED_L4',
++    ]);
++    const failure = (await notifications(incident.id)).find(
++      (n) => n.eventType === 'ESCALATION_FAILED',
++    );
++    expect(failure).toMatchObject({
++      notificationType: 'ALERT',
++      idempotencyKey: `ESCALATION_FAILED:${incident.id}:ESCALATION_FAILURE_2`,
++    });
++    expect(
++      (await notifications(incident.id)).filter((n) => n.eventType === 'ESCALATED_L2'),
++    ).toEqual([]);
++
++    const after = await db().incident.findUniqueOrThrow({ where: { id: incident.id } });
++    expect(after).toMatchObject({ status: 'OPEN', currentAssigneeId: null, severity: 'P1' });
++  });
++
++  it.each([
++    ['level1 has the wrong role', 'eng1', { role: 'TEAM_LEAD' as const }],
++    ['level3 left the team', 'lead', { teamId: null }],
++  ])('%s', async (_name, who, change) => {
++    const w = await slaWorld();
++    await db().user.update({ where: { id: w[who as 'eng1' | 'lead'].id }, data: change });
++    const incident = await w.incident();
++
++    await evaluateIncident(incident.id, { now: at(11 * MIN) });
++
++    const failures = (await notifications(incident.id)).filter(
++      (n) => n.eventType === 'ESCALATION_FAILED',
++    );
++    expect(failures).toHaveLength(1);
++    expect((await auditTypes(incident.id)).filter((t) => t.startsWith('ESCALATED_'))).toHaveLength(
++      3,
++    );
++  });
++
++  it('a failure at the last level ends the chain', async () => {
++    const w = await slaWorld();
++    await db().user.update({ where: { id: w.admin.id }, data: { status: 'DEACTIVATED' } });
++    const incident = await w.incident();
++
++    await evaluateIncident(incident.id, { now: at(11 * MIN) });
++
++    expect(await auditTypes(incident.id)).toEqual([
++      'SLA_WARNING',
++      'ESCALATED_L1',
++      'ESCALATED_L2',
++      'ESCALATED_L3',
++    ]);
++    expect(await recordedKeys(incident.id)).toContain(
++      `ESCALATION_FAILED:${incident.id}:ESCALATION_FAILURE_4`,
++    );
++    expect(await evaluateIncident(incident.id, { now: at(12 * MIN) })).toBe(0);
++  });
++
++  it('every level failing records one failure per level and nothing else changes', async () => {
++    const w = await slaWorld();
++    await db().user.updateMany({ data: { status: 'DEACTIVATED' } });
++    const incident = await w.incident();
++
++    await evaluateIncident(incident.id, { now: at(11 * MIN) });
++
++    const rows = await notifications(incident.id);
++    expect(rows.filter((n) => n.eventType === 'ESCALATION_FAILED')).toHaveLength(4);
++    expect(await auditTypes(incident.id)).toEqual(['SLA_WARNING']);
++  });
++});
++
++describe('stop conditions', () => {
++  it.each(['ACKNOWLEDGED', 'MITIGATING', 'RESOLVED', 'CLOSED'] as const)(
++    'no response warning, breach or escalation for an incident that is %s',
++    async (status) => {
++      const w = await slaWorld();
++      const incident = await w.incident({ status, acknowledgedAt: T0 });
++
++      await evaluateIncident(incident.id, { now: at(11 * MIN) });
++
++      const types = (await notifications(incident.id)).map((n) => n.eventType);
++      expect(types).not.toContain('RESPONSE_BREACH');
++      expect(types.filter((t) => t.startsWith('ESCALATED_'))).toEqual([]);
++      expect(await recordedKeys(incident.id)).not.toContain(
++        `SLA_WARNING:${incident.id}:RESPONSE_WARNING`,
++      );
++    },
++  );
++
++  it('resolved and closed incidents get no resolution milestones either', async () => {
++    const w = await slaWorld();
++    const resolved = await w.incident({ status: 'RESOLVED' });
++    expect(await evaluateIncident(resolved.id, { now: at(1000 * MIN) })).toBe(0);
++  });
++
++  it('escalation resumes from the next unrecorded level, and stops when an acknowledgement committed', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++    // A crash left the breach and level 1 recorded.
++    await runInTransaction(async (tx) => {
++      for (const [eventType, occurrenceId] of [
++        ['SLA_WARNING', 'RESPONSE_WARNING'],
++        ['RESPONSE_BREACH', 'RESPONSE_BREACH'],
++        ['ESCALATED_L1', 'ESCALATION_LEVEL_1'],
++      ] as const) {
++        await enqueueNotification(tx, { eventType, occurrenceId, incidentId: incident.id });
++      }
++    });
++
++    await db().incident.update({
++      where: { id: incident.id },
++      data: { status: 'ACKNOWLEDGED', acknowledgedTimestamp: T0, acknowledgedById: w.eng1.id },
++    });
++    expect(await evaluateIncident(incident.id, { now: at(11 * MIN) })).toBe(0);
++
++    // An unassign returns it to OPEN against the original deadline: levels 2-4 follow, 1 is not repeated.
++    await db().incident.update({
++      where: { id: incident.id },
++      data: { status: 'OPEN', acknowledgedTimestamp: null, acknowledgedById: null },
++    });
++    expect(await evaluateIncident(incident.id, { now: at(11 * MIN) })).toBe(3);
++    expect(await auditTypes(incident.id)).toEqual(['ESCALATED_L2', 'ESCALATED_L3', 'ESCALATED_L4']);
++  });
++
++  it('race: an acknowledgement that commits while the evaluation waits for the lock wins (no escalation)', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++
++    let locked!: () => void;
++    const lockHeld = new Promise<void>((resolve) => (locked = resolve));
++    const acknowledge = runInTransaction(async (tx) => {
++      await tx.$queryRaw`SELECT "id" FROM "Incident" WHERE "id" = ${incident.id}::uuid FOR UPDATE`;
++      locked();
++      await new Promise((resolve) => setTimeout(resolve, 300));
++      await tx.incident.update({
++        where: { id: incident.id },
++        data: {
++          status: 'ACKNOWLEDGED',
++          acknowledgedTimestamp: new Date(),
++          acknowledgedById: w.eng1.id,
++        },
++      });
++    });
++    await lockHeld;
++    const evaluation = evaluateIncident(incident.id, { now: at(11 * MIN) });
++    await Promise.all([acknowledge, evaluation]);
++
++    const types = (await notifications(incident.id)).map((n) => n.eventType);
++    expect(types).not.toContain('RESPONSE_BREACH');
++    expect(types.filter((t) => t.startsWith('ESCALATED_'))).toEqual([]);
++    expect(await auditTypes(incident.id)).toEqual([]);
++  });
++});
++
++describe('once-only recording', () => {
++  it('five concurrent evaluations of one incident produce exactly one record, audit event and notification per milestone', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++
++    await Promise.all(
++      Array.from({ length: 5 }, () => evaluateIncident(incident.id, { now: at(11 * MIN) })),
++    );
++
++    const keys = await recordedKeys(incident.id);
++    expect(keys).toHaveLength(6);
++    expect(new Set(keys).size).toBe(6);
++    expect(await auditTypes(incident.id)).toEqual([
++      'SLA_WARNING',
++      'ESCALATED_L1',
++      'ESCALATED_L2',
++      'ESCALATED_L3',
++      'ESCALATED_L4',
++    ]);
++    expect(await outboxNotificationCount()).toBe(6);
++  });
++
++  it('the database rejects a second insert of the same identity', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++    await evaluateIncident(incident.id, { now: at(8 * MIN) });
++    const [existing] = await notifications(incident.id);
++
++    await expect(
++      db().notification.create({
++        data: {
++          notificationType: 'WARNING',
++          eventType: 'SLA_WARNING',
++          idempotencyKey: existing.idempotencyKey,
++          recipients: [],
++          incidentId: incident.id,
++        },
++      }),
++    ).rejects.toMatchObject({ code: 'P2002' });
++  });
++
++  it('a delayed job and the scanner for the same milestone record it once', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++    const scheduler: DelayedJobScheduler = { scheduleDelayed: async () => undefined };
++    const handler = createSlaMilestoneProcessor({ now: at(8 * MIN), scheduler });
++
++    await handler({
++      name: 'SLA_MILESTONE',
++      data: { incidentId: incident.id, milestone: 'RESPONSE_WARNING' },
++      attempt: 1,
++    });
++    const scan = await runSlaScan({ now: at(8 * MIN) });
++
++    expect(scan).toEqual({ candidates: 0, recorded: 0, failed: 0 });
++    expect(await recordedKeys(incident.id)).toHaveLength(1);
++    expect(await auditTypes(incident.id)).toEqual(['SLA_WARNING']);
++    expect(await outboxNotificationCount()).toBe(1);
++  });
++
++  it('is atomic: a failed audit append leaves no notification, no outbox event and no audit event; the retry records once', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++    jest.spyOn(auditModule, 'appendAuditEvent').mockRejectedValueOnce(new Error('boom'));
++
++    await expect(evaluateIncident(incident.id, { now: at(8 * MIN) })).rejects.toThrow('boom');
++    expect(await notifications(incident.id)).toHaveLength(0);
++    expect(await audits(incident.id)).toHaveLength(0);
++    expect(await outboxNotificationCount()).toBe(0);
++
++    expect(await evaluateIncident(incident.id, { now: at(8 * MIN) })).toBe(1);
++    expect(await recordedKeys(incident.id)).toHaveLength(1);
++    expect(await auditTypes(incident.id)).toEqual(['SLA_WARNING']);
++  });
++});
++
++describe('PostgreSQL scanner (downtime recovery)', () => {
++  it('records every overdue milestone once after the delayed jobs were lost, then goes quiet', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++
++    const first = await runSlaScan({ now: at(11 * MIN) });
++    expect(first).toMatchObject({ candidates: 1, failed: 0 });
++    expect(first.recorded).toBe(6);
++    expect(await auditTypes(incident.id)).toEqual([
++      'SLA_WARNING',
++      'ESCALATED_L1',
++      'ESCALATED_L2',
++      'ESCALATED_L3',
++      'ESCALATED_L4',
++    ]);
++
++    expect(await runSlaScan({ now: at(11 * MIN) })).toEqual({
++      candidates: 0,
++      recorded: 0,
++      failed: 0,
++    });
++    expect(await recordedKeys(incident.id)).toHaveLength(6);
++  });
++
++  it('resumes an interrupted chain from the next unrecorded level', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++    await runInTransaction(async (tx) => {
++      for (const [eventType, occurrenceId] of [
++        ['SLA_WARNING', 'RESPONSE_WARNING'],
++        ['RESPONSE_BREACH', 'RESPONSE_BREACH'],
++        ['ESCALATED_L1', 'ESCALATION_LEVEL_1'],
++        ['ESCALATED_L2', 'ESCALATION_LEVEL_2'],
++      ] as const) {
++        await enqueueNotification(tx, { eventType, occurrenceId, incidentId: incident.id });
++      }
++    });
++
++    expect(await runSlaScan({ now: at(12 * MIN) })).toMatchObject({ candidates: 1, recorded: 2 });
++    expect(await auditTypes(incident.id)).toEqual(['ESCALATED_L3', 'ESCALATED_L4']);
++  });
++
++  it('SQL candidates agree with the pure calculator for every state and moment', async () => {
++    const w = await slaWorld();
++    const cases: {
++      status: 'OPEN' | 'ACKNOWLEDGED' | 'MITIGATING' | 'RESOLVED' | 'CLOSED';
++      at: number;
++    }[] = [];
++    for (const status of ['OPEN', 'ACKNOWLEDGED', 'MITIGATING', 'RESOLVED', 'CLOSED'] as const) {
++      for (const minutes of [
++        0,
++        8 * MIN - 1,
++        8 * MIN,
++        10 * MIN,
++        10 * MIN + 1,
++        48 * MIN,
++        60 * MIN,
++        60 * MIN + 1,
++      ]) {
++        cases.push({ status, at: minutes });
++      }
++    }
++
++    for (const c of cases) {
++      await resetState();
++      const w2 = await slaWorld();
++      const incident = await w2.incident({
++        status: c.status,
++        acknowledgedAt: c.status === 'OPEN' ? null : T0,
++      });
++      const now = at(c.at)();
++      const snapshot = (await findSlaIncident(db(), incident.id, { lock: false }))!;
++      const recorded = await findRecordedMilestones(db(), incident.id);
++      const expected = nextStep(snapshot, now, recorded) !== null;
++
++      const candidates = await findScanCandidates(db(), now);
++      expect({ ...c, candidate: candidates.includes(incident.id) }).toEqual({
++        ...c,
++        candidate: expected,
++      });
++    }
++    expect(w.team.id).toBeDefined();
++  });
++
++  it('candidates drop out as soon as each milestone is recorded (one at a time)', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++    const now = at(11 * MIN)();
++    const present = async () => (await findScanCandidates(db(), now)).includes(incident.id);
++
++    expect(await present()).toBe(true);
++    await evaluateIncident(incident.id, { now: () => now });
++    expect(await present()).toBe(false);
++    // A recorded key survives for every milestone name.
++    expect(ALL_MILESTONES.map((m) => milestoneKey(incident.id, m))).toHaveLength(12);
++  });
++
++  it('one failing incident does not stop the scan; the next scan retries it until it succeeds', async () => {
++    const w = await slaWorld();
++    const bad = await w.incident();
++    const good = await w.incident({ createdAt: new Date(T0.getTime() + 1000) });
++    const real = evaluateModule.evaluateIncident;
++    let failBad = true;
++    jest.spyOn(evaluateModule, 'evaluateIncident').mockImplementation(async (id, deps) => {
++      if (id === bad.id && failBad) throw new Error('transient');
++      return real(id, deps);
++    });
++
++    const first = await runSlaScan({ now: at(12 * MIN) });
++    expect(first.failed).toBe(1);
++    expect(await notifications(good.id)).not.toHaveLength(0);
++    expect(await notifications(bad.id)).toHaveLength(0);
++
++    failBad = false;
++    const second = await runSlaScan({ now: at(12 * MIN) });
++    expect(second).toMatchObject({ candidates: 1, failed: 0 });
++    expect(await recordedKeys(bad.id)).toHaveLength(6);
++  });
++});
++
++describe('scheduling of delayed jobs (SLA_EVALUATION_REQUESTED consumer)', () => {
++  class RecordingScheduler implements DelayedJobScheduler {
++    jobs: DelayedJob[] = [];
++    async scheduleDelayed(_queue: string, job: DelayedJob): Promise<void> {
++      this.jobs.push(job);
++    }
++  }
++  const run = async (scheduler: RecordingScheduler, incidentId: string, nowMs: number) =>
++    createSlaEvaluationProcessor({ scheduler, now: at(nowMs) })({
++      outboxEventId: randomUUID(),
++      eventType: 'SLA_EVALUATION_REQUESTED',
++      aggregateType: 'INCIDENT',
++      aggregateId: incidentId,
++      payload: { incidentId, requestId: 'req-sla' },
++      attempt: 1,
++    });
++
++  it('schedules the four milestones at their precise instants with deterministic ids', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++    const scheduler = new RecordingScheduler();
++
++    await run(scheduler, incident.id, 0);
++
++    const byId = Object.fromEntries(scheduler.jobs.map((j) => [j.jobId, j.delayMs]));
++    expect(byId).toEqual({
++      [`sla-${incident.id}-RESPONSE_WARNING`]: 8 * MIN,
++      [`sla-${incident.id}-RESPONSE_BREACH`]: 10 * MIN + 1,
++      [`sla-${incident.id}-RESOLUTION_WARNING`]: 48 * MIN,
++      [`sla-${incident.id}-RESOLUTION_BREACH`]: 60 * MIN + 1,
++    });
++    expect(scheduler.jobs[0].name).toBe('SLA_MILESTONE');
++    expect(scheduler.jobs[0].data).toEqual({
++      incidentId: incident.id,
++      milestone: 'RESPONSE_WARNING',
++    });
++  });
++
++  it('after a severity change the same ids are scheduled again with the new delays (replace, not add)', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++    const scheduler = new RecordingScheduler();
++    await run(scheduler, incident.id, 0);
++
++    await db().incident.update({ where: { id: incident.id }, data: { severity: 'P0' } });
++    const second = new RecordingScheduler();
++    await run(second, incident.id, 0);
++
++    const delay = (jobs: DelayedJob[], milestone: string) =>
++      jobs.find((j) => j.data.milestone === milestone)!.delayMs;
++    expect(delay(scheduler.jobs, 'RESPONSE_BREACH')).toBe(10 * MIN + 1);
++    expect(delay(second.jobs, 'RESPONSE_BREACH')).toBe(5 * MIN + 1);
++    expect(second.jobs.map((j) => j.jobId).sort()).toEqual(
++      scheduler.jobs.map((j) => j.jobId).sort(),
++    );
++  });
++
++  it('records what is already overdue first and schedules only what is still ahead', async () => {
++    const w = await slaWorld();
++    const incident = await w.incident();
++    const scheduler = new RecordingScheduler();
++
++    await run(scheduler, incident.id, 11 * MIN);
++
++    expect(await auditTypes(incident.id)).toContain('ESCALATED_L4');
++    expect(scheduler.jobs.map((j) => j.data.milestone).sort()).toEqual([
++      'RESOLUTION_BREACH',
++      'RESOLUTION_WARNING',
++    ]);
++  });
++
++  it('schedules no response job for an acknowledged incident and caps an enormous delay', async () => {
++    const w = await slaWorld({ sla: { P1ResolutionSlaMinutes: 2_147_483_647 } });
++    const incident = await w.incident({ status: 'ACKNOWLEDGED', acknowledgedAt: T0 });
++    const scheduler = new RecordingScheduler();
++
++    await run(scheduler, incident.id, 0);
++
++    expect(scheduler.jobs.map((j) => j.data.milestone).sort()).toEqual([
++      'RESOLUTION_BREACH',
++      'RESOLUTION_WARNING',
++    ]);
++    expect(scheduler.jobs.every((j) => j.delayMs <= 2_147_483_647)).toBe(true);
++  });
++});

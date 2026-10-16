@@ -12,7 +12,7 @@ Chat       = execution session
 Repository = implementation state
 ```
 
-A chat has no memory of earlier chats. Everything it needs about *what to build* is in the slice; everything about *how to work* is in `AGENTS.md`; everything about *where the project is* is in `PROJECT_STATUS.md` and the repository.
+A chat has no memory of earlier chats. Everything it needs about _what to build_ is in the slice; everything about _how to work_ is in `AGENTS.md`; everything about _where the project is_ is in `PROJECT_STATUS.md` and the repository.
 
 ## 2. Inputs
 

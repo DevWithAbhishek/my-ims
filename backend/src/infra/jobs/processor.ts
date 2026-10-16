@@ -8,9 +8,9 @@ import { executionRetryDelayMs } from './backoff.js';
 import { announceDeadLetter } from './dead-letter.js';
 import { classifyError, NonRetryableJobError, sanitizeError } from './errors.js';
 import { isOutboxEventType, queueForEvent, validatePayload, type QueueName } from './events.js';
-import type { QueueGateway } from './gateway.js';
+import { DELAYED_JOB_PREFIX, type QueueGateway } from './gateway.js';
 import { deadLetterExecution, markSuccess, recordExecutionRetry } from './outbox.repository.js';
-import type { OutboxProcessor } from './registry.js';
+import type { DelayedJobProcessor, OutboxProcessor } from './registry.js';
 import { requestIdOf } from './relay.js';
 
 export type WorkerConfig = Pick<
@@ -149,15 +149,69 @@ export async function processOutboxJob(
   }
 }
 
+/**
+ * Wrapper around a delayed-job consumer. Retryable failures are rethrown so BullMQ retries them
+ * (bounded attempts, the same backoff as outbox jobs); a non-retryable failure or the last failed
+ * attempt is logged at `error` and ends the job. There is no outbox row to dead-letter.
+ */
+export async function processDelayedJob(
+  job: JobLike & { name: string },
+  queue: QueueName,
+  handler: DelayedJobProcessor,
+  deps: { config: WorkerConfig },
+): Promise<void> {
+  const name = job.name.slice(DELAYED_JOB_PREFIX.length);
+  const attempt = job.attemptsMade + 1;
+  const maxAttempts = job.opts.attempts ?? deps.config.executionAttempts;
+  const fields = { queue, delayedJob: name, attempt, maxAttempts };
+  const started = Date.now();
+
+  const rawData = job.data as unknown;
+  const data: Record<string, string> = {};
+  if (typeof rawData === 'object' && rawData !== null) {
+    for (const [key, value] of Object.entries(rawData)) {
+      if (typeof value === 'string') data[key] = value;
+    }
+  }
+
+  try {
+    await handler({ name, data, attempt });
+    logger.info(
+      { ...fields, outcome: 'success', durationMs: Date.now() - started },
+      'Delayed job completed',
+    );
+  } catch (error) {
+    const { retryable, errorClass } = classifyError(error);
+    const lastError = sanitizeError(error);
+    if (!retryable || attempt >= maxAttempts) {
+      logger.error(
+        { ...fields, errorClass, retryable, outcome: 'delayed_job_failed', lastError },
+        'Delayed job failed for good',
+      );
+      throw new UnrecoverableError(lastError);
+    }
+    logger.warn(
+      { ...fields, errorClass, retryable, outcome: 'retry_scheduled', lastError },
+      'Delayed job failed; will retry',
+    );
+    throw error;
+  }
+}
+
 /** One BullMQ worker for `queue`, running the common wrapper around `processor`. */
 export function createJobWorker(
   queue: QueueName,
   processor: OutboxProcessor,
   deps: { config: WorkerConfig; gateway: QueueGateway },
   connection: Redis,
+  delayedProcessor?: DelayedJobProcessor,
 ): Worker {
   const limit = deps.config.queueRateLimits[queue];
-  const worker = new Worker(queue, (job) => processOutboxJob(job, queue, processor, deps), {
+  const run = (job: Job): Promise<void> =>
+    delayedProcessor && job.name.startsWith(DELAYED_JOB_PREFIX)
+      ? processDelayedJob(job, queue, delayedProcessor, deps)
+      : processOutboxJob(job, queue, processor, deps);
+  const worker = new Worker(queue, run, {
     connection,
     concurrency: deps.config.workerConcurrency,
     limiter: { max: limit.max, duration: limit.durationMs },

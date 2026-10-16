@@ -1,7 +1,15 @@
-import { getJobsConfig, getNotificationsConfig } from '../config/env.js';
+import { getJobsConfig, getNotificationsConfig, getSlaConfig } from '../config/env.js';
 import { QUEUES } from '../infra/jobs/events.js';
-import { registerProcessor } from '../infra/jobs/registry.js';
+import { createBullmqGateway } from '../infra/jobs/gateway.js';
+import { startLoop } from '../infra/jobs/loop.js';
+import { registerDelayedProcessor, registerProcessor } from '../infra/jobs/registry.js';
 import { startJobsRuntime, type JobsRuntime } from '../infra/jobs/runtime.js';
+import { createRedisConnection } from '../infra/redis/redis.js';
+import {
+  createSlaEvaluationProcessor,
+  createSlaMilestoneProcessor,
+  runSlaScan,
+} from '../modules/incidents/index.js';
 import {
   createNotificationProcessor,
   createSendGridEmailProvider,
@@ -14,6 +22,7 @@ import {
 export function startWorkers(): JobsRuntime {
   const jobs = getJobsConfig();
   const email = getNotificationsConfig();
+  const sla = getSlaConfig();
 
   registerProcessor(
     QUEUES.NOTIFICATIONS,
@@ -28,5 +37,25 @@ export function startWorkers(): JobsRuntime {
     }),
   );
 
-  return startJobsRuntime(jobs);
+  // SLICE-07: the same gateway publishes outbox events and schedules the delayed milestone jobs.
+  const connection = createRedisConnection('general');
+  const gateway = createBullmqGateway(connection, jobs.executionAttempts);
+  registerProcessor(QUEUES.SLA_ESCALATION, createSlaEvaluationProcessor({ scheduler: gateway }));
+  registerDelayedProcessor(
+    QUEUES.SLA_ESCALATION,
+    createSlaMilestoneProcessor({ scheduler: gateway }),
+  );
+
+  const runtime = startJobsRuntime(jobs, gateway);
+  const scanner = startLoop('sla-scan', sla.scanIntervalMs, async () => {
+    await runSlaScan();
+  });
+
+  return {
+    async stop() {
+      await scanner.stop();
+      await runtime.stop();
+      connection.disconnect();
+    },
+  };
 }

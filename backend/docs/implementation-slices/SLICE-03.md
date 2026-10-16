@@ -1,25 +1,33 @@
 # SLICE-03 — Alert Source Trust Gate
 
 ## 1. Purpose
+
 Authenticate and protect the single entry point for external alerts, `POST /webhooks/alerts/:alertSourceId`, before any alert is processed: size limit, source signature, timestamp freshness, replay protection, per-source rate limiting, and request-envelope validation. Hand verified, bounded input to ingestion (SLICE-04). Seed the `AlertSource` rows, including the per-source configuration that SLICE-04 reads.
 
 ## 2. Scope
+
 ### In Scope
+
 The webhook request pipeline steps 1–6 (below), raw-body capture, HMAC verification, replay store, rate limiting with block ladder and the Admin notification at the final stage, fail-closed behavior when Redis is unavailable, and the seed script for `AlertSource` rows (secret + severity mapping).
+
 ### Out of Scope
+
 Per-alert processing, normalization, identity, dedup, severity mapping logic and persistence (SLICE-04). Alert-source CRUD/management APIs (none exist; sources are seeded/out-of-band). Delivery of the Admin notification (SLICE-09).
 
 ## 3. Dependencies
+
 From SLICE-00: Redis client, error envelope. From SLICE-08: the in-transaction outbox write contract `enqueueOutbox(tx, …)` and the outbox event catalog (`NOTIFICATION_REQUESTED`, routed to the `notifications` queue). If the function does not yet exist, create only the minimal function with that signature in its owning location and report it. The seed's audit write uses `appendAuditEvent(tx, …)` and the `ALERT_SOURCE_UPDATED` enum value owned by SLICE-06 (create only those minimal pieces if absent, and report it).
 
 **Provided to SLICE-04:** a verified context `{ alertSource (including its `configuration`), items: unknown[] (≤100, in request order), rateLimitedIndices }`.
 
 ## 4. Capability Behavior
+
 **Authentication model.** No JWT. `alertSourceId` (path) selects an `AlertSource`; the caller proves it holds the source secret by signing the request.
 
 **Required headers.** `Content-Type: application/json`; `X-Signature: sha256=<hex>`; `X-Timestamp: <unix seconds>`; `X-Request-Id` optional. `X-Signature` = HMAC-SHA256 of the string `"<X-Timestamp>.<raw body>"` using the source secret, computed over the **raw request bytes** (capture the raw body; do not re-serialize). The secret is read from `AlertSource.configuration.signingSecret` and is never returned, logged, audited, or placed in an error message. Use constant-time comparison; for an unknown source still perform a dummy HMAC so timing is similar.
 
 **Request-level processing order (first failing step decides the response):**
+
 1. Body ≤ 1 MB → else `413 PAYLOAD_TOO_LARGE`.
 2. Source exists, is `ACTIVE`, and signature is valid — **one code for all three and for a malformed `alertSourceId`** → `401 SOURCE_AUTH_FAILED`. A missing or unparseable `X-Signature`/`X-Timestamp` cannot produce a valid signature and is the same `401 SOURCE_AUTH_FAILED`.
 3. `X-Timestamp` within ±300 s of server time → else `401 REQUEST_STALE` (retryable after re-signing).
@@ -50,27 +58,35 @@ Secrets come from environment/config at seed time, never from source code. `seve
 **Seed updates are audited.** Re-running the seed against an **existing** source that changes its `configuration` (for example rotating `signingSecret` or editing `severityMapping`) is the only out-of-band configuration change, and it appends audit `ALERT_SOURCE_UPDATED` in the same transaction as the update: `actor = null` (the seed runs outside any user session), `incidentId = null`, `metadata` = the alert source id and the **names of the changed configuration keys only** — never their values, and never the signing secret. Creating a new source writes no audit event. The seed identifies an existing source by the identifier it seeds (implementation-defined).
 
 ## 5. Domain & Data Context
+
 `AlertSource`: `id` uuid(v7), `name`, `sourceType` (string), `configuration` (JSON; keys `signingSecret`, `severityMapping` as above), `status` (`ACTIVE|DEACTIVATED`, default `ACTIVE`), timestamps; index `(sourceType, status)`. `Alert` rows reference `alertSourceId` (SLICE-04). Redis holds replay keys and rate-limit/ladder/block state. This Redis state is intentionally ephemeral: if Redis is wiped, replay records, rate-limit counters, ladder memory and blocks reset (counters are ephemeral by design; Redis is never the source of truth for business state).
 
 ## 6. API Contract
+
 **`POST /webhooks/alerts/:alertSourceId`** (identifier W1). Auth: source signature (no JWT). Path `alertSourceId` uuid of an `ACTIVE` seeded source. Body ≤ 1 MB: `{ "alerts": CommonAlertInputDto[] }` with 1–100 elements (item schema in SLICE-04). Request-level errors owned by this slice: `413 PAYLOAD_TOO_LARGE`, `401 SOURCE_AUTH_FAILED`, `401 REQUEST_STALE`, `409 REPLAY_DETECTED`, `429 RATE_LIMITED` (+`Retry-After`), `400 BAD_REQUEST`, `422 VALIDATION_FAILED`, `503 DEPENDENCY_UNAVAILABLE` (+`Retry-After`; sender should retry), `500 INTERNAL_ERROR`. Success and per-item results are SLICE-04's. Errors use the standard envelope.
 
 ## 7. Authorization & Security
+
 Team isolation is derived later (alert → service → team); the caller cannot choose it. Never reveal whether a source exists or is deactivated. Signing secrets never leave the process. Reject oversize bodies without buffering beyond the limit.
 
 ## 8. Consistency & Concurrency
+
 Replay marking is an atomic set-if-absent so two identical simultaneous requests yield exactly one success and one `409 REPLAY_DETECTED`. Rate-limit counters use atomic Redis operations; concurrent requests must not exceed the capacity.
 
 ## 9. Async / Events / Workers
+
 Only the final-stage Admin notice: one `NOTIFICATION_REQUESTED` outbox event as specified in §4, written inside a database transaction (never a direct queue publish, no email call here). Consumed by SLICE-09 via the outbox relay (SLICE-08).
 
 ## 10. Failure & Recovery
+
 Redis (replay store / rate limiter) unavailable → `503 DEPENDENCY_UNAVAILABLE` with `Retry-After`, nothing processed (fail closed). Database lookup failure → `503`. No partial acceptance: steps 1–6 never persist alerts. After a Redis wipe, replay protection and rate-limit state restart empty (ephemeral by design); the 300 s timestamp window still bounds old signed requests.
 
 ## 11. Implementation Surface
+
 Application: Alerts module — webhook controller, raw-body capture middleware (mounted before JSON parsing for this route), source repository, HMAC verifier, replay store, rate limiter, envelope validator, Admin-notice writer. Infrastructure: Redis keys. Seed script (including the audited update path). No schema change in this slice (the `AuditEventType` migration is owned by SLICE-06). Tests: unit (HMAC, timestamp window, ladder math), integration (Redis + PostgreSQL).
 
 ## 12. Verification Requirements
+
 - Valid signature accepted; wrong secret, tampered body, unknown/deactivated source, malformed id, missing headers → identical `401 SOURCE_AUTH_FAILED`.
 - Timestamp ±300 s boundaries → `REQUEST_STALE`.
 - Replay of the identical signed request → `409`; freshly signed same alerts → passes.
@@ -82,6 +98,7 @@ Application: Alerts module — webhook controller, raw-body capture middleware (
 - Seed re-run that changes an existing source's configuration appends exactly one `ALERT_SOURCE_UPDATED` (null actor, `incidentId = null`, metadata = source id + changed key names, no values/secret) atomically with the update; an unchanged re-run and the creation of a new source write none.
 
 ## 13. Completion Criteria
+
 - Steps 1–6 behave in the stated order with the stated codes; verified context (including `configuration`) is handed to SLICE-04.
 - Redis outage fails closed; replay and rate-limit state are atomic and Redis-backed; ladder and the `ALERT_SOURCE_BLOCKED` Admin notice work.
 - Seed script creates sources with `signingSecret` and `severityMapping` without committing secrets and audits configuration updates to existing sources; tests pass; typecheck/lint/format clean on touched files.
