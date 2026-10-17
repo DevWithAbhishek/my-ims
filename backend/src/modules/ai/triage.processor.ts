@@ -3,7 +3,6 @@ import { appendAuditEvent } from '../../infra/audit/append-audit-event.js';
 import { getPrisma, runInTransaction } from '../../infra/db/prisma.js';
 import {
   NonRetryableJobError,
-  RetryableJobError,
   type OutboxProcessor,
   type ProcessorInput,
 } from '../../infra/jobs/index.js';
@@ -11,6 +10,7 @@ import { classifyError } from '../../infra/jobs/errors.js';
 import { logger } from '../../shared/observability/logger.js';
 import { enqueueNotification } from '../notifications/index.js';
 import { AiProviderError, type AiProvider } from './ai-provider.js';
+import { toJobError } from './provider-job-error.js';
 import { projectAllowedFields } from './triage.allowlist.js';
 import { parseTriageOutput } from './triage.output.js';
 import { TRIAGE_INSTRUCTIONS } from './triage.prompt.js';
@@ -42,23 +42,6 @@ class InvalidModelOutputError extends Error {
     super('The model output failed validation');
     this.name = 'InvalidModelOutputError';
   }
-}
-
-/** Maps a provider failure to the SLICE-08 job errors, so the wrapper retries or dead-letters. */
-function toJobError(error: AiProviderError): Error {
-  if (!error.retryable) {
-    return new NonRetryableJobError(
-      'AUTHENTICATION_OR_CONFIGURATION',
-      `AI provider failure: ${error.kind}`,
-    );
-  }
-  const reason =
-    error.kind === 'RATE_LIMITED'
-      ? 'RATE_LIMITED'
-      : error.kind === 'NETWORK'
-        ? 'NETWORK'
-        : 'SERVICE_UNAVAILABLE';
-  return new RetryableJobError(reason, `AI provider failure: ${error.kind}`, error.retryAfterMs);
 }
 
 /**

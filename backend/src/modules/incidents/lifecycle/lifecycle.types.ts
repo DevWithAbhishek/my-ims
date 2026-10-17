@@ -30,6 +30,8 @@ export type IncidentChanges = Pick<
   | 'resolvedById'
   | 'resolvedTimestamp'
   | 'resolutionSummary'
+  | 'closedById'
+  | 'closedTimestamp'
 >;
 
 /** One audit event; the caller is its actor. Every event written also gets one notification. */

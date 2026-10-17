@@ -5,7 +5,11 @@ import { startLoop } from '../infra/jobs/loop.js';
 import { registerDelayedProcessor, registerProcessor } from '../infra/jobs/registry.js';
 import { startJobsRuntime, type JobsRuntime } from '../infra/jobs/runtime.js';
 import { createRedisConnection } from '../infra/redis/redis.js';
-import { createAlertTriageProcessor, createGeminiAiProvider } from '../modules/ai/index.js';
+import {
+  createAlertTriageProcessor,
+  createGeminiAiProvider,
+  createPostmortemProcessor,
+} from '../modules/ai/index.js';
 import {
   createSlaEvaluationProcessor,
   createSlaMilestoneProcessor,
@@ -39,17 +43,23 @@ export function startWorkers(): JobsRuntime {
     }),
   );
 
-  // SLICE-10: advisory alert triage; the provider is called here, never inside a transaction.
+  // The provider is called from the workers, never inside a transaction (SLICE-10, SLICE-11).
+  const aiProvider = createGeminiAiProvider({
+    apiKey: ai.geminiApiKey,
+    model: ai.geminiModel,
+    requestTimeoutMs: ai.requestTimeoutMs,
+  });
+
+  // SLICE-10: advisory alert triage.
   registerProcessor(
     QUEUES.AI_TRIAGE,
-    createAlertTriageProcessor({
-      provider: createGeminiAiProvider({
-        apiKey: ai.geminiApiKey,
-        model: ai.geminiModel,
-        requestTimeoutMs: ai.requestTimeoutMs,
-      }),
-      maxAttempts: jobs.executionAttempts,
-    }),
+    createAlertTriageProcessor({ provider: aiProvider, maxAttempts: jobs.executionAttempts }),
+  );
+
+  // SLICE-11: postmortem generation.
+  registerProcessor(
+    QUEUES.POSTMORTEM,
+    createPostmortemProcessor({ provider: aiProvider, maxAttempts: jobs.executionAttempts }),
   );
 
   // SLICE-07: the same gateway publishes outbox events and schedules the delayed milestone jobs.
