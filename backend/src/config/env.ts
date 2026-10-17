@@ -235,6 +235,41 @@ export function getNotificationsConfig(): NotificationsConfig {
   return cachedNotifications;
 }
 
+/** AI provider settings (SLICE-10, Gemini). Every value must be configured. */
+export interface AiConfig {
+  geminiApiKey: string;
+  geminiModel: string;
+  requestTimeoutMs: number;
+}
+
+const aiEnvSchema = z.object({
+  GEMINI_API_KEY: z.string().min(1),
+  GEMINI_MODEL: z.string().min(1),
+  AI_REQUEST_TIMEOUT_MS: positiveInt,
+});
+
+export function parseAiConfig(env: NodeJS.ProcessEnv): AiConfig {
+  const result = aiEnvSchema.safeParse(env);
+  if (!result.success) throw toConfigError(env, result.error.issues);
+
+  return {
+    geminiApiKey: result.data.GEMINI_API_KEY,
+    geminiModel: result.data.GEMINI_MODEL,
+    requestTimeoutMs: result.data.AI_REQUEST_TIMEOUT_MS,
+  };
+}
+
+let cachedAi: AiConfig | undefined;
+
+/** Validated AI provider settings, parsed once. Startup of the worker fails when any is missing. */
+export function getAiConfig(): AiConfig {
+  if (!cachedAi) {
+    dotenv.config({ quiet: true });
+    cachedAi = parseAiConfig(process.env);
+  }
+  return cachedAi;
+}
+
 /** SLA monitoring settings (SLICE-07). Every value must be configured. */
 export interface SlaConfig {
   /** How often the PostgreSQL scanner looks for crossed SLA thresholds that were not recorded. */

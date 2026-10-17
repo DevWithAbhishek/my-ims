@@ -1,10 +1,11 @@
-import { getJobsConfig, getNotificationsConfig, getSlaConfig } from '../config/env.js';
+import { getAiConfig, getJobsConfig, getNotificationsConfig, getSlaConfig } from '../config/env.js';
 import { QUEUES } from '../infra/jobs/events.js';
 import { createBullmqGateway } from '../infra/jobs/gateway.js';
 import { startLoop } from '../infra/jobs/loop.js';
 import { registerDelayedProcessor, registerProcessor } from '../infra/jobs/registry.js';
 import { startJobsRuntime, type JobsRuntime } from '../infra/jobs/runtime.js';
 import { createRedisConnection } from '../infra/redis/redis.js';
+import { createAlertTriageProcessor, createGeminiAiProvider } from '../modules/ai/index.js';
 import {
   createSlaEvaluationProcessor,
   createSlaMilestoneProcessor,
@@ -23,6 +24,7 @@ export function startWorkers(): JobsRuntime {
   const jobs = getJobsConfig();
   const email = getNotificationsConfig();
   const sla = getSlaConfig();
+  const ai = getAiConfig();
 
   registerProcessor(
     QUEUES.NOTIFICATIONS,
@@ -33,6 +35,19 @@ export function startWorkers(): JobsRuntime {
         requestTimeoutMs: email.sendTimeoutMs,
       }),
       processingWindowMs: jobs.processingWindowMs,
+      maxAttempts: jobs.executionAttempts,
+    }),
+  );
+
+  // SLICE-10: advisory alert triage; the provider is called here, never inside a transaction.
+  registerProcessor(
+    QUEUES.AI_TRIAGE,
+    createAlertTriageProcessor({
+      provider: createGeminiAiProvider({
+        apiKey: ai.geminiApiKey,
+        model: ai.geminiModel,
+        requestTimeoutMs: ai.requestTimeoutMs,
+      }),
       maxAttempts: jobs.executionAttempts,
     }),
   );
