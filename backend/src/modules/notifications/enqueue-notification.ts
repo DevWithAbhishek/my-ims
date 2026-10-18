@@ -1,5 +1,6 @@
 import type { TransactionClient } from '../../infra/db/prisma.js';
 import { enqueueOutbox, OUTBOX_EVENT_TYPES } from '../../infra/jobs/index.js';
+import { detailsToPayload } from './details.js';
 import {
   recordNotification,
   type EnqueueNotificationInput,
@@ -34,6 +35,7 @@ export async function enqueueNotification(
         ...(input.serviceId === undefined ? {} : { serviceId: input.serviceId }),
         ...(input.alertSourceId === undefined ? {} : { alertSourceId: input.alertSourceId }),
         ...(input.requestId === undefined ? {} : { requestId: input.requestId }),
+        ...detailsToPayload(input.details),
       },
     });
   }

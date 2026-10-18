@@ -409,6 +409,31 @@ describe('delivery worker (SLICE-09 §4.4)', () => {
     expect(await notified()).toHaveLength(0);
   });
 
+  it('renders the details of an Admin notice keyed on a team (INVESTIGATION_REQUEST_BLOCKED, SLICE-12)', async () => {
+    const w = await buildWorld();
+    const { notificationId } = await enqueue({
+      eventType: 'INVESTIGATION_REQUEST_BLOCKED',
+      occurrenceId: 'user-1-1760000000000',
+      teamId: w.teamA.id,
+      details: { userId: 'user-1', userName: 'Ada', attemptCount: 4, latestAction: 'Requested X' },
+    });
+    const { provider, run } = harness();
+
+    await run((await outboxOf(notificationId!)).id);
+
+    expect(provider.sent).toHaveLength(1);
+    expect(provider.sent[0].subject).toBe('[IMS] Investigation requests blocked');
+    for (const line of [
+      'User: Ada',
+      'User id: user-1',
+      'Attempts: 4',
+      'Latest action: Requested X',
+    ]) {
+      expect(provider.sent[0].text).toContain(line);
+    }
+    expect(await notified()).toHaveLength(0);
+  });
+
   it('puts a retryable failure back to REQUESTED, then delivers once on the retry', async () => {
     const w = await buildWorld();
     const { notificationId } = await enqueue(inputFor(w, 'ACKNOWLEDGED'));

@@ -1,4 +1,5 @@
 import type { NotificationEventType } from './catalog.js';
+import { NOTIFICATION_DETAIL_LABELS, type NotificationDetails } from './details.js';
 import type { TemplateFacts } from './notification.repository.js';
 
 type Template = { label: string; summary: string };
@@ -112,6 +113,7 @@ function oneLine(value: string, max: number): string {
 export function renderMessage(
   eventType: NotificationEventType,
   facts: TemplateFacts,
+  details: NotificationDetails = {},
 ): RenderedMessage {
   const template = TEMPLATES[eventType];
   const subject = facts.incidentTitle
@@ -128,5 +130,9 @@ export function renderMessage(
   detail('Service', facts.serviceName);
   detail('Team', facts.teamName);
   detail('Alert source', facts.alertSourceName);
+  for (const [key, label] of Object.entries(NOTIFICATION_DETAIL_LABELS)) {
+    const value = details[key as keyof NotificationDetails];
+    if (value !== undefined) detail(label, String(value));
+  }
   return { subject, text: lines.join('\n').trimEnd() + '\n' };
 }

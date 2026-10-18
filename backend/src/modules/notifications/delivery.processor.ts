@@ -20,6 +20,7 @@ import {
   finishAttempt,
   type StoredNotification,
 } from './notification.repository.js';
+import { detailsFromPayload } from './details.js';
 import { recordNotification } from './record-notification.js';
 import { renderMessage } from './templates.js';
 
@@ -187,7 +188,7 @@ export function createNotificationProcessor(deps: DeliveryDeps): OutboxProcessor
         serviceId: idOf(input.payload, 'serviceId'),
         alertSourceId: idOf(input.payload, 'alertSourceId'),
       });
-      const { subject, text } = renderMessage(eventType, facts);
+      const { subject, text } = renderMessage(eventType, facts, detailsFromPayload(input.payload));
       const receipt = await deps.provider.send({
         idempotencyKey: row.idempotencyKey,
         to: emails,

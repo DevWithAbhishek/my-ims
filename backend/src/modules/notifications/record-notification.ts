@@ -7,6 +7,7 @@ import {
   type NotificationScope,
 } from './catalog.js';
 import { deriveIdempotencyKey, entityIdOf } from './idempotency-key.js';
+import type { NotificationDetailKey } from './details.js';
 import {
   findActiveUserIds,
   findIncidentFacts,
@@ -28,6 +29,11 @@ export type EnqueueNotificationInput = {
   /** The specific user some rules name (assignee, investigation requester). */
   subjectUserId?: string;
   requestId?: string;
+  /**
+   * Short facts the message states beyond what the database holds (SLICE-12's Admin notice: user,
+   * attempts, latest action). Only the keys of `NOTIFICATION_DETAIL_LABELS` are rendered.
+   */
+  details?: Readonly<Partial<Record<NotificationDetailKey, string | number>>>;
 };
 
 export type EnqueueNotificationResult = {

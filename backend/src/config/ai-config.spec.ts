@@ -1,4 +1,9 @@
-import { ConfigError, parseAiConfig } from './env';
+import {
+  ConfigError,
+  parseAiConfig,
+  parseInvestigationRetentionConfig,
+  parseInvestigationRetrievalConfig,
+} from './env';
 
 const valid = {
   GEMINI_API_KEY: 'AIza-key',
@@ -38,5 +43,42 @@ describe('parseAiConfig', () => {
     expect(() => parseAiConfig({ ...valid, GEMINI_API_KEY: '' })).toThrow(ConfigError);
     expect(() => parseAiConfig({ ...valid, GEMINI_MODEL: '' })).toThrow(ConfigError);
     expect(() => parseAiConfig({ ...valid, AI_REQUEST_TIMEOUT_MS: '0' })).toThrow(ConfigError);
+  });
+});
+
+describe('investigation settings', () => {
+  const retention = {
+    INVESTIGATION_RETENTION_INTERVAL_MS: '3600000',
+    INVESTIGATION_RETENTION_BATCH_SIZE: '100',
+  };
+
+  it('defaults the retrieval limit to 20 and reads an override', () => {
+    expect(parseInvestigationRetrievalConfig({})).toEqual({ postmortemLimit: 20 });
+    expect(parseInvestigationRetrievalConfig({ INVESTIGATION_RETRIEVAL_LIMIT: '5' })).toEqual({
+      postmortemLimit: 5,
+    });
+    expect(() => parseInvestigationRetrievalConfig({ INVESTIGATION_RETRIEVAL_LIMIT: '0' })).toThrow(
+      ConfigError,
+    );
+  });
+
+  it('has no defaults for retention: both variables are reported by name', () => {
+    expect(parseInvestigationRetentionConfig(retention)).toEqual({
+      intervalMs: 3600000,
+      batchSize: 100,
+    });
+    expect.assertions(4);
+    try {
+      parseInvestigationRetentionConfig({});
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      expect((error as ConfigError).variables.sort()).toEqual([
+        'INVESTIGATION_RETENTION_BATCH_SIZE',
+        'INVESTIGATION_RETENTION_INTERVAL_MS',
+      ]);
+    }
+    expect(() =>
+      parseInvestigationRetentionConfig({ ...retention, INVESTIGATION_RETENTION_BATCH_SIZE: 'x' }),
+    ).toThrow(ConfigError);
   });
 });

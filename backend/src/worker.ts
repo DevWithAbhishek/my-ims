@@ -1,4 +1,10 @@
-import { getConfig, getJobsConfig, getNotificationsConfig, getSlaConfig } from './config/env.js';
+import {
+  getConfig,
+  getInvestigationRetentionConfig,
+  getJobsConfig,
+  getNotificationsConfig,
+  getSlaConfig,
+} from './config/env.js';
 import { disconnectPrisma, pingDatabase } from './infra/db/prisma.js';
 import { closeRedis, pingRedis } from './infra/redis/redis.js';
 import { onShutdownSignal } from './shared/lifecycle/shutdown.js';
@@ -10,6 +16,7 @@ async function main(): Promise<void> {
   getJobsConfig(); // fails startup when any outbox/worker setting is missing
   getNotificationsConfig(); // fails startup when any email setting is missing
   getSlaConfig(); // fails startup when the SLA scan interval is missing
+  getInvestigationRetentionConfig(); // fails startup when a retention setting is missing
 
   await pingDatabase();
   await pingRedis();

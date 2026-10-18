@@ -10,6 +10,7 @@
     "start:worker": "node dist/worker.js",
     "seed:admin": "tsx src/scripts/seed-admin.ts",
     "seed:alert-source": "tsx src/scripts/seed-alert-source.ts",
+    "ai:evaluate": "tsx src/scripts/ai-evaluate.ts",
     "redrive:outbox": "tsx src/scripts/redrive-outbox.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "jest --config jest.config.js",

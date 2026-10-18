@@ -1,4 +1,10 @@
-import { getAiConfig, getJobsConfig, getNotificationsConfig, getSlaConfig } from '../config/env.js';
+import {
+  getAiConfig,
+  getInvestigationRetentionConfig,
+  getJobsConfig,
+  getNotificationsConfig,
+  getSlaConfig,
+} from '../config/env.js';
 import { QUEUES } from '../infra/jobs/events.js';
 import { createBullmqGateway } from '../infra/jobs/gateway.js';
 import { startLoop } from '../infra/jobs/loop.js';
@@ -8,7 +14,9 @@ import { createRedisConnection } from '../infra/redis/redis.js';
 import {
   createAlertTriageProcessor,
   createGeminiAiProvider,
+  createInvestigationProcessor,
   createPostmortemProcessor,
+  runInvestigationRetention,
 } from '../modules/ai/index.js';
 import {
   createSlaEvaluationProcessor,
@@ -29,6 +37,7 @@ export function startWorkers(): JobsRuntime {
   const email = getNotificationsConfig();
   const sla = getSlaConfig();
   const ai = getAiConfig();
+  const retention = getInvestigationRetentionConfig();
 
   registerProcessor(
     QUEUES.NOTIFICATIONS,
@@ -62,6 +71,12 @@ export function startWorkers(): JobsRuntime {
     createPostmortemProcessor({ provider: aiProvider, maxAttempts: jobs.executionAttempts }),
   );
 
+  // SLICE-12: advisory investigation briefs.
+  registerProcessor(
+    QUEUES.INVESTIGATION,
+    createInvestigationProcessor({ provider: aiProvider, maxAttempts: jobs.executionAttempts }),
+  );
+
   // SLICE-07: the same gateway publishes outbox events and schedules the delayed milestone jobs.
   const connection = createRedisConnection('general');
   const gateway = createBullmqGateway(connection, jobs.executionAttempts);
@@ -76,8 +91,14 @@ export function startWorkers(): JobsRuntime {
     await runSlaScan();
   });
 
+  // SLICE-12: deletes investigations (and their evidence) older than 14 days.
+  const retentionLoop = startLoop('investigation-retention', retention.intervalMs, () =>
+    runInvestigationRetention({ batchSize: retention.batchSize }),
+  );
+
   return {
     async stop() {
+      await retentionLoop.stop();
       await scanner.stop();
       await runtime.stop();
       connection.disconnect();

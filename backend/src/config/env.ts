@@ -297,3 +297,67 @@ export function getSlaConfig(): SlaConfig {
   }
   return cachedSla;
 }
+
+/** Investigation retrieval setting (SLICE-12), read by the API when a request is stored. */
+export interface InvestigationRetrievalConfig {
+  /** How many past reviewed postmortems of the service are retrieved (a retrieval parameter). */
+  postmortemLimit: number;
+}
+
+const retrievalEnvSchema = z.object({
+  INVESTIGATION_RETRIEVAL_LIMIT: positiveInt.default(20),
+});
+
+export function parseInvestigationRetrievalConfig(
+  env: NodeJS.ProcessEnv,
+): InvestigationRetrievalConfig {
+  const result = retrievalEnvSchema.safeParse(env);
+  if (!result.success) throw toConfigError(env, result.error.issues);
+  return { postmortemLimit: result.data.INVESTIGATION_RETRIEVAL_LIMIT };
+}
+
+let cachedRetrieval: InvestigationRetrievalConfig | undefined;
+
+/** The retrieval limit, parsed once; it defaults to 20 as the slice states. */
+export function getInvestigationRetrievalConfig(): InvestigationRetrievalConfig {
+  if (!cachedRetrieval) {
+    dotenv.config({ quiet: true });
+    cachedRetrieval = parseInvestigationRetrievalConfig(process.env);
+  }
+  return cachedRetrieval;
+}
+
+/** Investigation retention settings (SLICE-12). Every value must be configured. */
+export interface InvestigationRetentionConfig {
+  /** How often the retention job looks for investigations older than 14 days. */
+  intervalMs: number;
+  /** How many investigations one retention transaction deletes at most. */
+  batchSize: number;
+}
+
+const retentionEnvSchema = z.object({
+  INVESTIGATION_RETENTION_INTERVAL_MS: positiveInt,
+  INVESTIGATION_RETENTION_BATCH_SIZE: positiveInt,
+});
+
+export function parseInvestigationRetentionConfig(
+  env: NodeJS.ProcessEnv,
+): InvestigationRetentionConfig {
+  const result = retentionEnvSchema.safeParse(env);
+  if (!result.success) throw toConfigError(env, result.error.issues);
+  return {
+    intervalMs: result.data.INVESTIGATION_RETENTION_INTERVAL_MS,
+    batchSize: result.data.INVESTIGATION_RETENTION_BATCH_SIZE,
+  };
+}
+
+let cachedRetention: InvestigationRetentionConfig | undefined;
+
+/** Validated retention settings, parsed once. Startup of the worker fails when any is missing. */
+export function getInvestigationRetentionConfig(): InvestigationRetentionConfig {
+  if (!cachedRetention) {
+    dotenv.config({ quiet: true });
+    cachedRetention = parseInvestigationRetentionConfig(process.env);
+  }
+  return cachedRetention;
+}

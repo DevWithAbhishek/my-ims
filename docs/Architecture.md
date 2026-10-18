@@ -1,97 +1,154 @@
 # Architecture
 
-## Components
+## Backend Architecture
 
-- Sync flow:
+The backend is a TypeScript modular monolith. The API and worker are separate Node.js processes
+built from the same container image. Follow the diagrams from left to right: the first shows how
+requests enter the API; the second shows how committed work reaches background workers.
+PostgreSQL is the durable source of truth. Redis supports queues and webhook controls.
 
-  ```
-  Alert Source
-      ↓
-      API
-      ↓
-  Source Authentication
-      ↓
-  Alerts
-      ├── Validate
-      ├── Normalize
-      ├── Identify
-      └── Deduplicate
-      ↓
-  PostgreSQL transaction
-      ├── Alert
-      ├── Incident
-      ├── Audit Events
-      ├── Notification
-      └── Outbox Events
-      ↓
-    Commit
-      ↓
-  HTTP Response
-  ```
+### 1. HTTP API: requests become database changes
 
-- Async flow:
+```mermaid
+flowchart LR
+  subgraph API["API process"]
+    Express["Express API"] --> Routes["/api/v1 routes"]
+    Webhook["Signed alert webhook"]
+    Routes --> Identity["Identity"]
+    Routes --> Services["Services and escalation policies"]
+    Routes --> Incidents["Incidents"]
+    Routes --> Alerts["Alerts"]
+    Webhook --> Alerts
+    Alerts --> Incidents
+    Alerts --> Notify["Notification producer"]
+    Incidents --> Notify
+  end
 
-  ```
-    Outbox
-      ↓
-    Relay
-      ↓
-    BullMQ
-      ↓
-    Workers
-    ├── AI triage
-    ├── notifications
-    ├── SLA/escalation
-    ├── postmortem
-    └── investigation
-  ```
+  User["Web client / API caller"] --> Express
+  AlertSource["Alert source"] --> Webhook
+  Identity --> DB[("PostgreSQL")]
+  Services --> DB
+  Alerts --> DB
+  Incidents --> DB
+  Notify --> DB
+  Webhook -. "rate limits and replay checks" .-> Redis[("Redis")]
+```
 
-- Overall Flow:
-  ```
-                           ┌─────────────┐
-                           │  Identity   │
-                           └──────┬──────┘
-                                  │
-  Alert Source                    │
-       │                          │
-       ▼                          │
-  ┌───────────┐                   │
-  │  Alerts   │                   │
-  │           │                   │
-  │ normalize │                   │
-  │ identify  │                   │
-  │ dedup     │                   │
-  └─────┬─────┘                   │
-        │                         │
-        │ ONE LOCAL TRANSACTION   │
-        ▼                         │
-  ┌───────────────────────────────┴──────┐
-  │              PostgreSQL              │
-  │                                      │
-  │ Alert + Incident + Audit + Outbox    │
-  └──────────────────┬───────────────────┘
-                    │
-                  COMMIT
-                    │
-                    ▼
-                  BullMQ
-                    │
-        ┌───────────┼────────────┐
-        │           │            │
-        ▼           ▼            ▼
-      AI Triage   SLA/          Notification
-                  Escalation
-        │           │
-        │           └──→ notify escalation target
-        │
-        ▼
-    Investigation /
-    Postmortem
-  ```
+### 2. Background work: outbox to workers
 
-- Incident -> RESOLVED -> Postmortem Job -> AI -> Draft -> Human Review -> CLOSED.
-- Modules: Identity, AppService, Alerts, Incident, Notifications, AI.
-- External: Email provider, LLM provider.
+```mermaid
+flowchart LR
+  DB[("PostgreSQL<br/>transactional outbox")] --> Relay["Outbox relay<br/>in worker process"]
+  Relay --> Queue[("Redis<br/>BullMQ queues")]
+
+  subgraph Workers["Registered worker consumers"]
+    Triage["AI triage"]
+    SLA["SLA evaluation<br/>and milestones"]
+    Email["Notification delivery"]
+    Postmortem["Postmortem generation"]
+  end
+
+  Queue --> Triage
+  Queue --> SLA
+  Queue --> Email
+  Queue --> Postmortem
+
+  Triage --> Gemini["Google Gemini API"]
+  Postmortem --> Gemini
+  Email --> SendGrid["SendGrid Mail API"]
+  Triage --> Results["Persist job results in PostgreSQL"]
+  SLA --> Results
+  Email --> Results
+  Postmortem --> Results
+
+  Scanner["SLA scanner<br/>worker process"] --> DB
+  Queue -. "declared; no consumer registered" .-> Investigation["Investigation queue"]
+  Queue --> DLQ["Dead-letter announcements<br/>operator redrives from PostgreSQL"]
+```
+
+The same worker process runs the outbox relay, recovery/retention loops and SLA scanner. External
+provider calls (Gemini and SendGrid) happen in workers, not during API requests.
+
+### Request and asynchronous work flows
+
+```mermaid
+sequenceDiagram
+  participant Source as Alert source
+  participant API as Express webhook
+  participant Alert as Alerts module
+  participant DB as PostgreSQL
+  participant Relay as Outbox relay
+  participant Redis as BullMQ / Redis
+  participant Worker as Registered worker
+  participant Provider as Gemini or SendGrid
+
+  Source->>API: POST alert (signed raw bytes)
+  API->>API: Verify source, signature, replay and rate limits
+  API->>Alert: Validate, normalize, identify and deduplicate
+  Alert->>DB: Transaction: alert/incident + audit + notification + outbox
+  DB-->>API: Commit
+  API-->>Source: HTTP response (does not wait for provider)
+  loop Relay polling and recovery
+    Relay->>DB: Claim pending outbox rows
+    Relay->>Redis: Publish mapped job
+    Relay->>DB: Mark published / retry / dead-letter
+  end
+  Redis->>Worker: At-least-once job delivery
+  Worker->>Provider: AI generation or email delivery
+  Worker->>DB: Persist result and delivery/lifecycle state
+```
+
+The relay claims outbox rows in PostgreSQL and publishes outside the transaction. Outbox publication
+retries without a maximum when Redis is unavailable; worker execution uses bounded attempts and
+backoff. A dead-lettered event remains durable in PostgreSQL, with a best-effort announcement to the
+shared BullMQ dead-letter queue; operators can redrive valid rows with `npm run redrive:outbox`.
+Consumers must be idempotent because delivery is at least once.
+
+### Active worker queues
+
+| Queue | Producer / trigger | Registered consumer |
+| --- | --- | --- |
+| `ai-triage` | Alert ingestion outbox event | Gemini-backed advisory triage |
+| `sla-escalation` | Outbox event, SLA scanner, and delayed milestone scheduling | SLA evaluation and milestone processing |
+| `notifications` | Notification records and outbox events | SendGrid delivery |
+| `postmortem` | Postmortem generation outbox event | Gemini-backed draft generation |
+| `investigation` | Event type and queue are declared | **No processor is registered in `src/workers/index.ts` yet.** Jobs published here currently have no consumer. |
+| `dead-letter` | Relay or worker failure after retry exhaustion | Announcement queue only; recovery is operator redrive of the PostgreSQL outbox row. |
+
+An incident's postmortem path is asynchronous: resolution creates the postmortem state and queues
+generation; the AI creates a draft for human review; approval closes the incident. AI output is
+advisory and does not block alert persistence or the core incident lifecycle.
+
+### Runtime and data boundaries
+
+| Area | Responsibility |
+| --- | --- |
+| **Identity** | Login, refresh/logout sessions, password hashing, JWT authentication, users, teams, roles and membership |
+| **App services** | Service configuration, SLA rules and escalation policies |
+| **Alerts** | Signed source webhooks, input validation, normalization, stable identity/deduplication and ingestion |
+| **Incidents** | Team-scoped incident lifecycle, assignment, severity, comments, timeline, audit and postmortem review |
+| **Notifications** | Notification contract, recipient resolution, durable notification records and provider delivery |
+| **AI** | Allow-listed triage/postmortem inputs, prompt/output validation, provider abstraction and persisted results |
+| **Shared infrastructure** | Prisma/PostgreSQL access, Redis connections, transactional outbox, audit append, health/readiness and request logging |
+
+Modules are composed through their public `index.ts` exports. PostgreSQL stores domain records
+(including teams/users/sessions, services/policies, alert sources/alerts, incidents, comments,
+audit events, outbox events, notifications, postmortems, investigations/evidence and evaluations).
+Modules logically own their data but share one database. Business state changes and required audit,
+notification and outbox records are committed atomically where applicable.
+
+### Third-party and platform dependencies
+
+| Dependency | Use |
+| --- | --- |
+| **PostgreSQL** | Durable relational system of record; accessed with Prisma 7 and the `pg` driver/adapter |
+| **Redis** | BullMQ queues, webhook rate limits and replay protection; accessed with `ioredis` |
+| **SendGrid** | Worker-only email delivery through the v3 Mail Send HTTPS API |
+| **Google Gemini** | Worker-only alert triage and postmortem generation through the `generateContent` HTTPS API |
+| **Docker / Node.js 22** | Reproducible runtime image; the same image starts `dist/main.js` (API) or `dist/worker.js` (worker) |
+
+The local Compose stack provides PostgreSQL 16 and Redis 7. The documented test setup uses Supabase
+PostgreSQL. AWS hosting is a future deployment target, not a runtime dependency depicted here.
 
 ---
 
@@ -114,45 +171,47 @@ Cross-cutting infrastructure (usable by every module, depends on no module): the
 
 | Concern               | Decision                                                                                                                 |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Scale Assumption      | Designed for 200 req/s on load test, it's a portfolio project                                                            |
-| Deployment model      | Single containerized service + multi-worker process.                                                                     |
-| App Hosting           | Everything on AWS post testing, testing with Supabase Postgres.                                                          |
-| Database Access       | Using Prisma ORM. Raw SQL used for complex SQL queries.                                                                  |
-| Reliability           | Notifications and escalations go through workers with retries and a dead-letter fallback, not inline in the request path; assignment is a synchronous lifecycle action. |
-| Security Boundaries   | Auth module owns identity; every other modules trust a verified request context.                                         |
-| Data ownership        | One database; modules own their tables logically, not separated yet.                                                     |
-| External dependencies | Email provider, LLM provider.                                                                                            |
+| Concern | Decision |
+| --- | --- |
+| Scale assumption | Portfolio project; documented load-test target is 200 req/s. |
+| Deployment model | Separate API and worker processes from the same container image; local Compose runs PostgreSQL and Redis. |
+| Hosting | Supabase PostgreSQL is used for testing; AWS is the intended post-testing hosting target. |
+| Database access | Prisma ORM with PostgreSQL; raw SQL is used for row locks and complex queries. |
+| Reliability | Notifications, AI and SLA work run asynchronously. The transactional outbox is durable; workers retry with bounded attempts and dead-letter fallback. Assignment remains a synchronous lifecycle action. |
+| Security boundaries | Identity owns authentication; other modules authorize using verified request context. Alert webhooks authenticate the raw-body signature and apply replay/rate-limit gates. |
+| Data ownership | One PostgreSQL database; modules logically own their tables. |
+| External dependencies | SendGrid for email and Google Gemini for AI generation. |
 
 ---
 
 ## Database Connection Strategy (Supabase) - Testing
 
-- Supabase fronts Postgres with a connection pooler (pgBouncer) exposed on two ports/modes. Which one to use depend on what's connecting:
+The runtime uses `DATABASE_URL` via Prisma's PostgreSQL adapter and a per-process `pg` pool capped
+at 10 connections. Prisma migrations use `DIRECT_URL`. For Supabase, select the connection endpoint
+according to the client and migration tooling:
 
 | Use Case                        | Connection                                              | Why                                                                                                                      |
 | ------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Running API and workers process | `DATABASE_URL` - Supabase transaction pooler, port 6543 | Lets many stateless app instances share a small real-backend connection budget. Does not support session-level features. |
-| Running Migrations              | `DIRECT_URL` - Supabase direct connection, port 5432.   | DDL and multi-statement migration scripts need session-level semantics; safer and more predictable outside the pooler.   |
-| Local Development               | `DIRECT_URL`                                            | Enough for code test and to check if app runs fine with few users.                                                       |
+| Use case | Connection | Why |
+| --- | --- | --- |
+| API and worker processes | `DATABASE_URL` — Supabase transaction pooler, commonly port 6543 | Allows stateless processes to share the backend connection budget. |
+| Migrations | `DIRECT_URL` — Supabase direct connection, commonly port 5432 | DDL and migration tooling need direct/session-level semantics. |
+| Local development | `DIRECT_URL` | A direct local PostgreSQL connection is sufficient for development. |
 
-- The application's own `Pool` is set conservatively (eg. 5-10 per instance) even behind the transactional pooler - the pooler reduces backend connection pressure, it does not make the app's own pool unlimited. All non-local connections use SSL (`sslmode=requrie` minimum; Supabase requires TLS.)
+The API and worker each maintain their own pool, capped at 10 connections per process. Supabase
+requires TLS for hosted database connections; configure the connection URL with the provider's
+required SSL settings.
 
 ---
 
 ## Flows
 
-- **Synchronous Request Flow:** Alert Source -> API -> (Source Authenticated) -> Alerts module -> Incident creation (one transaction with audit and outbox events) -> Response; user requests: Client -> API -> (JWT verified) -> module.  
-  Request flows in each module as: Module -> Controller -> Service -> Repository -> PostgreSQL -> Response.
-
-- **Asynchronous flow:** Service commits a state change and its outbox event in one transaction -> the relay publishes the job (notification, SLA/escalation, AI triage, postmortem, investigation) -> Workers dequeue from Redis -> call external provider -> write the result back through the owning module's repository.
-
-- **Alert flow:** Module receives the alerts from authenticated source, deduplicates it and calls incident module for new incident creation, if one doesn't exist.
-
-- **Incident flow:** Module creates an incident and enqueues AI triage (advisory), a team member acknowledges (an unassigned incident is assigned to the acknowledger), severity is confirmed, then the incident is resolved; resolution creates the postmortem record and enqueues draft generation, and approving the postmortem closes the incident. Every notifying state transition creates its notification record and outbox event in the same transaction.
-
-- **Notification Flow:**: Any module calls the notification producer contract inside its own transaction (the Notification record and its outbox event commit atomically with the state change, and recipients are resolved at that time); the worker sends via the email provider and records delivery status.
-
-- **Failure/retry boundary:** All external calls (email provider, LLM provider) happen only inside the worker, never inline in an HTTP request, so a slow or down dependency cannot make an endpoint hang.
+- **User request:** Client -> Express API -> JWT verification and role/team authorization -> module controller/service/repository -> PostgreSQL -> response.
+- **Alert request:** Source -> raw-body HMAC verification, replay and rate-limit checks -> validate/normalize/deduplicate -> PostgreSQL transaction -> response. Alert and incident state, audit, notification and outbox writes are atomic when created by the ingestion path.
+- **Asynchronous work:** A committed outbox row -> relay -> BullMQ on Redis -> registered worker -> provider call when needed -> result persisted by the owning module. Provider calls never run inline in HTTP requests.
+- **SLA work:** Worker-side PostgreSQL scanner plus delayed BullMQ milestone jobs -> locked/revalidated incident evaluation -> escalation, audit and notification state changes.
+- **Postmortem:** Incident resolution -> persisted postmortem and generation event -> AI draft -> human review -> incident closure on approval.
+- **Failure boundary:** Redis publication failures retry indefinitely at the outbox relay; execution retries are bounded. Dead-letter status is durable in PostgreSQL, while the BullMQ dead-letter queue is an announcement mechanism.
 
 ---
 
