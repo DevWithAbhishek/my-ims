@@ -3,9 +3,10 @@
 ## Backend Architecture
 
 The backend is a TypeScript modular monolith. The API and worker are separate Node.js processes
-built from the same container image. Follow the diagrams from left to right: the first shows how
-requests enter the API; the second shows how committed work reaches background workers.
-PostgreSQL is the durable source of truth. Redis supports queues and webhook controls.
+built from the same container image. Follow each diagram from left to right: the first shows how
+requests reach the API modules; the second shows how committed work reaches background workers;
+the third shows operator-only CLI tasks. PostgreSQL is the durable source of truth. Redis supports
+queues and shared rate limits.
 
 ### 1. HTTP API: requests become database changes
 
@@ -18,6 +19,7 @@ flowchart LR
     Routes --> Services["Services and escalation policies"]
     Routes --> Incidents["Incidents"]
     Routes --> Alerts["Alerts"]
+    Routes --> Investigations["AI investigations"]
     Webhook --> Alerts
     Alerts --> Incidents
     Alerts --> Notify["Notification producer"]
@@ -30,15 +32,17 @@ flowchart LR
   Services --> DB
   Alerts --> DB
   Incidents --> DB
+  Investigations --> DB
   Notify --> DB
   Webhook -. "rate limits and replay checks" .-> Redis[("Redis")]
+  Investigations -. "request rate limit" .-> Redis
 ```
 
 ### 2. Background work: outbox to workers
 
 ```mermaid
 flowchart LR
-  DB[("PostgreSQL<br/>transactional outbox")] --> Relay["Outbox relay<br/>in worker process"]
+  DB[("PostgreSQL<br/>transactional outbox")] --> Relay["Outbox relay<br/>stale recovery and outbox retention"]
   Relay --> Queue[("Redis<br/>BullMQ queues")]
 
   subgraph Workers["Registered worker consumers"]
@@ -46,28 +50,46 @@ flowchart LR
     SLA["SLA evaluation<br/>and milestones"]
     Email["Notification delivery"]
     Postmortem["Postmortem generation"]
+    InvestigationWorker["AI investigation"]
   end
 
   Queue --> Triage
   Queue --> SLA
   Queue --> Email
   Queue --> Postmortem
+  Queue --> InvestigationWorker
 
   Triage --> Gemini["Google Gemini API"]
   Postmortem --> Gemini
+  InvestigationWorker --> Gemini
   Email --> SendGrid["SendGrid Mail API"]
   Triage --> Results["Persist job results in PostgreSQL"]
   SLA --> Results
   Email --> Results
   Postmortem --> Results
+  InvestigationWorker --> Results
 
   Scanner["SLA scanner<br/>worker process"] --> DB
-  Queue -. "declared; no consumer registered" .-> Investigation["Investigation queue"]
+  InvestigationRetention["Investigation retention loop<br/>deletes records older than 14 days"] --> DB
   Queue --> DLQ["Dead-letter announcements<br/>operator redrives from PostgreSQL"]
 ```
 
-The same worker process runs the outbox relay, recovery/retention loops and SLA scanner. External
-provider calls (Gemini and SendGrid) happen in workers, not during API requests.
+The same worker process runs the outbox relay, stale recovery, outbox retention, SLA scanner,
+investigation retention, and all five registered queue consumers. Investigation workers retrieve
+reviewed postmortem evidence from PostgreSQL before requesting a Gemini brief. External provider
+calls (Gemini and SendGrid) happen in workers, not during API requests.
+
+### 3. Operator CLI tasks
+
+```mermaid
+flowchart LR
+  Operator["Operator"] --> Evaluate["npm run ai:evaluate<br/>evaluate a service's investigation evidence"]
+  Evaluate --> DB[("PostgreSQL")]
+  Evaluate --> Gemini["Google Gemini API"]
+  Operator --> Redrive["npm run redrive:outbox<br/>return a dead-letter event to PENDING"]
+  Redrive --> DB
+  DB -. "relay publishes pending event" .-> Relay["Outbox relay"]
+```
 
 ### Request and asynchronous work flows
 
@@ -171,8 +193,6 @@ Cross-cutting infrastructure (usable by every module, depends on no module): the
 
 | Concern               | Decision                                                                                                                 |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Concern | Decision |
-| --- | --- |
 | Scale assumption | Portfolio project; documented load-test target is 200 req/s. |
 | Deployment model | Separate API and worker processes from the same container image; local Compose runs PostgreSQL and Redis. |
 | Hosting | Supabase PostgreSQL is used for testing; AWS is the intended post-testing hosting target. |
@@ -192,8 +212,6 @@ according to the client and migration tooling:
 
 | Use Case                        | Connection                                              | Why                                                                                                                      |
 | ------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Use case | Connection | Why |
-| --- | --- | --- |
 | API and worker processes | `DATABASE_URL` — Supabase transaction pooler, commonly port 6543 | Allows stateless processes to share the backend connection budget. |
 | Migrations | `DIRECT_URL` — Supabase direct connection, commonly port 5432 | DDL and migration tooling need direct/session-level semantics. |
 | Local development | `DIRECT_URL` | A direct local PostgreSQL connection is sufficient for development. |

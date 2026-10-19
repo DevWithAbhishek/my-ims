@@ -1,118 +1,224 @@
-# Incident Management System (IMS) Backend
+# Incident Management System Backend
 
-A production-oriented Incident Management System built as a modular monolith, focused on reliable background processing, fault recovery, testing, and AI-assisted incident operations.
+This backend service powers the incident management platform and follows a modular, layered architecture for maintainability and scalability.
 
-The goal is to build a backend whose behavior can be inspected, tested, and explained—not merely one whose code can be generated quickly.
+## Project Structure
 
-## Architecture
-
-Modular monolith (ADR-001): one deployable image with two process types.
-
-- **API:** `dist/main.js`
-- **Worker:** `dist/worker.js`
-
-The API handles synchronous requests. The worker executes background jobs. Both use the same application codebase and deployment image.
-
-The transactional outbox records background-work requests in PostgreSQL before a relay publishes them to BullMQ. Worker execution is designed around bounded retries, backoff, and idempotency safeguards.
-
-## Technology Stack
-
-| Area | Technology |
-|---|---|
-| Runtime | Node.js |
-| Language | TypeScript |
-| HTTP API | Express 5 |
-| Database | PostgreSQL 16 |
-| ORM | Prisma 7 with `@prisma/adapter-pg` |
-| Background jobs | BullMQ |
-| Queue infrastructure | Redis 7 |
-| Validation | Zod |
-| Logging | Pino |
-| Local infrastructure | Docker Compose |
-
-## Key Engineering Focus
-
-- **Reliable asynchronous processing:** Transactional outbox, queue workers, bounded retries, backoff, and dead-letter handling.
-- **Data integrity:** PostgreSQL transactions and database constraints for important invariants.
-- **Testing:** Unit tests and integration tests against real PostgreSQL and Redis infrastructure.
-- **Failure handling:** Fault-injection tests to verify expected behavior during infrastructure failures.
-- **AI-assisted incident operations:** Planned capabilities include AI-assisted triage, investigation, and postmortem generation, with deterministic validation and human oversight.
-- **Maintainable architecture:** Explicit module boundaries, documented architectural decisions, and reviewable implementation slices.
-
-## Quick Start
-
-```bash
-cp .env.example .env
-
-docker compose up -d postgres redis
-
-npm install
-npm run prisma:generate
-npm run start:dev
+```text
+incident-management-system/
+├── README.md
+├── docs/
+│   ├── API.md
+│   ├── Architecture.md
+│   ├── Basic.md
+│   ├── DB_Schema.md
+│   ├── Domain_Model.md
+│   └── PRD.md
+│
+├── frontend/
+│   └── ...
+│
+└── backend/
+    ├── Dockerfile
+    ├── docker-compose.yml
+    ├── eslint.config.mjs
+    ├── jest.config.js
+    ├── jest.int.config.js
+    ├── package.json
+    ├── tsconfig.json
+    ├── tsconfig.build.json
+    ├── README.md
+    ├── prisma/
+    │   ├── schema.prisma
+    │   └── migrations/
+    │
+    ├── src/
+    │   ├── app.ts
+    │   ├── server.ts
+    │   ├── config/
+    │   │   └── env.ts
+    │   │
+    │   ├── infra/
+    │   │   ├── db/
+    │   │   ├── jobs/
+    │   │   └── redis/
+    │   │
+    │   ├── modules/
+    │   │   ├── aiService/
+    │   │   ├── alerts/
+    │   │   ├── appService/
+    │   │   ├── auth/
+    │   │   ├── incidents/
+    │   │   ├── notifications/
+    │   │   └── users/
+    │   │
+    │   ├── shared/
+    │   │   ├── errors/
+    │   │   │   └── AppError.ts
+    │   │   ├── middleware/
+    │   │   │   ├── error-mapping.ts
+    │   │   │   └── request-ids.ts
+    │   │   └── observability/
+    │   │       └── logger.ts
+    │   │
+    │   ├── workers/
+    │   └── tests/
+    │       ├── factories/
+    │       ├── helpers/
+    │       └── integrations/
+    │
+    └── docs/
+        ├── API-DESIGN-POSTMORTEM.md
+        ├── API.md
+        └── implementation-slices/
+            ├── 00-INDEX.md
+            ├── SLICE-01-identity-access.md
+            ├── SLICE-02-service-catalog-sla-escalation-policy.md
+            ├── SLICE-03-alert-source-trust-gate.md
+            ├── SLICE-04-alert-ingestion-incident-creation.md
+            ├── SLICE-05-incident-lifecycle-assignment.md
+            ├── SLICE-06-incident-visibility-comments-timeline.md
+            ├── SLICE-07-sla-monitoring-escalation.md
+            ├── SLICE-08-outbox-queue-worker-reliability.md
+            ├── SLICE-09-notifications.md
+            ├── SLICE-10-ai-alert-triage.md
+            ├── SLICE-11-postmortem-review-closure.md
+            └── SLICE-12-ai-investigation-evaluation.md
 ```
 
-The API listens on port `3000`. Start the worker separately:
+## Module Architecture Pattern
 
-```bash
-npm run start:worker:dev
-```
-
-Configure environment variables in `.env`; see `.env.example` for the required settings.
-
-- `DATABASE_URL` is the runtime database connection, configured for the Supabase transaction pooler on port `6543`.
-- `DIRECT_URL` is used by the Prisma CLI for migrations through a direct connection on port `5432`.
-- In `NODE_ENV=production`, `DATABASE_URL` must use `sslmode=require` or stronger.
-
-Never commit real credentials or production connection strings.
-
-## Available Scripts
-
-| Script | Purpose |
-|---|---|
-| `npm run build` | Generate Prisma client and compile TypeScript |
-| `npm test` | Run unit tests without external services |
-| `npm run test:int` | Run integration tests against PostgreSQL and Redis |
-| `npm run typecheck` | Type-check application code and tests |
-| `npm run prisma:generate` | Generate the Prisma client |
-
-## Repository Structure
+Each module in `src/modules` follows a consistent layered structure to keep responsibilities clean and predictable.
 
 ```text
 src/
-  config/             Environment schema and global ConfigModule
-  infrastructure/     Prisma/pg adapter, Redis, BullMQ, Pino
-  common/             Shared errors and Zod validation
-  modules/
-    identity/         Identity and access management
-    app-service/      Service catalog
-    alerts/           Alert ingestion and processing
-    incident/         Incident lifecycle
-    notifications/    Notification workflows
-    ai/               AI integrations
-  main.ts             API process entrypoint
-  worker.ts           Worker process entrypoint
-
-prisma/
-  schema.prisma       Prisma schema
-  migrations/         Database migrations as introduced
+└── modules/
+    └── incidents/
+        ├── index.ts                    # public interface; rest of the module is private
+        ├── incidents.routes.ts         # route registration and endpoint definitions
+        │
+        ├── controllers/
+        │   └── incidents.controller.ts # request/response handling
+        │
+        ├── services/
+        │   └── incidents.service.ts    # orchestration and business logic
+        │
+        ├── repositories/
+        │   └── incidents.repository.ts # persistence and data access
+        │
+        ├── schemas/
+        │   └── incidents.schema.ts     # validation and DTO schemas
+        │
+        ├── types/
+        │   ├── incidents.types.ts      # domain and model types
+        │   └── incidents.response.ts   # response payload types
+        │
+        ├── mappers/
+        │   └── incidents.mapper.ts     # entity/data transformation logic
+        │
+        └── tests/
+            ├── incidents.service.test.ts
+            ├── incidents.controller.test.ts
+            └── incidents.integration.test.ts
 ```
 
-Module convention:
+Typical responsibilities by layer:
 
-`Module → Controller → Service → Repository → PostgreSQL`
+- `routes`: exposes endpoints and delegates to controllers
+- `controllers`: validates HTTP request context and calls services
+- `services`: contains business rules, orchestration, and domain logic
+- `repositories`: talks to Prisma, databases, or external storage
+- `schemas`: request validation, Zod or similar schema definitions
+- `types`: domain models, payload contracts, and response structures
+- `mappers`: converts persistence entities to domain objects or API responses
+- `tests`: unit, controller, and integration coverage for the module
 
-Cross-module access goes through the owning module's exported service. Module boundary enforcement is currently by convention, as documented in ADR-001.
+## Recommended Module Layout
 
-## Project Status
+Each feature module should follow the convention below:
 
-The repository is being developed incrementally. Current implementation status should be assessed from the code and tests in the repository; planned capabilities are not represented as completed features.
+```text
+src/
+└── modules/
+    └── <module-name>/
+        ├── index.ts
+        ├── <module-name>.routes.ts
+        ├── controllers/
+        │   └── <module-name>.controller.ts
+        ├── services/
+        │   └── <module-name>.service.ts
+        ├── repositories/
+        │   └── <module-name>.repository.ts
+        ├── schemas/
+        │   └── <module-name>.schema.ts
+        ├── types/
+        │   ├── <module-name>.types.ts
+        │   └── <module-name>.response.ts
+        ├── mappers/
+        │   └── <module-name>.mapper.ts
+        └── tests/
+            ├── <module-name>.service.test.ts
+            ├── <module-name>.controller.test.ts
+            └── <module-name>.integration.test.ts
+```
 
-## Engineering Principles
+This structure keeps each feature isolated, easy to test, and easier to extend as the platform grows.
 
-- PostgreSQL is the durable source of truth.
-- Required background work is recorded transactionally before queue publication.
-- Consumers must tolerate duplicate delivery.
-- Retries are bounded, and terminal failures should be observable.
-- AI output is advisory and subject to validation; it does not replace business rules or engineering review.
-- Tests should verify actual behavior, including failure paths, rather than merely passing for an unrelated reason.
-- Architectural decisions and important trade-offs are documented.
+Architecture
+    - [ ✔️ ] Express vs NestJS frozen [Express chosen]
+    - [ ✔️ ] Modular monolith frozen
+    - [ ✔️ ] module boundary rule frozen
+    - [ ✔️ ] Controller → Service → Repository frozen
+    - [ ✔️ ] cross-module public-interface rule frozen
+    - [ ✔️ ] app.ts / server.ts distinction frozen
+    - [ ✔️ ] infrastructure boundary frozen
+
+  Runtime
+    - [ ✔️ ] Node.js
+    - [ ✔️ ] TypeScript
+    - [ ✔️ ] Express
+    - [ ✔️ ] Zod
+    - [ ✔️ ] Pino
+    - [ ✔️ ] Jest
+    - [ ✔️ ] Supertest
+
+  Data
+    - [ ✔️ ] PostgreSQL
+    - [ ✔️ ] Prisma
+    - [ ✔️ ] Prisma migration strategy
+    - [ ✔️ ] transaction ownership rule
+    - [ ✔️ ] DB constraint philosophy
+    - [ ✔️ ] real PostgreSQL integration-test strategy
+
+  Infrastructure
+    - [ ✔️ ] Redis
+    - [ ✔️ ] BullMQ
+    - [ ✔️ ] Docker Compose
+    - [ ✔️ ] environment configuration
+    - [ ✔️ ] logging
+    - [ ✔️ ] health/readiness
+
+  Security
+  - [ ✔️ ] JWT
+  - [ ✔️ ] refresh session
+  - [ ✔️ ] Argon2
+  - [ ✔️ ] authorization boundary
+  - [ ✔️ ] request context
+  - [ ✔️ ] secret handling
+
+Development workflow
+    - [ ✔️ ] slice = persistent capability context
+    - [ ✔️ ] implementation guide = execution process
+    - [ ✔️ ] AGENTS = global agent rules
+    - [ ✔️ ] PROJECT_STATE = current implementation state
+    - [ ✔️ ] TEST_STATUS = evidence
+    - [ ✔️ ] SESSION_CHECKPOINT = continuity
+    - [ ✔️ ] no slice-specific implementation workflow duplication
+    
+  Repository
+- [ ✔️ ] directory structure frozen
+- [ ✔️ ] naming conventions frozen
+- [ ✔️ ] module structure convention frozen
+- [ ✔️ ] test structure frozen
+- [ ✔️ ] config structure frozen
+- [ ✔️ ] migration location frozen

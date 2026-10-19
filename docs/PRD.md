@@ -1,6 +1,6 @@
 # Incident Management System (IMS)
 
-**Status:** Revised Draft
+**Status:** Revised — synchronized with the finalized design
 
 **Scope:** MVP
 
@@ -8,7 +8,7 @@
 
 **Created on:** 17th Sept\'2026
 
-**Last updated on:** 19th Sept 2026
+**Last updated on:** 18th Oct 2026
 
 ---
 
@@ -20,7 +20,7 @@ Engineering teams need a shared way to receive authenticated alerts, record inci
 
 Without a consistent workflow, incident details and decisions can become scattered across alerts, chat, and individual notes. This creates manual work during incident response and makes it harder to identify recurring problems and improve the system over time.
 
-When an incident resembles a previous failure, engineers also need a practical way to find relevant prior incidents, reviewed postmortems, runbooks, and investigation evidence without manually searching across separate records.
+When an incident resembles a previous failure, engineers also need a practical way to find relevant prior incidents, reviewed postmortems, and investigation evidence without manually searching across separate records.
 
 The MVP provides a focused incident lifecycle from authenticated alert ingestion through acknowledgement, mitigation, resolution, postmortem review, and closure.
 
@@ -48,7 +48,7 @@ The MVP provides a focused incident lifecycle from authenticated alert ingestion
    - **Response SLA:** time allowed for an incident to be acknowledged.
    - **Resolution SLA:** time allowed for an incident to be resolved.
 10. Generate an SLA warning at 80% of the applicable SLA window and escalate overdue incidents through the configured escalation policy.
-11. Notify the assigned engineer and Team Lead about relevant incident events.
+11. Notify the relevant recipients (team members, the assignee, the Team Lead and the fallback Admin, as defined per event) about relevant incident events.
 12. Preserve an append-only incident timeline and audit trail.
 13. Add AI-assisted alert triage that:
     - classifies alert category,
@@ -98,7 +98,7 @@ The MVP provides a focused incident lifecycle from authenticated alert ingestion
 - As an Engineer, I can resolve an incident by providing a resolution summary and confirming that the affected service is working again.
 - As an Engineer, I can review the incident timeline and escalation history so that I understand what happened before I became involved.
 - As an Engineer, I can review and update the AI-generated postmortem draft before the incident is closed.
-- As an Engineer, I can request an AI-assisted investigation brief so that relevant historical incidents, reviewed postmortems, runbooks, and other recorded IMS evidence can help guide investigation.
+- As an Engineer, I can request an AI-assisted investigation brief so that the incident's recorded information and the service's past reviewed postmortems can help guide investigation.
 - As an Engineer, I can see the evidence used by an AI investigation brief so that I can distinguish recorded information from AI-generated suggestions.
 
 ### Team Lead
@@ -147,7 +147,7 @@ The MVP provides a focused incident lifecycle from authenticated alert ingestion
 | FR-011 | Incident assignment                | A Engineer acknowledges a incident post notification. A Team Lead can assign an incident to a configured responder, in case no engineer acknowledges it within SLA window. The escalation worker can notify the next configured responder according to the escalation policy.                                                                 |
 | FR-012 | Incident reassignment              | A Team Lead can reassign an incident. Engineers cannot assign or reassign incidents.                                                                                                                                                                                                                                                          |
 | FR-013 | Incident unassignment              | A Team Lead can remove the current assignee from an incident.                                                                                                                                                                                                                                                                                 |
-| FR-014 | Incident acknowledgement           | An authorized Engineer or Team Lead can acknowledge an OPEN incident. The first successful acknowledgement is recorded with the authenticated user. The person acknowledging may differ from the current assignee.                                                                                                                            |
+| FR-014 | Incident acknowledgement           | An authorized Engineer or Team Lead can acknowledge an OPEN incident. The first successful acknowledgement is recorded with the authenticated user. The person acknowledging may differ from the current assignee. If the incident has no assignee, the acknowledging user also becomes the current assignee.                                                                                                                            |
 | FR-015 | Severity confirmation/update       | An authorized Engineer or Team Lead can confirm or update severity after reviewing the incident. A Team Lead can manually select severity when AI triage is unavailable.                                                                                                                                                                      |
 | FR-016 | Incident comments                  | Authorized users can add comments to an incident. Comments become part of the incident timeline.                                                                                                                                                                                                                                              |
 | FR-017 | Incident resolution                | An authorized assigned responder can resolve an incident by providing a resolution summary and confirming that the affected service is working again.                                                                                                                                                                                         |
@@ -157,7 +157,7 @@ The MVP provides a focused incident lifecycle from authenticated alert ingestion
 | FR-021 | SLA warning                        | A worker evaluates SLA progress and creates a warning when the applicable SLA reaches 80% of its window.                                                                                                                                                                                                                                      |
 | FR-022 | SLA escalation                     | If an incident remains unacknowledged when its response SLA expires, the worker escalates it to the next configured responder in the escalation policy.                                                                                                                                                                                       |
 | FR-023 | Severity-sensitive SLA             | If severity changes, subsequent SLA evaluation uses the SLA associated with the latest severity. The worker evaluates whether the current incident has crossed the applicable warning or breach threshold.                                                                                                                                    |
-| FR-024 | Notifications                      | The system sends relevant incident notifications to the assigned engineer and Team Lead.                                                                                                                                                                                                                                                      |
+| FR-024 | Notifications                      | The system sends relevant incident notifications to the recipients defined for each event (team members, assignee, Team Lead, fallback Admin as applicable), resolved when the event is committed.                                                                                                                                                                                                                                                      |
 | FR-025 | Notification reliability           | Notification processing is asynchronous, retryable, and safe to repeat.                                                                                                                                                                                                                                                                       |
 | FR-026 | Postmortem generation              | After an incident reaches RESOLVED, an asynchronous worker generates a structured AI postmortem draft from recorded incident data.                                                                                                                                                                                                            |
 | FR-027 | Postmortem failure handling        | Failure of postmortem generation does not reopen or invalidate a RESOLVED incident. Generation can be retried.                                                                                                                                                                                                                                |
@@ -174,12 +174,12 @@ The MVP provides a focused incident lifecycle from authenticated alert ingestion
 | FR-038 | Multiple alerts per request        | A single request may contain multiple alerts. The system processes each alert separately for validation, identity, deduplication, storage, and incident association.                                                                                                                                                                          |
 | FR-039 | Source alert status                | The system records the source alert status, including firing or resolved when provided by the source. A source alert becoming resolved does not automatically change the IMS incident to RESOLVED.                                                                                                                                            |
 | FR-040 | AI-assisted incident investigation | An authorized user can request an AI-generated investigation brief for an incident using relevant recorded IMS knowledge.                                                                                                                                                                                                                     |
-| FR-041 | Investigation evidence retrieval   | The investigation capability retrieves relevant recorded IMS information, including historical incidents, reviewed postmortems, runbooks, and other configured IMS knowledge sources.                                                                                                                                                         |
+| FR-041 | Investigation evidence retrieval   | The investigation capability retrieves the incident's own recorded information and the service's past reviewed postmortems (the most recent 20 by default).                                                                                                                                                         |
 | FR-042 | Evidence references                | An AI investigation brief identifies the recorded sources used to support its statements or suggestions.                                                                                                                                                                                                                                      |
 | FR-043 | Investigation output               | An investigation brief summarizes relevant evidence, identifies possible areas of investigation, and provides suggested investigation steps without representing suggestions as confirmed facts.                                                                                                                                              |
 | FR-044 | Investigation fallback             | If retrieval or AI generation is unavailable, the incident remains fully usable and the user can continue manual investigation.                                                                                                                                                                                                               |
 | FR-045 | Investigation idempotency          | Repeated execution of the same investigation request must not create conflicting or unintended duplicate investigation records.                                                                                                                                                                                                               |
-| FR-046 | AI investigation evaluation        | A small repeatable evaluation fixture/test suite is maintained outside the production domain model and API.                                                                                                                                                                                                                                   |
+| FR-046 | AI investigation evaluation        | An operator-run AI evaluation (CLI) stores each run in the Evaluation table for manual review; it has no production API endpoint.                                                                                                                                                                                                                                   |
 
 ---
 
@@ -238,7 +238,7 @@ The MVP provides a focused incident lifecycle from authenticated alert ingestion
 | BR-032 | An external alert identity uses source plus a stable provider alert identifier when one is available.                                                                  | Alert          | Source-specific identity handling      | Invalid identity is rejected                                   | AC-003       |
 | BR-033 | If a source does not provide a usable stable identifier, IMS generates a deterministic identity from the source and the alert fields that define the alert's identity. | Alert          | Normalization and identity service     | Alert is rejected if a stable identity cannot be formed        | AC-003       |
 | BR-034 | The entire raw payload must not be used as the only basis for alert identity because some fields can change between deliveries.                                        | Alert          | Identity service                       | Identity remains stable when non-identity fields change        | AC-003       |
-| BR-035 | Alerts with the same external alert identity are treated as duplicates for incident deduplication.                                                                     | Alert/Incident | Application and database checks        | No second unresolved incident is created                       | AC-003       |
+| BR-035 | Alerts with the same external alert identity are treated as duplicates for incident deduplication while the associated incident is unresolved; once it is RESOLVED, a new firing delivery creates a new incident.                                                                     | Alert/Incident | Application and database checks        | No second unresolved incident is created                       | AC-003       |
 | BR-036 | The alert identity must be stored with the alert record.                                                                                                               | Alert          | Database                               | Alert record is incomplete without identity                    | AC-003       |
 | BR-037 | Deduplication must be enforced at the application and database levels where appropriate.                                                                               | Alert/Incident | Service logic and database constraints | Concurrent duplicate processing is safely resolved             | AC-003       |
 | BR-038 | The original source payload is stored independently of normalized alert fields.                                                                                        | Alert          | Database                               | Original payload remains available for review                  | AC-038       |
@@ -263,7 +263,7 @@ The MVP provides a focused incident lifecycle from authenticated alert ingestion
 | BR-047 | Response SLA is measured from incident `created_at` until acknowledgement.                                                                                     | SLA        | SLA worker/service      | SLA status is not silently lost                  | AC-019         |
 | BR-048 | Resolution SLA is measured from incident `created_at` until resolution.                                                                                        | SLA        | SLA worker/service      | SLA status is not silently lost                  | AC-020         |
 | BR-049 | SLA clocks use continuous elapsed time.                                                                                                                        | SLA        | Time calculation        | N/A                                              | AC-039         |
-| BR-050 | SLA calculations use IST timestamps in the MVP.                                                                                                                | SLA        | Application time policy | Invalid timestamp is rejected                    | AC-039         |
+| BR-050 | SLA calculations use UTC timestamps in the MVP.                                                                                                                | SLA        | Application time policy | Invalid timestamp is rejected                    | AC-039         |
 | BR-051 | The applicable SLA threshold is determined by the incident's current severity and the service's configured SLA policy.                                         | SLA        | SLA service             | Invalid configuration is rejected                | AC-021         |
 | BR-052 | The 80% warning threshold is measured from incident `created_at`.                                                                                              | SLA        | SLA worker              | Warning is not created before the threshold      | AC-021         |
 | BR-053 | When severity changes, SLA evaluation uses the latest severity's configured threshold.                                                                         | SLA        | SLA worker              | Current severity is used for the next evaluation | AC-021         |
@@ -283,7 +283,7 @@ The MVP provides a focused incident lifecycle from authenticated alert ingestion
 
 | ID     | Rule                                                                             | Applies to   | Enforcement                         | Failure behavior                            | Verification   |
 | ------ | -------------------------------------------------------------------------------- | ------------ | ----------------------------------- | ------------------------------------------- | -------------- |
-| BR-060 | Relevant incident notifications are sent to the assigned engineer and Team Lead. | Notification | Notification service                | Delivery failure is retried                 | AC-025         |
+| BR-060 | Relevant incident notifications are sent to the recipients defined for each event. | Notification | Notification service                | Delivery failure is retried                 | AC-025         |
 | BR-061 | Notification delivery is asynchronous.                                           | Notification | Queue/worker                        | Business action is not blocked              | AC-026         |
 | BR-062 | Notification jobs are retryable.                                                 | Notification | Worker retry policy                 | Exhausted jobs enter failure state          | AC-026, AC-027 |
 | BR-063 | Notification attempts and outcomes are recorded.                                 | Notification | Notification record                 | Delivery history remains available          | AC-026         |
@@ -307,7 +307,7 @@ The MVP provides a focused incident lifecycle from authenticated alert ingestion
 | BR-076 | Recorded facts and AI-generated suggestions must remain distinguishable in the investigation result.                         | AI Investigation    | Structured output and labels              | Unsupported claims are not presented as recorded facts                                       | AC-050         |
 | BR-077 | AI investigation failure does not block incident viewing, investigation, lifecycle transitions, or closure.                  | AI Investigation    | Separate asynchronous/optional workflow   | Manual workflow remains available                                                            | AC-052         |
 | BR-078 | Repeated investigation execution must be safe and must not create conflicting results for the same request.                  | AI Investigation    | Idempotency and stored request identity   | Duplicate execution is safely ignored or represented as the same request                     | AC-053         |
-| BR-079 | The evaluation set must contain known expected relevant evidence for its test cases.                                         | AI Evaluation       | Evaluation data and test process          | Evaluation case is invalid if expected evidence is missing                                   | AC-054         |
+| BR-079 | Each AI evaluation run stores its input, evidence and constraints with its result so it can be reviewed manually.                                         | AI Evaluation       | Evaluation CLI and table          | Unsupported output is rejected, not stored                                   | AC-054         |
 | BR-080 | AI investigation evaluation is a verification activity and does not itself change production incident data.                  | AI Evaluation       | Separate evaluation workflow/data         | Evaluation failures are reported without changing incidents                                  | AC-054         |
 
 ---
@@ -344,8 +344,8 @@ CLOSED
 | ------------------------- | ------- | --------------------------------------- | ------------------------------------------------------- | -------------------------------------------------- |
 | OPEN → ACKNOWLEDGED       | Yes     | Engineer / Team Lead                    | Incident is OPEN; user is authorized                    | Audit/timeline event; notification                 |
 | ACKNOWLEDGED → MITIGATING | Yes     | Engineer / Team Lead                    | User is authorized; severity is confirmed or updated    | Audit/timeline event; notification                 |
-| MITIGATING → RESOLVED     | Yes     | Assigned Engineer                       | Resolution summary provided; service confirmed working  | Audit/timeline event; notification; postmortem job |
-| RESOLVED → CLOSED         | Yes     | Authorized Engineer / Team Lead / Admin | Postmortem reviewed or manual review path completed     | Audit/timeline event; notification                 |
+| MITIGATING → RESOLVED     | Yes     | Team Lead / Admin; Engineer only as current assignee | Resolution summary provided; service confirmed working  | Audit/timeline event; notification; postmortem job |
+| RESOLVED → CLOSED         | Yes     | Escalation-chain member (Engineer / Team Lead / Admin) | Postmortem reviewed or manual review path completed     | Audit/timeline event; notification                 |
 | CLOSED → \*               | No      | —                                       | Terminal state                                          | None                                               |
 | RESOLVED → MITIGATING     | No      | —                                       | Closed-loop lifecycle does not support reopening in MVP | None                                               |
 | OPEN → MITIGATING         | No      | —                                       | Acknowledgement is required first                       | None                                               |
@@ -371,6 +371,8 @@ EngineerB acknowledges
 
 The acknowledgement actor and assignee are stored independently.
 
+Acknowledging an incident that has no assignee makes the acknowledging user the current assignee; an existing assignee is not changed by acknowledgement.
+
 ### Alert Source State
 
 ```text
@@ -394,10 +396,20 @@ The source alert state is separate from the IMS incident lifecycle.
 - Active/inactive status
 - Created/updated timestamps
 
+### User Session
+
+- Session ID
+- User ID
+- Refresh token hash (the token itself is never stored)
+- Revocation status
+- Expiry
+- Last-used timestamp and network information
+
 ### Team
 
 - Team ID
 - Team name
+- Active/deactivated status
 - Created/updated timestamps
 
 ### Service
@@ -408,15 +420,15 @@ The source alert state is separate from the IMS incident lifecycle.
 - Initial severity default
 - SLA configuration for P0-P3
 - Escalation policy reference
+- Active/deactivated status
 - Created/updated timestamps
 
 ### Escalation Policy
 
 - Policy ID
 - Service ID
-- Ordered responder list
-- Escalation timing configuration
-- Final Team Lead/Admin fallback
+- Responders: level 1 Engineer, level 2 Engineer, level 3 Team Lead
+- Fallback Admin
 - Created/updated timestamps
 
 ### Alert Source
@@ -424,7 +436,7 @@ The source alert state is separate from the IMS incident lifecycle.
 - Alert source ID
 - Source type
 - Name
-- Configuration
+- Configuration (signing secret, severity mapping)
 - Enabled status
 - Created/updated timestamps
 
@@ -450,6 +462,18 @@ The source alert state is separate from the IMS incident lifecycle.
 - Original payload
 - Created/updated timestamps
 
+### AI Triage
+
+- Alert ID
+- Suggested severity
+- Category
+- Confidence
+- Supporting evidence
+- Reasoning summary
+- Status (pending / success / failed)
+- Model and model version
+- Created/updated timestamps
+
 ### Incident
 
 - Incident ID
@@ -461,9 +485,12 @@ The source alert state is separate from the IMS incident lifecycle.
 - Status
 - Current assignee
 - Acknowledged by
+- Severity confirmed by
 - Resolved by
+- Closed by
 - Created timestamp
 - Acknowledged timestamp
+- Severity confirmed timestamp
 - Resolved timestamp
 - Closed timestamp
 - Alert reference
@@ -480,7 +507,7 @@ The source alert state is separate from the IMS incident lifecycle.
 ### Incident Event / Audit Event
 
 - Event ID
-- Incident ID
+- Incident ID (empty for administrative events)
 - Event type
 - Actor/user ID where applicable
 - Event metadata
@@ -494,12 +521,17 @@ ALERT_RECEIVED
 ALERT_DUPLICATE
 AI_TRIAGE_COMPLETED
 ASSIGNED
+REASSIGNED
+OPEN
 ACKNOWLEDGED
-SEVERITY_CHANGED
+SEVERITY_CONFIRMED
 COMMENT_ADDED
 SLA_WARNING
-ESCALATED
-NOTIFICATION_SENT
+ESCALATED_L1
+ESCALATED_L2
+ESCALATED_L3
+ESCALATED_L4
+NOTIFIED
 SOURCE_ALERT_RESOLVED
 RESOLVED
 POSTMORTEM_GENERATED
@@ -508,13 +540,27 @@ AI_INVESTIGATION_COMPLETED
 CLOSED
 ```
 
+Administrative events (recorded without an incident; updates and deactivations only):
+
+```text
+USER_UPDATED
+USER_DEACTIVATED
+TEAM_UPDATED
+TEAM_DEACTIVATED
+SERVICE_UPDATED
+SERVICE_DEACTIVATED
+ESCALATION_POLICY_UPDATED
+ALERT_SOURCE_UPDATED
+```
+
 ### Notification
 
 - Notification ID
-- Incident ID
-- Recipient
-- Notification type
-- Delivery status
+- Incident ID, when the notification belongs to an incident
+- Recipients
+- Notification type (INFO / WARNING / ALERT)
+- Event type
+- Delivery status (requested / running / completed / failed)
 - Attempt count
 - Last attempt timestamp
 - Provider response/error information
@@ -537,6 +583,7 @@ CLOSED
 - MTTR
 - Risk level
 - Generation status
+- Generation failure reason
 - Model
 - Model version
 - Prompt/version
@@ -544,16 +591,17 @@ CLOSED
 - Generation timestamp
 - Human reviewer
 - Review timestamp
-- Approval status
+- Review status
 
 ### AI Investigation
 
 - Investigation ID
 - Incident ID
 - Requesting user
-- Status
+- Status (requested / running / completed / failed)
 - Investigation result
-- Generation timestamp
+- Failure reason
+- Completion timestamp
 - Model and model version, when AI generation occurs
 - Input/reference information
 - Idempotency/request reference
@@ -565,16 +613,17 @@ CLOSED
 - Source type
 - Source record reference
 - Relevance/reference information
+- Evidence type (fact / inference / unknown)
 - Created timestamp
 
-### AI Evaluation Case
+### AI Evaluation
 
-- Evaluation case ID
-- Input incident/reference
-- Expected relevant evidence
-- Expected output constraints
+- Evaluation ID
+- Input (the data evaluated, including the service reference)
+- Evidence used
+- Constraints applied
 - Evaluation result
-- Evaluation run timestamp
+- Run timestamp
 
 ---
 
@@ -607,9 +656,10 @@ The MVP supports multiple external alert sources through the same common ingesti
 | Manage services            | No       | No        | Yes   |
 | Manage escalation policies | No       | No        | Yes   |
 | Review/approve postmortem  | Yes      | Yes       | Yes   |
+| Request AI investigation   | Yes      | Yes       | Yes   |
 | View audit/timeline        | Yes      | Yes       | Yes   |
 
-Authorization must additionally enforce team isolation.
+Authorization must additionally enforce team isolation. Severity confirmation/update and postmortem approval/manual creation are further limited to members of the incident's service escalation chain (its level 1, level 2, level 3 and fallback Admin); an Engineer cannot change the severity of an OPEN incident; an Engineer can resolve only as the current assignee; and every incident-scoped operation is limited to the caller's own team (a user with no team cannot use incident operations).
 
 ---
 
@@ -650,13 +700,15 @@ The MVP must address:
 
 9. **Rate limiting**
    - Apply inbound alert rate limiting per authenticated source.
+   - Apply per-user limits to login/refresh and investigation requests.
+   - Rate-limit and replay checks fail closed (503) when their backing store is unavailable.
 
 10. **Audit trail**
     - Record security-relevant and incident lifecycle actions in an append-only audit/timeline structure.
 
 11. **AI data handling/redaction**
-    - Define which incident data may be sent to the LLM provider.
-    - Redact sensitive information before external AI processing where required.
+    - Only allow-listed fields are sent to the LLM provider: for triage the alert summary, description, labels and additional details; for postmortems the incident description, severity and comments; for investigations the incident description, severity and the service's reviewed postmortems.
+    - Credentials, tokens, alert payloads and identities are never sent; no further redaction is applied inside the allowed fields.
 
 12. **Secure password/session/token handling**
     - Use secure password storage and appropriate session/token handling.
@@ -681,7 +733,7 @@ The MVP must address:
 | NFR-008 | Idempotency              | Duplicate alert, queue, notification, and postmortem processing must not create unintended duplicate business actions.                                              |
 | NFR-009 | Recovery                 | Retryable asynchronous failures must use bounded retry behavior and ultimately be represented in a dead-letter/failure state when retries are exhausted.            |
 | NFR-010 | AI investigation quality | AI investigation results must provide traceable evidence references and remain distinguishable from recorded facts.                                                 |
-| NFR-011 | AI evaluation            | AI investigation retrieval and output checks must be repeatable against a maintained evaluation set.                                                                |
+| NFR-011 | AI evaluation            | AI evaluation runs must be repeatable by an operator and stored for review.                                                                |
 
 ---
 
@@ -694,6 +746,7 @@ The MVP must address:
 | AI investigation/retrieval | Investigation failure is observable; no incident lifecycle or severity change occurs; manual investigation remains available.        |
 | Email provider             | Notification job retries with backoff; exhausted failures move to a failure state and remain observable.                             |
 | Queue/worker               | Jobs are safely retried; repeated execution must be handled safely.                                                                  |
+| Redis                      | Rate-limit and replay gates fail closed (503); pending work is republished from PostgreSQL after recovery.                          |
 | Database                   | Failed transaction rolls back the associated state change and audit event.                                                           |
 | Alert source               | Invalid authentication, replay checks, or payload validation causes rejection; valid duplicate delivery is safely deduplicated.      |
 
@@ -702,7 +755,7 @@ The MVP must address:
 Retry implementation details are part of the engineering design, but the MVP requires:
 
 - Exponential backoff.
-- Bounded retry attempts.
+- Bounded retry attempts (5 attempts in the MVP).
 - DLQ/failure state after retry exhaustion.
 - Retryable and non-retryable failure classification.
 - Observable retry/failure metadata.
@@ -736,12 +789,12 @@ Retry implementation details are part of the engineering design, but the MVP req
 - Resolution SLA tracking.
 - 80% SLA warning.
 - SLA-based escalation.
-- Notifications to assigned engineer and Team Lead.
+- Notifications to the recipients defined for each event.
 - Safe repeated asynchronous job processing.
 - AI-assisted alert triage.
 - AI-assisted incident investigation using relevant recorded IMS knowledge and evidence references.
 - AI-generated postmortem draft.
-- A small repeatable AI evaluation set covering investigation retrieval relevance and evidence/output validity.
+- An operator-run AI evaluation of recurring patterns across a service's investigation evidence, stored for manual review.
 - Human postmortem review.
 - Basic operational logs, metrics, and failure handling.
 - Retry with exponential backoff and DLQ.
@@ -799,14 +852,14 @@ Potential future extensions include:
 | RD-007 | Inbound alert rate limiting is applied per authenticated source.                                                                    | Each configured source has its own limit.                                                                                                       |
 | RD-008 | The MVP uses two SLAs: Response SLA and Resolution SLA.                                                                             | Response ends at acknowledgement; Resolution ends at resolution.                                                                                |
 | RD-009 | Both SLA clocks start from incident `created_at`.                                                                                   | SLA time is measured from the original incident creation time.                                                                                  |
-| RD-010 | SLA clocks use continuous elapsed time in IST in the MVP.                                                                           | There are no business-hour pauses in the MVP.                                                                                                   |
+| RD-010 | SLA clocks use continuous elapsed time; timestamps are UTC in the MVP.                                                                           | There are no business-hour pauses in the MVP.                                                                                                   |
 | RD-011 | Severity changes cause SLA evaluation to use the latest severity's configured SLA threshold.                                        | The worker uses the current severity at each evaluation.                                                                                        |
 | RD-012 | SLA warning is evaluated at 80% of the applicable SLA window from incident `created_at`.                                            | The warning is recorded once for the applicable threshold.                                                                                      |
 | RD-013 | If an assigned responder does not acknowledge before the response SLA breach, the worker notifies to the next configured responder. | Escalation follows the service policy.                                                                                                          |
 | RD-014 | The acknowledgement actor may differ from the current assignee.                                                                     | Assignment and acknowledgement are stored separately.                                                                                           |
 | RD-015 | Team Leads and Admins can assign/reassign/unassign incidents; Engineers cannot.                                                     | Assignment authority is role-based.                                                                                                             |
 | RD-016 | Multiple engineers cannot collaboratively work on one incident in the MVP.                                                          | One current assignee is supported.                                                                                                              |
-| RD-017 | Notifications are sent to the assigned engineer and Team Lead.                                                                      | Exact notification events remain configurable.                                                                                                  |
+| RD-017 | Notifications are sent to the recipients defined for each event.                                                                      | The notification events and recipients are fixed (see RD-045).                                                                                                  |
 | RD-018 | Severity levels are P0, P1, P2, and P3.                                                                                             | Each service defines its SLA values for these levels.                                                                                           |
 | RD-019 | Each user belongs to exactly one team in the MVP.                                                                                   | Team is the authorization boundary.                                                                                                             |
 | RD-020 | Each service belongs to exactly one team in the MVP.                                                                                | Services cannot be shared across teams.                                                                                                         |
@@ -825,33 +878,34 @@ Potential future extensions include:
 | RD-033 | No backup LLM provider is required for the MVP.                                                                                     | Human fallback is sufficient when AI is unavailable.                                                                                            |
 | RD-034 | The MVP uses one Team as the authorization boundary.                                                                                | There is no separate multi-tenant workspace abstraction.                                                                                        |
 | RD-035 | AI-assisted incident investigation is advisory.                                                                                     | It does not automatically change incident state, severity, assignment, or resolution.                                                           |
-| RD-036 | Investigation uses recorded IMS knowledge as its evidence base.                                                                     | Initial MVP sources are historical incidents, reviewed postmortems, runbooks, and other configured IMS records.                                 |
+| RD-036 | Investigation uses recorded IMS knowledge as its evidence base.                                                                     | Initial MVP sources are the incident itself and the service's past reviewed postmortems.                                 |
 | RD-037 | Investigation results must expose evidence references.                                                                              | Users can inspect which recorded sources support the result.                                                                                    |
 | RD-038 | AI investigation remains available as an optional workflow after incident creation.                                                 | AI failure does not block incident processing or manual investigation.                                                                          |
 | RD-039 | Investigation access follows the requesting user's team authorization.                                                              | Evidence from unauthorized teams must not be retrieved or exposed.                                                                              |
 | RD-040 | AI investigation output distinguishes facts from suggestions.                                                                       | Recorded evidence is not rewritten as an AI-confirmed fact.                                                                                     |
 | RD-041 | Repeated investigation requests are idempotent.                                                                                     | The same request must not create conflicting or unintended duplicate business records.                                                          |
-| RD-042 | The MVP includes a small repeatable AI evaluation set.                                                                              | It is used to check retrieval relevance and evidence/output validity after changes.                                                             |
-| RD-043 | The alert ingestion and incident creation is a local atomic transaction.                                                            | The accepted Alert + Incident + required initial Outbox event are persisted in one PostgreSQL transaction inside the Alert repository/workflow. |
+| RD-042 | The MVP includes an operator-run AI evaluation.                                                                              | Each run is stored in the Evaluation table and reviewed manually; it has no production API.                                                             |
+| RD-043 | The alert ingestion and incident creation is a local atomic transaction.                                                            | The accepted Alert + Incident + required audit, notification and outbox events are persisted in one PostgreSQL transaction inside the Alert repository/workflow. |
+| RD-044 | Administrative updates and deactivations are audited.                                                                               | User, team, service, escalation-policy and alert-source-configuration changes are recorded as audit events without an incident, atomically with the change. |
+| RD-045 | Each notifying event creates one durable notification record, committed with the state change.                                      | Recipients (team members, assignee, Team Lead as service level 3, fallback Admin, as defined per event) are resolved at that time; types are INFO, WARNING and ALERT; team-update events notify team members only. |
+| RD-046 | There is no separate delay between escalation levels; SLA evaluation is hybrid.                                                     | Delayed jobs are the primary trigger and a periodic scanner the safety net; every SLA milestone is recorded once; breaches notify but never change incident state; an invalid responder fails its level and the next level is attempted immediately. |
+| RD-047 | Redis-dependent gates fail closed.                                                                                                  | Rate-limit and replay checks return 503 when Redis is unavailable; Redis state is ephemeral and PostgreSQL stays the source of truth. |
+| RD-048 | Investigation uses the incident and the service's last 20 reviewed postmortems; investigations are deleted after 14 days.           | Evidence is deleted with its investigation; there are no runbooks in the MVP; requests are rate-limited per user. |
+| RD-049 | Only allow-listed fields are sent to the LLM provider.                                                                              | Triage: alert summary, description, labels, additional details. Postmortem: incident description, severity, comments. Investigation: incident description, severity, reviewed postmortems. |
+| RD-050 | Source severity is mapped per source and incident text is derived from alert fields.                                                | Mapping (case-insensitive): critical = P0, high = P1, warning = P2, info = P3, otherwise the service default. Title = alert name (else summary); description = description and summary. |
+| RD-051 | Acknowledging an incident with no assignee assigns the acknowledging user.                                                          | An existing assignee is unchanged; the acknowledgement actor is still stored separately. |
+| RD-052 | Execution retries use 5 attempts with exponential backoff.                                                                          | Exhausted work becomes a dead-letter record that an operator re-drives manually; publication to the queue is retried until Redis recovers. |
+| RD-053 | A failed postmortem generation can be retried or replaced by a manual postmortem.                                                   | Approving or manually creating the postmortem closes the incident atomically; only escalation-chain members may do so. |
 
 ---
 
 ## 18. Open Questions
 
-| ID     | Question                                                                                               | Why it matters                                         |
-| ------ | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------ |
-| OQ-001 | What exact SLA durations should be configured for P0-P3 for each service?                              | Determines response and resolution deadlines.          |
-| OQ-002 | Should SLA configuration be identical across services or configurable per service?                     | Affects service configuration and data model.          |
-| OQ-003 | What exact escalation delay should apply between responders?                                           | Determines worker scheduling behavior.                 |
-| OQ-004 | What exact source-severity mappings should be configured for each supported source?                    | Determines initial P0-P3 severity.                     |
-| OQ-005 | What exact notification events should trigger email to the assigned engineer and Team Lead?            | Prevents unnecessary notification noise.               |
-| OQ-006 | What exact data fields are allowed to leave the system for LLM processing?                             | Determines AI redaction and privacy implementation.    |
-| OQ-007 | What exact AI confidence/evidence response format should be enforced?                                  | Determines validation and storage of AI triage output. |
-| OQ-008 | What manual path should be available if postmortem generation repeatedly fails?                        | Ensures an incident can still be closed safely.        |
-| OQ-009 | Which exact IMS record types should be included in the initial investigation knowledge set?            | Defines the first retrieval boundary.                  |
-| OQ-010 | What retention policy should apply to AI investigation results and evidence references?                | Determines storage and review behavior.                |
-| OQ-011 | What exact evaluation cases and expected evidence should be included in the initial AI evaluation set? | Determines how investigation quality is checked.       |
-| OQ-012 | What exact data must be excluded or redacted before AI investigation processing?                       | Determines privacy and external AI handling.           |
+| ID     | Question                                                                                                              | Why it matters                                                   |
+| ------ | --------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| OQ-001 | What exact SLA durations should be configured for P0-P3 for each service?                                             | Determines response and resolution deadlines.                    |
+| OQ-003 | After a level is escalated successfully and the incident is still unacknowledged, what causes the next level to be attempted, given there is no delay between responders? | Determines worker scheduling behavior.                           |
+| OQ-013 | Which email provider does the production notification adapter use?                                                    | Determines the production email integration.                     |
 
 ---
 
@@ -870,7 +924,7 @@ Potential future extensions include:
 | Duplicate flow         | Existing unresolved incident with the same external alert identity is found → record/associate the duplicate alert → return success without creating another unresolved incident         |
 | AI failure flow        | Incident remains persisted; AI triage failure is recorded; human severity selection remains available                                                                                    |
 | Resulting state        | New incident → OPEN                                                                                                                                                                      |
-| Side effects           | Incident event; asynchronous AI triage job; notification job as applicable                                                                                                               |
+| Side effects           | Incident and alert events; asynchronous AI triage job; SLA evaluation job; incident-created notification                                                                                                               |
 | Acceptance criteria    | AC-001 through AC-006, AC-043 through AC-048                                                                                                                                             |
 
 ### UC-002: Team member views an OPEN incident
@@ -897,7 +951,7 @@ Potential future extensions include:
 | Preconditions          | Incident exists, is OPEN, and user is authorized                                                                                                                                    |
 | Inputs                 | `incident_id`, `authenticated_user_id`                                                                                                                                              |
 | Business rules invoked | BR-044, BR-045, BR-046                                                                                                                                                              |
-| Main success flow      | Load incident with concurrency protection → verify OPEN state → set acknowledgement actor/timestamp → transition to ACKNOWLEDGED → persist audit/timeline event atomically → commit |
+| Main success flow      | Load incident with concurrency protection → verify OPEN state → set acknowledgement actor/timestamp (and assign the acknowledger if the incident has no assignee) → transition to ACKNOWLEDGED → persist audit/timeline event atomically → commit |
 | Concurrent flow        | Two authorized users attempt acknowledgement concurrently → one succeeds; the other receives a conflict/invalid-state response without corrupting state                             |
 | Resulting state        | OPEN → ACKNOWLEDGED                                                                                                                                                                 |
 | Side effects           | Audit/timeline event; notification                                                                                                                                                  |
@@ -942,11 +996,12 @@ Potential future extensions include:
 | Preconditions          | Incident is not ACKNOWLEDGED, RESOLVED, or CLOSED                                                                              |
 | Inputs                 | Incident ID, current severity, SLA configuration, escalation policy                                                            |
 | Business rules invoked | BR-041, BR-055 through BR-058                                                                                                  |
-| Main success flow      | Evaluate current SLA → verify incident still requires acknowledgement → select next responder → notify responder and Team Lead |
+| Main success flow      | Evaluate current SLA → verify incident still requires acknowledgement → select next responder → notify the defined recipients |
 | Final fallback         | If the final configured responder has already been attempted, escalate to the Team Lead/Admin fallback                         |
+| Invalid responder flow | If a level's responder is invalid or deactivated, an escalation-failed notification is recorded, the level is finished, and the next level is attempted immediately |
 | Duplicate worker flow  | Repeated job execution produces no duplicate notification action                                                               |
 | Resulting state        | Incident remains OPEN until acknowledged                                                                                       |
-| Side effects           | ESCALATED event; assignment event; notification                                                                                |
+| Side effects           | ESCALATED_Ln event; notification (escalation never assigns the incident)                                                                                |
 | Acceptance criteria    | AC-022 through AC-024                                                                                                          |
 
 ### UC-007: Worker fires SLA warning
@@ -958,7 +1013,7 @@ Potential future extensions include:
 | Preconditions          | Incident is not resolved/closed and the relevant SLA is active                                                        |
 | Inputs                 | Incident ID, current severity, SLA configuration                                                                      |
 | Business rules invoked | BR-051 through BR-054                                                                                                 |
-| Main success flow      | Calculate elapsed time → determine applicable threshold → record SLA warning → notify assigned engineer and Team Lead |
+| Main success flow      | Calculate elapsed time → determine applicable threshold → record SLA warning → notify the defined recipients |
 | Duplicate worker flow  | Repeated evaluation does not create duplicate warning actions                                                         |
 | Resulting state        | No lifecycle state change                                                                                             |
 | Side effects           | SLA_WARNING event; notification                                                                                       |
@@ -968,12 +1023,12 @@ Potential future extensions include:
 
 | Field                  | Description                                                                                                                                                                                                             |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Actor                  | Assigned Engineer                                                                                                                                                                                                       |
+| Actor                  | Team Lead / Admin, or the assigned Engineer |
 | Trigger                | Engineer determines the service is working again                                                                                                                                                                        |
-| Preconditions          | Incident is MITIGATING; user is the assigned Engineer                                                                                                                                                                   |
+| Preconditions          | Incident is MITIGATING; user is a Team Lead/Admin of the team or the assigned Engineer                                                                                                                                                                   |
 | Inputs                 | `incident_id`, `authenticated_user_id`, resolution summary                                                                                                                                                              |
 | Business rules invoked | BR-005, BR-009, BR-013, BR-015, BR-067 through BR-072                                                                                                                                                                   |
-| Main success flow      | Authorize assigned Engineer → validate resolution data → transition to RESOLVED → store resolution summary and resolved timestamp → commit audit/timeline event atomically → trigger asynchronous postmortem generation |
+| Main success flow      | Authorize responder → validate resolution data → transition to RESOLVED → store resolution summary and resolved timestamp → commit audit/timeline event atomically → trigger asynchronous postmortem generation |
 | Failure flow           | Invalid transition or missing resolution summary → reject without changing state                                                                                                                                        |
 | Resulting state        | MITIGATING → RESOLVED                                                                                                                                                                                                   |
 | Side effects           | RESOLVED event; notification; postmortem generation job                                                                                                                                                                 |
@@ -986,13 +1041,13 @@ Potential future extensions include:
 | Actor                  | Postmortem worker                                                                                                                      |
 | Trigger                | RESOLVED incident generates a postmortem job                                                                                           |
 | Preconditions          | Incident is RESOLVED                                                                                                                   |
-| Inputs                 | Incident ID, recorded incident data, timeline, comments, resolution data                                                               |
+| Inputs                 | Incident ID; incident description and severity; incident comments (the allow-listed data)                                                               |
 | Business rules invoked | BR-065 through BR-071                                                                                                                  |
 | Main success flow      | Load recorded incident context → call LLM → validate structured response → store draft and AI provenance → record POSTMORTEM_GENERATED |
-| Failure flow           | LLM unavailable/error → record failure → retry according to retry policy → incident remains RESOLVED                                   |
+| Failure flow           | LLM unavailable/error → record failure → retry according to retry policy (5 attempts) → on exhaustion record the failure reason and notify; the team can retry or write the postmortem manually → incident remains RESOLVED                                   |
 | Duplicate flow         | Repeated job execution does not create conflicting or duplicate postmortems                                                            |
 | Resulting state        | Incident remains RESOLVED                                                                                                              |
-| Side effects           | Postmortem draft; timeline event                                                                                                       |
+| Side effects           | Postmortem draft; timeline event; notification                                                                                                       |
 | Acceptance criteria    | AC-030 through AC-032                                                                                                                  |
 
 ### UC-010: Engineer reviews postmortem and closes incident
@@ -1001,7 +1056,7 @@ Potential future extensions include:
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Actor                  | Engineer / Team Lead / Admin                                                                                                                                               |
 | Trigger                | Reviewer opens generated postmortem                                                                                                                                        |
-| Preconditions          | Incident is RESOLVED and postmortem draft exists, or the defined manual review path is available                                                                           |
+| Preconditions          | Incident is RESOLVED and a postmortem draft exists, or generation failed and the manual postmortem path is available                                                                           |
 | Inputs                 | `incident_id`, `authenticated_user_id`, reviewed postmortem content                                                                                                        |
 | Business rules invoked | BR-014, BR-067, BR-072                                                                                                                                                     |
 | Main success flow      | Review draft → update content if necessary → approve → transition incident to CLOSED → record reviewer and review timestamp → record POSTMORTEM_REVIEWED and CLOSED events |
@@ -1019,10 +1074,10 @@ Potential future extensions include:
 | Actor                     | Engineer / Team Lead / Admin                                                                                                                                                                        |
 | Trigger                   | Authorized user requests investigation assistance for an incident                                                                                                                                   |
 | Preconditions             | User is authorized for the incident's team; relevant incident data is available                                                                                                                     |
-| Inputs                    | `incident_id`, `authenticated_user_id`, investigation request reference                                                                                                                             |
+| Inputs                    | `incident_id`, `authenticated_user_id`, idempotency key                                                                                                                             |
 | Business rules invoked    | BR-073 through BR-078                                                                                                                                                                               |
 | Main success flow         | Authorize user → retrieve permitted IMS knowledge → identify relevant evidence → generate structured investigation brief → validate evidence references → store result → record investigation event |
-| No-result flow            | No sufficiently relevant evidence is found → record that no relevant evidence was found → optionally generate a limited AI response stating the limitation                                          |
+| No-result flow            | No reviewed postmortems exist for the service → record that no past postmortems were found → generate a limited brief from the incident itself (always an evidence source) stating the limitation                                          |
 | AI/retrieval failure flow | Record failure → incident remains unchanged → manual investigation remains available → retry when appropriate                                                                                       |
 | Duplicate flow            | Repeated request with the same idempotency/reference does not create conflicting investigation records                                                                                              |
 | Resulting state           | Incident lifecycle state unchanged                                                                                                                                                                  |
@@ -1056,8 +1111,8 @@ Potential future extensions include:
 | AC-021 | A severity change causes subsequent SLA evaluation to use the latest severity configuration.                                                                                                                                    |
 | AC-022 | An unacknowledged incident is escalated to the next configured responder when the response SLA is breached.                                                                                                                     |
 | AC-023 | Escalation continues through the configured chain and reaches the Team Lead/Admin fallback after the final responder.                                                                                                           |
-| AC-024 | Repeated escalation-worker execution does not produce duplicate assignment or escalation actions.                                                                                                                               |
-| AC-025 | Notifications are sent to the assigned engineer and Team Lead for defined notification events.                                                                                                                                  |
+| AC-024 | Repeated escalation-worker execution does not produce duplicate escalation actions.                                                                                                                               |
+| AC-025 | Notifications are sent to the defined recipients for each defined notification event.                                                                                                                                  |
 | AC-026 | Failed notification attempts are recorded and retried with exponential backoff.                                                                                                                                                 |
 | AC-027 | Exhausted notification retries are represented in a DLQ/failure state and remain observable.                                                                                                                                    |
 | AC-028 | Repeated notification-job execution does not create unintended duplicate notification actions.                                                                                                                                  |
@@ -1071,7 +1126,7 @@ Potential future extensions include:
 | AC-036 | Protected APIs validate authentication, authorization, and input data at the server boundary.                                                                                                                                   |
 | AC-037 | Secrets are not exposed through source code, logs, or API responses.                                                                                                                                                            |
 | AC-038 | Original alert payloads are retained and associated with the corresponding alert/incident.                                                                                                                                      |
-| AC-039 | Incident timestamps and SLA calculations follow the MVP's defined IST-based continuous elapsed-time policy.                                                                                                                     |
+| AC-039 | Incident timestamps and SLA calculations follow the MVP's defined UTC-based continuous elapsed-time policy.                                                                                                                     |
 | AC-040 | Under the defined synthetic workload of 200 requests/sec, authenticated incident state-transition API p95 latency remains below 500ms excluding external provider calls.                                                        |
 | AC-041 | Under the defined synthetic workload, current-status read endpoint p95 latency remains below 300ms.                                                                                                                             |
 | AC-042 | Structured logs, correlation IDs, retry information, job failures, and escalation outcomes are available for operational debugging.                                                                                             |
@@ -1086,7 +1141,11 @@ Potential future extensions include:
 | AC-051 | An AI investigation request cannot retrieve or expose incident knowledge belonging to another unauthorized team.                                                                                                                |
 | AC-052 | If AI or retrieval is unavailable, the incident remains usable and manual investigation can continue.                                                                                                                           |
 | AC-053 | Repeated execution of the same investigation request does not create conflicting or unintended duplicate investigation records.                                                                                                 |
-| AC-054 | The AI evaluation set can be executed repeatedly and reports retrieval relevance and evidence/output validity without modifying production incident data.                                                                       |
+| AC-054 | An operator can run the AI evaluation for a service repeatedly; each run is stored in the Evaluation table for manual review without modifying production incident data.                                                                       |
+| AC-055 | Updates and deactivations of users, teams, services, escalation policies and alert-source configuration are recorded as audit events without an incident, atomically with the change. |
+| AC-056 | When Redis is unavailable, rate-limit and replay gates return 503 and do not process the request. |
+| AC-057 | Each notifying event creates exactly one notification record, atomically with the state change; a repeated occurrence does not create a second one. |
+| AC-058 | Acknowledging an unassigned incident makes the acknowledging user the current assignee. |
 
 ---
 
